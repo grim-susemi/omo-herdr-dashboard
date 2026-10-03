@@ -1,13 +1,13 @@
 {
   "schema": "omo-herdr-todo/native-source-manifest/1",
   "sdkPackage": "@code-yeongyu/senpi",
-  "sdkVersion": "2026.10.2",
-  "recordedAtUtc": "2026-10-03T01:17:20.886Z",
+  "sdkVersion": "2026.10.3",
+  "recordedAtUtc": "2026-10-03T22:08:56.224Z",
   "purpose": "Read-only sha256 identity of the installed SDK files used by npm run test:host. test-host.mjs asserts the version and every hash before and after the run.",
   "files": [
     {
       "path": "package.json",
-      "sha256": "b8ee780f01622dc8ff2d5238c34779542298ca30ba3ea3022b80ff726d47de80"
+      "sha256": "5e19864ac93ff30e7eff65c480f4425d79ad4b83e4e8e702f5c8643472a156de"
     },
     {
       "path": "dist/core/resource-loader.js",
@@ -15,7 +15,7 @@
     },
     {
       "path": "dist/core/settings-manager.js",
-      "sha256": "3d4281ba24eb79a17b4c3266bd5409ba35c90bd5b66caf8077920fc6fc172196"
+      "sha256": "a93d35728507dbb92682ce1ec99963d569aabd3db2af83f3bdd3b1e720e38417"
     },
     {
       "path": "dist/core/session-manager.js",
