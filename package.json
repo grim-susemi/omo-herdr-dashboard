@@ -19,7 +19,7 @@
     "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {
-    "test": "node --test --test-isolation=none test/unit/*.test.mjs",
+    "test": "node --test --test-isolation=none test/unit/*.test.mjs test/native-todo.test.mjs",
     "test:host": "node scripts/test-host.mjs",
     "build": "node scripts/build.mjs",
     "check": "npm test && npm run build"

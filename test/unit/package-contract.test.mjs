@@ -22,7 +22,7 @@ test('package declares no production dependency and no bundled path', () => {
 });
 
 test('every command contract points at a real, executable file', () => {
-  assert.equal(manifest.scripts.test, 'node --test --test-isolation=none test/unit/*.test.mjs');
+  assert.equal(manifest.scripts.test, 'node --test --test-isolation=none test/unit/*.test.mjs test/native-todo.test.mjs');
   assert.equal(manifest.scripts['test:host'], 'node scripts/test-host.mjs');
   assert.equal(manifest.scripts.build, 'node scripts/build.mjs');
   for (const command of Object.values(manifest.scripts)) {

@@ -13,6 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createNativeHost, WIDGET_KEY } from '../../src/native-host.mjs';
+import { projectNativeTodo, createNativeTodoProjection } from '../../src/native-todo.mjs';
 import { compareToDeclared, hashManifest, summarizeIdentity } from '../../src/source-hashes.mjs';
 import { PROBE_HOST_KEY, installProbe } from './fixture-extension.mjs';
 
@@ -319,4 +320,83 @@ test('native-source-hashes-unchanged-and-runner-clean', async () => {
   assert.equal(identity.allUnchanged, true);
   assert.deepEqual(host.errors, []);
   assert.equal(existsSync(join(agentDir, 'extensions')), false, 'fixture agent dir must not discover user extensions');
+});
+
+test('projection-manualqa-real-native-tool-values-counts-target-and-history', async () => {
+  await host.toolAction({ op: 'init', list: [
+    { phase: 'F', items: ['a', 'b'] }, { phase: 'V', items: ['c'] },
+  ] });
+  const initialLeaf = host.session.getLeafId();
+  const initialBranch = structuredClone(host.session.getBranch());
+  await host.toolAction({ op: 'done', task: 'c' });
+  await host.toolAction({ op: 'done', task: 'a' });
+  const committedLeaf = host.session.getLeafId();
+  const current = projectNativeTodo(host.session.getBranch());
+  assert.deepEqual(current.phases, host.readState().phases);
+  assert.deepEqual(current.counts, {
+    total: 3, closed: 2, open: 1, completed: 2, dropped: 0, inProgress: 1, pending: 0,
+  });
+  assert.equal(current.target.content, 'b');
+  assert.equal(current.target.status, 'in_progress');
+  assert.equal(host.session.getLeafId(), committedLeaf, 'projection must not write the session');
+  const historical = projectNativeTodo(host.session.getBranch(initialLeaf));
+  assert.equal(historical.counts.closed, 0);
+  assert.equal(historical.target.content, 'a');
+  assert.deepEqual(host.session.getBranch(initialLeaf), initialBranch, 'projection cannot alter historical entries');
+  assert.equal(host.calls.at(-1).function, 'stock registered todo.definition.execute');
+
+  await host.toolAction({ op: 'init', list: [
+    { phase: 'F', items: ['a', 'b'] }, { phase: 'V', items: ['c'] },
+  ] });
+  await host.toolAction({ op: 'start', task: 'c' });
+  await host.toolAction({ op: 'done', task: 'a' });
+  const later = projectNativeTodo(host.session.getBranch());
+  assert.equal(later.target.content, 'c');
+  assert.equal(later.phases[1].tasks[0].status, 'in_progress');
+  assert.deepEqual(later.phases, host.readState().phases);
+});
+
+test('projection-manualqa-real-command-append-clear-tree-rebase-and-stale-rejection', async () => {
+  const reader = createNativeTodoProjection();
+  const epoch = reader.rebase({ sessionId: 'fixture-session', branchId: 'fixture-current' });
+  reader.read(host.session, epoch);
+  const beforeAppend = host.session.getLeafId();
+  await host.commandAction('append V native appended');
+  const appendedLeaf = host.session.getLeafId();
+  assert.notEqual(appendedLeaf, beforeAppend);
+  assert.equal(host.calls.at(-1).function, 'ExtensionRunner.getCommand(todo).handler');
+  assert.equal(host.session.getBranch().at(-1).data.source, 'user');
+  assert.equal(reader.read(host.session, epoch), true);
+  assert.equal(reader.snapshot.counts.total, 4);
+  assert.equal(reader.snapshot.phases[1].tasks.at(-1).content, 'Native appended');
+  assert.equal(reader.snapshot.target.content, 'c');
+  assert.equal(reader.snapshot.scopeEpoch, epoch, 'append is a leaf revision, not a new scope');
+  assert.equal(reader.read(host.session, epoch), false, 'repeated event does not republish');
+
+  await host.commandAction('rm');
+  reader.read(host.session, epoch);
+  const emptyLeaf = host.session.getLeafId();
+  assert.equal(reader.snapshot.availability, 'empty');
+  assert.equal(reader.snapshot.counts.total, 0);
+  assert.equal(reader.snapshot.target, null);
+  assert.deepEqual(reader.snapshot.phases, host.readState().phases);
+  const staleBranch = host.session.getBranch();
+
+  // This is fixture-only native navigation. Production projection only reads.
+  host.session.branch(appendedLeaf);
+  await host.emitSessionStart();
+  const historicalEpoch = reader.rebase({ sessionId: 'fixture-session', branchId: 'fixture-historical' });
+  reader.read(host.session, historicalEpoch);
+  assert.equal(reader.snapshot.counts.total, 4);
+  assert.equal(reader.snapshot.target.content, 'c');
+  assert.equal(reader.observe({ scopeEpoch: epoch, branch: staleBranch, leafRevision: emptyLeaf }), false);
+  assert.equal(reader.snapshot.counts.total, 4);
+
+  host.session.branch(emptyLeaf);
+  await host.emitSessionStart();
+  const restoredEpoch = reader.rebase({ sessionId: 'fixture-session', branchId: 'fixture-restored' });
+  reader.read(host.session, restoredEpoch);
+  assert.equal(reader.snapshot.availability, 'empty', 'cached historical sibling is not current');
+  assert.equal(reader.snapshot.counts.total, 0);
+  assert.deepEqual(host.errors, []);
 });
