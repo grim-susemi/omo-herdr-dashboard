@@ -16,7 +16,7 @@ const checks = [];
 
 const modules = ['src', 'scripts']
   .flatMap(dir => listFilesRecursive(join(root, dir)))
-  .filter(file => file.endsWith('.mjs'));
+  .filter(file => file.endsWith('.mjs')).concat(join(root, 'extension.mjs'));
 let syntaxOk = true;
 for (const file of modules) {
   try {
@@ -56,6 +56,7 @@ checks.push({ check: 'package-contract', scripts: Object.keys(manifest.scripts ?
 // Shipped files only. Tests are not published and may legitimately contain
 // hostile fixture strings used to prove the scanner works.
 const scanned = [
+  join(root, 'extension.mjs'),
   ...listFilesRecursive(join(root, 'src')),
   ...listFilesRecursive(join(root, 'scripts')),
   ...listFilesRecursive(join(root, 'config')),
