@@ -1,4 +1,13 @@
 import { test } from 'node:test';
+
+test('tiny Korean Todo footer keeps follow and c/q controls visible',()=>{
+  const frame=renderFrame({...mixed(),availability:'current'},{
+    columns:22,rows:8,color:false,language:'ko',follow:false});
+  const foot=stripVTControlCharacters(frame.text).split('\n').at(-1);
+  for(const key of ['OFF','j/k','c','q'])assert.ok(foot.includes(key),foot);
+  assert.ok(fixtureCells(foot)<22);
+});
+
 import assert from 'node:assert/strict';
 import { stripVTControlCharacters } from 'node:util';
 import { projectNativeTodo } from '../src/native-todo.mjs';
@@ -48,14 +57,14 @@ for (const [columns, rows, bodyRows] of [[80, 24, 16], [40, 16, 8], [24, 8, 2], 
 
 test('every phase shell and every actual status remain accessible by basic body scroll', () => {
   const snapshot = mixed();
-  const full = renderFrame(snapshot, { columns: 40, rows: 16, color: false });
+  const full = renderFrame(snapshot, { columns: 40, rows: 16, color: false, completedExpanded: true });
   assert.equal(Object.keys(full.phaseRanges).length, 3);
   assert.equal(Object.keys(full.taskRanges).length, 5);
   assert.equal(Object.values(full.taskRanges).filter(range => range.status === 'in_progress').length, 2);
   assert.equal(full.bodyLines.filter(line => line.startsWith(' * ') || line.startsWith('>* ')).length, 2);
   for (const [index, phase] of snapshot.phases.entries()) {
     const range = full.phaseRanges[snapshot.phaseSummaries[index].key];
-    const frame = renderFrame(snapshot, { columns: 40, rows: 16, scroll: range.start, color: false });
+    const frame = renderFrame(snapshot, { columns: 40, rows: 16, scroll: range.start, color: false, completedExpanded: true });
     assert.ok(frame.lines.some(line => line.includes(phase.name)));
   }
   const shell = renderFrame(project([{ name: 'Empty', tasks: [] }]), { columns: 40, rows: 16, color: false });
@@ -67,7 +76,7 @@ test('closed includes dropped; dropped never becomes completed', () => {
   const snapshot = project([{ name: 'Dropped', tasks: [
     { content: 'A', status: 'abandoned' }, { content: 'B', status: 'abandoned' },
   ] }]);
-  const frame = renderFrame(snapshot, { color: false });
+  const frame = renderFrame(snapshot, { color: false, completedExpanded: true });
   assert.match(frame.text, /2\/2 closed done:0 drop:2/);
   assert.match(frame.text, /Dropped 2\/2 done:0 drop:2/);
   assert.equal(snapshot.target, null);
@@ -134,6 +143,23 @@ test('native follow retains occurrence identity across parallel arrival and hand
   snapshot = project(phases);
   assert.equal(runningTarget(snapshot, target), null);
   assert.match(renderFrame(snapshot, { target: null, color: false }).text, /No current target/);
+});
+
+
+
+test('fully closed nonempty phases fold task rows but keep truthful shells and counts', () => {
+  const snapshot=project([{name:'Closed',tasks:[{content:'DONE_HIDE',status:'completed'},{content:'DROP_HIDE',status:'abandoned'}]},
+    {name:'Empty',tasks:[]},{name:'Open',tasks:[{content:'LIVE_KEEP',status:'in_progress'}]}]);
+  const original=structuredClone(snapshot);
+  const folded=renderFrame(snapshot,{columns:80,rows:40,color:false});
+  const expanded=renderFrame(snapshot,{columns:80,rows:40,color:false,completedExpanded:true});
+  assert.doesNotMatch(folded.text,/DONE_HIDE|DROP_HIDE/);
+  assert.match(folded.text,/Closed 2\/2 done:1 drop:1/);
+  assert.match(folded.text,/Empty 0\/0 done:0 drop:0/);
+  assert.equal(Object.keys(folded.phaseRanges).length,3);
+  assert.match(expanded.text,/DONE_HIDE/);assert.match(expanded.text,/DROP_HIDE/);
+  assert.ok(expanded.bodyLines.length>folded.bodyLines.length);
+  assert.deepEqual(snapshot,original);
 });
 
 test('retained native target drives marker and reveal without replacing the snapshot target', () => {

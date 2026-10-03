@@ -84,6 +84,8 @@ function counts(tasks) {
   const dropped = tasks.filter(task => task.status === 'abandoned').length;
   return { total: tasks.length, closed: completed + dropped, completed, dropped };
 }
+export const isClosedPhase = phase => phase.tasks.length > 0 &&
+  phase.tasks.every(task => ['completed', 'abandoned'].includes(task.status));
 const clamp = (value, max) => Math.min(Math.max(0, Math.floor(value || 0)), Math.max(0, max));
 
 // Retain native display identity, never the projection's pending fallback.
@@ -98,7 +100,7 @@ export function runningTarget(snapshot, previous) {
 
 export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en',
   availability = snapshot?.availability ?? 'waiting', error = '', color = true,
-  scroll = 0, askScroll = 0, revealTarget = false, target = snapshot?.target, follow = true } = {}) {
+  scroll = 0, askScroll = 0, revealTarget = false, target = snapshot?.target, follow = true, completedExpanded = false } = {}) {
   // Keep the terminal's final cell free, as in the existing DAG renderer.
   // ConPTY can otherwise wrap a wide glyph before the following cursor move.
   columns = Math.max(1, Math.floor(columns) - 1);
@@ -112,6 +114,8 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const bodyLines = [];
   if (error) bodyLines.push(...wrap(t(language, 'readError', { error: clean(error) }), columns));
   const phaseOccurrences = new Map();
+  const closedPhases = phases.filter(isClosedPhase).length;
+  if (closedPhases) bodyLines.push(paint(fit(`${t(language, 'closedPhases', { count: closedPhases })} ${completedExpanded ? '[-]' : '[+]'}`, columns), 'completed', color));
   for (const [phaseIndex, phase] of phases.entries()) {
     const occurrence = phaseOccurrences.get(phase.name) ?? 0;
     phaseOccurrences.set(phase.name, occurrence + 1);
@@ -123,7 +127,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)} ${summary}`, 'accent', color));
     else bodyLines.push(paint(fit(phase.name, columns), 'accent', color), ...wrap(summary, columns));
     const taskOccurrences = new Map();
-    for (const [taskIndex, task] of phase.tasks.entries()) {
+    for (const [taskIndex, task] of (isClosedPhase(phase) && !completedExpanded ? [] : phase.tasks).entries()) {
       const taskOccurrence = taskOccurrences.get(task.content) ?? 0;
       taskOccurrences.set(task.content, taskOccurrence + 1);
       const key = snapshot?.phaseSummaries?.[phaseIndex]?.taskKeys?.[taskIndex] ??
@@ -179,8 +183,10 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   scroll = clamp(scroll, bodyLines.length - bodyRows);
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
   while (visible.length < bodyRows) visible.push('');
-  const footer = `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
-  const lines = [...top, ...ask, ...visible, paint(fit(footer, columns), 'pending', color)].slice(0, rows);
+  const footer = error ? t(language, 'readError', { error }) : columns < 40 ?
+    `f ${t(language, follow ? columns < 30 ? 'followShortOn' : 'followOn' : columns < 30 ? 'followShortOff' : 'followOff')} j/k c q` :
+    `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
+  const lines = [...top, ...ask, ...visible, paint(fit(footer, columns), error ? 'error' : 'accent', color)].slice(0, rows);
   return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll, bodyRows, askRows };
 }
 

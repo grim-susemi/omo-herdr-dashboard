@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { createRoleClient } from './presence.mjs';
 import { sameSnapshotScope, validSnapshot } from './storage.mjs';
 import { readRoleState, registerRoleViewer, requestRoleClose } from './controller.mjs';
-import { renderFrame, runningTarget } from './render.mjs';
+import { isClosedPhase, renderFrame, runningTarget } from './render.mjs';
 import { t } from './i18n.mjs';
 
 const pathKey = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
@@ -75,7 +75,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   let state = null, snapshot = null, availability = 'waiting', error = '';
   let client = null, message = null, generation = 0, observation = 0, validatedObservation = -1;
   let invalidState = false;
-  let prefs = { scroll: 0, askScroll: 0, follow: true }, scroll = 0, target = null;
+  let prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: false }, scroll = 0, target = null;
   let refreshing = null, dirty = false, closing = false, closeJob;
   let painting = Promise.resolve(), saving = Promise.resolve(), lastFrame;
   let resolveClosed;
@@ -155,13 +155,15 @@ export async function startViewer(options, { input = process.stdin, output = pro
     });
   }
   async function preferences(next, epoch) {
-    prefs = { scroll: 0, askScroll: 0, follow: true }; scroll = 0; target = null;
+    prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: false }; scroll = 0; target = null;
     try {
       const value = JSON.parse(await readFile(next.prefsPath, 'utf8'));
       if (epoch === generation && value.schema === 'omo-herdr-todo/view/1' && sameSnapshotScope(value, next) &&
         [value.scroll, value.askScroll].every(number => Number.isSafeInteger(number) && number >= 0) &&
-        (value.follow === undefined || typeof value.follow === 'boolean')) {
-        prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: value.follow ?? true };
+        (value.follow === undefined || typeof value.follow === 'boolean') &&
+        (value.completedExpanded === undefined || typeof value.completedExpanded === 'boolean')) {
+        prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: value.follow ?? true,
+          completedExpanded: value.completedExpanded ?? false };
         scroll = prefs.scroll;
       }
     } catch (cause) {
@@ -286,6 +288,10 @@ export async function startViewer(options, { input = process.stdin, output = pro
     const page = Math.max(1, lastFrame?.bodyRows ?? 1);
     const body = ['j', 'k', '\x1b[B', '\x1b[A', '\x1b[6~', '\x1b[5~'].includes(sequence);
     if (sequence === 'f') prefs.follow = !prefs.follow;
+    else if (sequence === 'c' && snapshot?.phases.some(isClosedPhase)) {
+      prefs.follow = false;
+      prefs.completedExpanded = !prefs.completedExpanded;
+    }
     else if (body || sequence === 'a' || sequence === 'z') {
       prefs.follow = false; // Pause this role before any manual movement.
       if (sequence === 'j' || sequence === '\x1b[B') scroll++;
