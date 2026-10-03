@@ -57,6 +57,7 @@ if (!senpiRootArg) {
       const run = spawnSync(process.execPath, [
         '--test', '--test-isolation=none', '--test-reporter=tap', '--test-timeout=120000',
         join(root, 'test/host/native-host.test.mjs'),
+        join(root, 'test/host/display-bridge-host.test.mjs'),
       ], {
         cwd: root,
         encoding: 'utf8',
