@@ -1,0 +1,40 @@
+{
+  "name": "omo-herdr-todo",
+  "version": "0.1.0",
+  "description": "Concurrent native Todo, DAG and worker surfaces for OmO inside Herdr. Source/test/build foundation (task 2 scope).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "config/",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "scripts": {
+    "test": "node --test --test-isolation=none test/unit/*.test.mjs",
+    "test:host": "node scripts/test-host.mjs",
+    "build": "node scripts/build.mjs",
+    "check": "npm test && npm run build"
+  },
+  "keywords": [
+    "omo",
+    "senpi",
+    "herdr",
+    "todo",
+    "dag",
+    "tui"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/grim-susemi/omo-herdr-todo.git"
+  },
+  "private": false
+}
