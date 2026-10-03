@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { stripVTControlCharacters } from 'node:util';
 import { projectNativeTodo } from '../src/native-todo.mjs';
-import { clean, fit, width, wrap, renderFrame } from '../src/render.mjs';
+import { clean, fit, width, wrap, renderFrame, runningTarget } from '../src/render.mjs';
 
 const project = phases => projectNativeTodo([{ type: 'custom', customType: 'senpi.todo-state',
   data: { schema: 'v2', phases, ask: { entryId: 'fixture-ask', capturedAt: 1,
@@ -109,4 +109,45 @@ test('native terminal controls cannot clear, title, recolor or reorder the viewe
   assert.doesNotMatch(frame.text, /[\x00-\x09\x0b-\x1f\x7f-\x9f\u202e]/u);
   assert.doesNotMatch(frame.text, /foreign/);
   assert.match(frame.text, /safe text/);
+});
+
+test('native follow retains occurrence identity across parallel arrival and hands off only when inactive', () => {
+  const phases = [{ name: 'Later', tasks: [
+    { content: 'Same content', status: 'completed' },
+    { content: 'Same content', status: 'in_progress' },
+    { content: 'Parallel', status: 'in_progress' },
+  ] }];
+  let snapshot = project(phases), target = runningTarget(snapshot);
+  assert.equal(target.key, '["Later",0,"Same content",1]');
+  phases.unshift({ name: 'Earlier', tasks: [{ content: 'Arrival', status: 'in_progress' }] });
+  snapshot = project(phases);
+  assert.deepEqual(runningTarget(snapshot, target), { ...target, phaseIndex: 1 });
+  assert.equal(snapshot.counts.inProgress, 3);
+  phases[1].tasks[1].status = 'completed';
+  target = runningTarget(project(phases), target);
+  assert.equal(target.content, 'Arrival');
+  phases.shift();
+  target = runningTarget(project(phases), target);
+  assert.equal(target.content, 'Parallel');
+  phases[0].tasks[2].status = 'abandoned';
+  phases[0].tasks.push({ content: 'Pending is not active', status: 'pending' });
+  snapshot = project(phases);
+  assert.equal(runningTarget(snapshot, target), null);
+  assert.match(renderFrame(snapshot, { target: null, color: false }).text, /No current target/);
+});
+
+test('retained native target drives marker and reveal without replacing the snapshot target', () => {
+  const snapshot = project([{ name: 'Long', tasks: Array.from({ length: 30 }, (_, index) => ({
+    content: `NATIVE_${index}`, status: index === 0 || index === 28 ? 'in_progress' : 'completed',
+  })) }]);
+  const original = structuredClone(snapshot);
+  const target = { key: snapshot.phaseSummaries[0].taskKeys[28] };
+  const retained = runningTarget(snapshot, target);
+  const followed = renderFrame(snapshot, { rows: 16, columns: 40, color: false, target: retained, revealTarget: true });
+  assert.ok(followed.scroll > 0);
+  assert.match(followed.text, />\* NATIVE_28/);
+  const paused = renderFrame(snapshot, { rows: 16, columns: 40, color: false,
+    target: retained, follow: false, revealTarget: false });
+  assert.equal(paused.scroll, 0);
+  assert.deepEqual(snapshot, original);
 });

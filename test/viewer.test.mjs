@@ -367,3 +367,123 @@ test('rejected close has no direct fallback; termination does not request manual
   await terminated.close(false);
   assert.equal(f.requests.filter(value => value.type === 'close').length, 1);
 });
+
+test('follow keeps automatic reveal transient and manual choices survive duplicate, resize and same-scope restart', async t => {
+  const f = await fixture(t);
+  const phases = [{ name: 'Long phase', tasks: Array.from({ length: 35 }, (_, index) => ({
+    content: `FOLLOW_NATIVE_${index}`, status: index === 31 ? 'in_progress' : 'completed',
+  })) }];
+  const publish = () => f.presence.publish({ ...projectNativeTodo([{ type: 'custom',
+    customType: 'senpi.todo-state', data: { schema: 'v2', phases,
+      ask: { entryId: 'ask', capturedAt: 1, text: 'Ask line\n'.repeat(30) } } }]), ...f.presence.getOwner() });
+  await publish();
+  const ack = signal(f.presence.events, 'event', event => event.type === 'ack');
+  let viewer = await f.start(); await ack;
+  assert.equal(viewer.state.follow, true);
+  assert.ok(viewer.frame.scroll > 0);
+  assert.equal(viewer.state.scroll, 0);
+  await assert.rejects(fs.readFile(f.state.prefsPath), { code: 'ENOENT' });
+  const source = await fs.readFile(f.statePath, 'utf8');
+  const paused = signal(viewer.events, 'preferences', value => !value.follow && value.askScroll === 1);
+  viewer.key('a'); await paused;
+  assert.equal(viewer.state.scroll, 0, 'ask navigation must not save automatic body reveal');
+  const resumed = signal(viewer.events, 'preferences', value => value.follow);
+  viewer.key('f'); await resumed;
+  const moving = signal(viewer.events, 'frame', value => value.text.includes('Follow OFF'));
+  const manual = signal(viewer.events, 'preferences', value => !value.follow && value.scroll > 0);
+  viewer.key('k'); await moving;
+  const saved = await manual, manualScroll = saved.scroll;
+  const duplicate = signal(viewer.events, 'frame', value => value.text.includes('Follow OFF'));
+  await f.writeState(); await duplicate;
+  const resized = signal(viewer.events, 'frame', value => value.lines.length === 18);
+  f.output.columns = 40; f.output.rows = 18; f.output.emit('resize'); await resized;
+  assert.equal(viewer.state.scroll, manualScroll);
+  assert.deepEqual(JSON.parse(await fs.readFile(f.state.prefsPath, 'utf8')), saved);
+  await viewer.close(false);
+  const restarted = signal(f.presence.events, 'event', event => event.type === 'ack');
+  viewer = await f.start(); await restarted;
+  assert.equal(viewer.state.follow, false);
+  assert.equal(viewer.state.scroll, manualScroll);
+  assert.equal(viewer.state.askScroll, 1);
+  assert.equal(await fs.readFile(f.statePath, 'utf8'), source);
+  const following = signal(viewer.events, 'frame', value => value.text.includes('Follow ON'));
+  viewer.key('f'); await following;
+  phases.unshift({ name: 'Parallel phase', tasks: [{ content: 'EARLY_ARRIVAL', status: 'in_progress' }] });
+  const retained = signal(viewer.events, 'frame', value => value.sequence === 2 && value.text.includes('FOLLOW_NATIVE_31'));
+  await publish(); await retained;
+  assert.equal(viewer.state.target.content, 'FOLLOW_NATIVE_31');
+  phases[1].tasks[31].status = 'completed';
+  const handoff = signal(viewer.events, 'frame', value => value.sequence === 3 && value.text.includes('Now: EARLY_ARRIVAL'));
+  await publish(); await handoff;
+  assert.equal(viewer.state.target.content, 'EARLY_ARRIVAL');
+  phases.shift();
+  const idle = signal(viewer.events, 'frame', value => value.sequence === 4 && value.text.includes('No current target'));
+  await publish(); await idle;
+  assert.equal(viewer.state.target, null);
+  const owner = f.presence.getOwner();
+  await f.presence.rebase({ ...owner, scopeEpoch: 2 });
+  const rebound = signal(viewer.events, 'registered', value => value.scope.scopeEpoch === 2);
+  await f.writeState({ ...f.state, scopeEpoch: 2, presenceOffer: f.presence.offer('todo'),
+    controlOffer: { ...f.state.controlOffer, scopeEpoch: 2 } });
+  await rebound;
+  assert.equal(viewer.state.follow, true);
+  assert.equal(viewer.state.scroll, 0);
+  assert.equal(viewer.state.target, null);
+});
+
+test('same-scope source error, disconnect and reattach retain an active target without revealing it offline', async t => {
+  const f = await fixture(t);
+  const phases = [{ name: 'Current', tasks: [{ content: 'TODO_PAR', status: 'in_progress' }] }];
+  const projection = () => projectNativeTodo([{ type: 'custom', customType: 'senpi.todo-state',
+    data: { schema: 'v2', phases } }]);
+  await f.presence.publish({ ...projection(), ...f.presence.getOwner() });
+  const initialAck = signal(f.presence.events, 'event', event => event.type === 'ack');
+  const viewer = await f.start(); await initialAck;
+  const targetKey = viewer.state.target.key;
+  phases.unshift({ name: 'Earlier', tasks: [{ content: 'EARLY_RUN', status: 'in_progress' },
+    ...Array.from({ length: 35 }, (_, index) => ({ content: `History ${index}`, status: 'completed' }))] });
+  const retained = signal(viewer.events, 'frame', value => value.sequence === 2);
+  await f.presence.publish({ ...projection(), ...f.presence.getOwner() }); await retained;
+  assert.equal(viewer.state.target.key, targetKey);
+  const paused = signal(viewer.events, 'preferences', value => !value.follow);
+  viewer.key('k'); const saved = await paused;
+  const failed = signal(viewer.events, 'frame', () => viewer.state.availability === 'last-known');
+  f.presence.sourceFailed(new Error('Owned source unavailable'), f.presence.getOwner());
+  await failed;
+  assert.equal(viewer.state.target.key, targetKey);
+  assert.ok(!viewer.frame.bodyLines.some(line => stripVTControlCharacters(line).startsWith('>* ')));
+  const disconnected = signal(viewer.events, 'disconnected');
+  await f.presence.close(); await disconnected;
+  assert.equal(viewer.state.availability, 'disconnected');
+  assert.equal(viewer.state.target.key, targetKey);
+  const owner = f.presence.getOwner();
+  const replacement = createPresence({ ...owner,
+    storage: createSnapshotStorage({ path: f.cachePath }),
+    pipePath: `\\\\.\\pipe\\todo-viewer-${process.pid}-${randomUUID()}-reattach` });
+  t.after(() => replacement.close());
+  await replacement.start();
+  await replacement.publish({ ...projection(), ...replacement.getOwner() });
+  const reattached = signal(viewer.events, 'snapshot', value => value.snapshot.sequence === 1);
+  await f.writeState({ ...f.state, presenceOffer: replacement.offer('todo') });
+  await reattached;
+  assert.equal(viewer.state.role.ownerKey, owner.ownerKey);
+  assert.equal(viewer.state.role.sessionId, owner.sessionId);
+  assert.equal(viewer.state.role.scopeEpoch, owner.scopeEpoch);
+  assert.equal(viewer.state.target.key, targetKey);
+  assert.equal(viewer.state.follow, false);
+  assert.equal(viewer.state.scroll, saved.scroll);
+  const resumed = signal(viewer.events, 'preferences', value => value.follow);
+  viewer.key('f'); await resumed;
+  assert.equal(viewer.state.target.key, targetKey);
+  assert.equal(viewer.state.scroll, saved.scroll);
+  assert.equal(JSON.parse(await fs.readFile(f.state.prefsPath, 'utf8')).scroll, saved.scroll);
+  phases.length = 0;
+  const emptied = signal(viewer.events, 'snapshot', value => value.snapshot.availability === 'empty');
+  await replacement.publish({ ...projection(), ...replacement.getOwner() }); await emptied;
+  assert.equal(viewer.state.target, null);
+  phases.push({ name: 'Earlier', tasks: [{ content: 'EARLY_RUN', status: 'in_progress' }] },
+    { name: 'Current', tasks: [{ content: 'TODO_PAR', status: 'in_progress' }] });
+  const repopulated = signal(viewer.events, 'snapshot', value => value.snapshot.sequence === 3);
+  await replacement.publish({ ...projection(), ...replacement.getOwner() }); await repopulated;
+  assert.equal(viewer.state.target.content, 'EARLY_RUN');
+});

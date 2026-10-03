@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { createRoleClient } from './presence.mjs';
 import { sameSnapshotScope, validSnapshot } from './storage.mjs';
 import { readRoleState, registerRoleViewer, requestRoleClose } from './controller.mjs';
-import { renderFrame } from './render.mjs';
+import { renderFrame, runningTarget } from './render.mjs';
 import { t } from './i18n.mjs';
 
 const pathKey = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
@@ -75,7 +75,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   let state = null, snapshot = null, availability = 'waiting', error = '';
   let client = null, message = null, generation = 0, observation = 0, validatedObservation = -1;
   let invalidState = false;
-  let prefs = { scroll: 0, askScroll: 0 }, manualScroll = false;
+  let prefs = { scroll: 0, askScroll: 0, follow: true }, scroll = 0, target = null;
   let refreshing = null, dirty = false, closing = false, closeJob;
   let painting = Promise.resolve(), saving = Promise.resolve(), lastFrame;
   let resolveClosed;
@@ -86,10 +86,12 @@ export async function startViewer(options, { input = process.stdin, output = pro
   const write = text => new Promise((done, fail) => output.write(text, cause => cause ? fail(cause) : done()));
   function draw() {
     if (closing) return painting;
+    if (availability === 'current' || availability === 'empty') target = runningTarget(snapshot, target);
     const frame = renderFrame(snapshot, { columns: output.columns ?? 80, rows: output.rows ?? 24,
       language: state?.language, availability, error, color: interactive,
-      ...prefs, revealTarget: !manualScroll });
-    prefs = { scroll: frame.scroll, askScroll: frame.askScroll };
+      ...prefs, scroll, target: availability === 'current' ? target : null,
+      revealTarget: prefs.follow && availability === 'current' });
+    scroll = frame.scroll;
     lastFrame = frame;
     const captured = { frame, client, message, generation, observation,
       scope: state && { ownerKey: state.ownerKey, sessionId: state.sessionId, scopeEpoch: state.scopeEpoch },
@@ -153,13 +155,14 @@ export async function startViewer(options, { input = process.stdin, output = pro
     });
   }
   async function preferences(next, epoch) {
-    prefs = { scroll: 0, askScroll: 0 }; manualScroll = false;
+    prefs = { scroll: 0, askScroll: 0, follow: true }; scroll = 0; target = null;
     try {
       const value = JSON.parse(await readFile(next.prefsPath, 'utf8'));
       if (epoch === generation && value.schema === 'omo-herdr-todo/view/1' && sameSnapshotScope(value, next) &&
-        [value.scroll, value.askScroll].every(number => Number.isSafeInteger(number) && number >= 0)) {
-        prefs = { scroll: value.scroll, askScroll: value.askScroll };
-        manualScroll = value.scroll > 0;
+        [value.scroll, value.askScroll].every(number => Number.isSafeInteger(number) && number >= 0) &&
+        (value.follow === undefined || typeof value.follow === 'boolean')) {
+        prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: value.follow ?? true };
+        scroll = prefs.scroll;
       }
     } catch (cause) {
       if (cause.code !== 'ENOENT' && epoch === generation) error = t(next.language, 'prefsError', { error: cause.message });
@@ -280,16 +283,22 @@ export async function startViewer(options, { input = process.stdin, output = pro
   function key(sequence) {
     if (closing) return;
     if (['q', '\x03', '\x04'].includes(sequence)) return close(true);
-    const old = { ...prefs };
     const page = Math.max(1, lastFrame?.bodyRows ?? 1);
-    if (sequence === 'j' || sequence === '\x1b[B') { prefs.scroll++; manualScroll = true; }
-    if (sequence === 'k' || sequence === '\x1b[A') { prefs.scroll = Math.max(0, prefs.scroll - 1); manualScroll = true; }
-    if (sequence === '\x1b[6~') { prefs.scroll += page; manualScroll = true; }
-    if (sequence === '\x1b[5~') { prefs.scroll = Math.max(0, prefs.scroll - page); manualScroll = true; }
-    if (sequence === 'a') prefs.askScroll++;
-    if (sequence === 'z') prefs.askScroll = Math.max(0, prefs.askScroll - 1);
+    const body = ['j', 'k', '\x1b[B', '\x1b[A', '\x1b[6~', '\x1b[5~'].includes(sequence);
+    if (sequence === 'f') prefs.follow = !prefs.follow;
+    else if (body || sequence === 'a' || sequence === 'z') {
+      prefs.follow = false; // Pause this role before any manual movement.
+      if (sequence === 'j' || sequence === '\x1b[B') scroll++;
+      if (sequence === 'k' || sequence === '\x1b[A') scroll = Math.max(0, scroll - 1);
+      if (sequence === '\x1b[6~') scroll += page;
+      if (sequence === '\x1b[5~') scroll = Math.max(0, scroll - page);
+      if (sequence === 'a') prefs.askScroll++;
+      if (sequence === 'z') prefs.askScroll = Math.max(0, prefs.askScroll - 1);
+    } else return;
     void draw();
-    if (state && (old.scroll !== prefs.scroll || old.askScroll !== prefs.askScroll)) savePreferences();
+    if (body) prefs.scroll = scroll;
+    if (sequence === 'a' || sequence === 'z') prefs.askScroll = lastFrame.askScroll;
+    if (state) savePreferences();
   }
   const keypress = (text, pressed) => { void key(pressed.sequence || text || pressed.name); };
   const resize = () => { void draw(); };
@@ -321,7 +330,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
     throw cause;
   }
   return { events, closed, draw, refresh, key, close,
-    get state() { return { role: state, snapshot, availability, error, ...prefs }; },
+    get state() { return { role: state, snapshot, availability, error, ...prefs, target }; },
     get frame() { return lastFrame; } };
 }
 

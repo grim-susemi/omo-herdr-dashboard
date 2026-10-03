@@ -86,9 +86,19 @@ function counts(tasks) {
 }
 const clamp = (value, max) => Math.min(Math.max(0, Math.floor(value || 0)), Math.max(0, max));
 
+// Retain native display identity, never the projection's pending fallback.
+export function runningTarget(snapshot, previous) {
+  const targets = (snapshot?.phases ?? []).flatMap((phase, phaseIndex) =>
+    phase.tasks.flatMap((task, taskIndex) => task.status === 'in_progress' ? [{
+      phaseIndex, taskIndex, phaseName: phase.name,
+      key: snapshot.phaseSummaries[phaseIndex].taskKeys[taskIndex], ...task,
+    }] : []));
+  return targets.find(target => target.key === previous?.key) ?? targets[0] ?? null;
+}
+
 export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en',
   availability = snapshot?.availability ?? 'waiting', error = '', color = true,
-  scroll = 0, askScroll = 0, revealTarget = false } = {}) {
+  scroll = 0, askScroll = 0, revealTarget = false, target = snapshot?.target, follow = true } = {}) {
   // Keep the terminal's final cell free, as in the existing DAG renderer.
   // ConPTY can otherwise wrap a wide glyph before the following cursor move.
   columns = Math.max(1, Math.floor(columns) - 1);
@@ -96,7 +106,6 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const phases = snapshot?.phases ?? [];
   const total = counts(phases.flatMap(phase => phase.tasks));
   const tally = count => `${count.closed}/${count.total}${columns >= 24 ? ` ${t(language, 'closed')}` : ''} ${t(language, 'completed')}:${count.completed} ${t(language, 'dropped')}:${count.dropped}`;
-  const target = snapshot?.target;
   const head = `${t(language, 'todo')} | ${t(language, availability)}`;
   const current = `${t(language, 'now')}: ${target ? clean(target.content) : t(language, 'idle')}`;
   const taskRanges = Object.create(null), phaseRanges = Object.create(null);
@@ -170,7 +179,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   scroll = clamp(scroll, bodyLines.length - bodyRows);
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
   while (visible.length < bodyRows) visible.push('');
-  const footer = t(language, 'controls');
+  const footer = `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
   const lines = [...top, ...ask, ...visible, paint(fit(footer, columns), 'pending', color)].slice(0, rows);
   return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll, bodyRows, askRows };
 }
