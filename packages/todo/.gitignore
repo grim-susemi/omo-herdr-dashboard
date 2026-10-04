@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tgz
+.tmp-e1/
+.dist-stage-*/
+*.log

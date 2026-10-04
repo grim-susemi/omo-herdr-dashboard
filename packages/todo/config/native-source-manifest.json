@@ -1,0 +1,73 @@
+{
+  "schema": "omo-herdr-todo/native-source-manifest/1",
+  "sdkPackage": "@code-yeongyu/senpi",
+  "sdkVersion": "2026.10.7",
+  "recordedAtUtc": "2026-10-04T11:51:04.805Z",
+  "purpose": "Read-only sha256 identity of the installed SDK files used by npm run test:host. test-host.mjs asserts the version and every hash before and after the run.",
+  "files": [
+    {
+      "path": "package.json",
+      "sha256": "4ae54aecc7cff6e2bb36b45c854909fe7e3dc3be17046f436fa580d6d35a044b"
+    },
+    {
+      "path": "dist/core/resource-loader.js",
+      "sha256": "6a0a686c7d87a79c719f6637fbd7d5e10d8d5f2d41b473ad55b4cafc99fcacc7"
+    },
+    {
+      "path": "dist/core/settings-manager.js",
+      "sha256": "a93d35728507dbb92682ce1ec99963d569aabd3db2af83f3bdd3b1e720e38417"
+    },
+    {
+      "path": "dist/core/session-manager.js",
+      "sha256": "62dd278dbf81edc3ed5dcde129d2c614fd83dc3f5ee71778b3fb88c40e600a2e"
+    },
+    {
+      "path": "dist/core/extensions/loader.js",
+      "sha256": "9b2b4e480f019e15772daababc5cb5c702ade92cb245216c28b9f533c9d1f6f4"
+    },
+    {
+      "path": "dist/core/extensions/runner.js",
+      "sha256": "922ce4e7038ea6a6b0f4cfccb316a732aba8e2c38535f5997741f3395f444da0"
+    },
+    {
+      "path": "dist/core/extensions/builtin/index.js",
+      "sha256": "94047d7391dd43b87d62f9d2c0539722274fc91382864115e603a83e344aba23"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/index.js",
+      "sha256": "112bb63ef35771656689d06739d76616ac12874962daf7b5d8866e5d0483280b"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/commands.js",
+      "sha256": "764d06508ad2333beb404fcf764bf42c21a5f5af5812c47c5816dcf1098835d9"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/state.js",
+      "sha256": "940eb41782f75cd6e4717302c0104c36fb15982a8230582a7329c9a1eb1038fd"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/todo-storage.js",
+      "sha256": "dc02b54a68fb8296bc282f3aa19405a6381a96ad9c6cc02246702500261e1803"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/todo-widget-component.js",
+      "sha256": "0230e7485490e30adda747760cfadaa57bf1f619584a615a208cc413a650c1e0"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/todo-widget.js",
+      "sha256": "b63a97c8edc37b5348a815a34c931bb12c40490603805167dd7e2eb2a52a38ed"
+    },
+    {
+      "path": "dist/core/extensions/builtin/todotools/tools/todo.js",
+      "sha256": "c309f81be271b1621ac7dfa8bc89c352aa73de8e4b89e8d8c35c5ff0655b894d"
+    },
+    {
+      "path": "dist/modes/interactive/interactive-mode.js",
+      "sha256": "2d5540c419fa7fce86d32d88fc7fad8cc16c29a9113d2f19714999149fdffc12"
+    },
+    {
+      "path": "dist/modes/interactive/theme/theme.js",
+      "sha256": "343126cf42b9a79f6e0d4ae565c3a3bf76d8ad865ccb4e72d5fa7c46ec93d9fb"
+    }
+  ]
+}
