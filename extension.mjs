@@ -1,9 +1,18 @@
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { languageOf } from './src/i18n.mjs';
 import { isChildSession } from './src/child-guard.mjs';
 import { bindDisplayBridgeSignals } from './src/display-bridge.mjs';
 import { resolveDashboardNode, TodoPane } from './src/controller.mjs';
+
+export function installedLanguage(environment = process.env) {
+  let selected = 'en';
+  try { selected = JSON.parse(readFileSync(new URL('./locale.json', import.meta.url), 'utf8')).language; }
+  catch (error) { if (error.code !== 'ENOENT') console.warn('Todo pane: Cannot read locale configuration: '+error.message); }
+  return languageOf(environment.OMO_HERDR_TODO_LANG ?? selected);
+}
 
 export default function extension(pi) {
   let controller;
@@ -28,7 +37,7 @@ export default function extension(pi) {
       stateDir: process.env.OMO_HERDR_TODO_STATE_DIR ?? join(homedir(), '.omo', 'agent', 'herdr-todo'),
       viewer: join(dirname(fileURLToPath(import.meta.url)), 'src/viewer.mjs'),
       node: () => resolveDashboardNode(),
-      language: process.env.OMO_HERDR_TODO_LANG ?? 'en',
+      language: installedLanguage(),
       notify: message => ctx.ui.notify(message, 'warning') });
     controller = next;
     try { await next.start(); }

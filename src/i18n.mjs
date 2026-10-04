@@ -29,9 +29,24 @@ export const messages = {
     cacheError: 'Todo 파생 캐시가 잘못되었습니다.',
     prefsError: '화면 설정: {error}', registrationError: '뷰어 소유권을 확인하지 못했습니다.',
   },
+  'zh-cn': {
+    closedPhases: '已关闭阶段 ({count})', controlsNarrow: 'j/k a/z c q',
+    todo: 'Todo', current: '在线', empty: '原生列表为空', waiting: '等待连接',
+    error: '读取错误', 'last-known': '记录 / 离线', disconnected: '连接结束 / 记录',
+    closed: '关闭', completed: '完成', dropped: '移除', ask: '请求', now: '当前',
+    idle: '无当前目标', noAsk: '无已保存请求', emptyPhase: '(空阶段)',
+    emptyBody: '原生清单为空。', waitingBody: '等待原生 Todo 连接。',
+    errorBody: '无法读取原生 Todo。', readError: '读取错误: {error}',
+    controls: 'j/k 工作 a/z 请求 c 已关闭 q 关闭', position: '工作 {start}-{end}/{total}',
+    followOn: '自动跟随 ON', followOff: '自动跟随 OFF',
+    followShortOn: '跟随 ON', followShortOff: '跟随 OFF',
+    invalidBinding: 'CLI 与 Todo 角色信息不匹配。',
+    cacheError: 'Todo 派生缓存无效。',
+    prefsError: '视图设置: {error}', registrationError: '无法验证查看器所有权。',
+  },
 };
 
-export const languageOf = value => value === 'ko' ? 'ko' : 'en';
+export const languageOf = value => ['en', 'ko', 'zh-cn'].includes(value) ? value : 'en';
 export function t(language, key, values = {}) {
   const template = messages[languageOf(language)][key];
   if (template === undefined) throw new Error(`Unknown translation key: ${key}`);
