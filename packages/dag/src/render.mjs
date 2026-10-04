@@ -1,0 +1,457 @@
+import { t } from './i18n.mjs';
+import { clean, layers, terminal } from './model.mjs';
+import { TASK_SCOPE, isExpanded } from './view-state.mjs';
+
+const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+export function width(text) {
+  let result = 0;
+  for (const { segment } of segmenter.segment(clean(text))) {
+    const cp = segment.codePointAt(0);
+    result += /\p{Extended_Pictographic}/u.test(segment) || cp >= 0x1100 &&
+      (cp <= 0x115f || cp === 0x2329 || cp === 0x232a || cp >= 0x2e80 && cp <= 0xa4cf ||
+       cp >= 0xac00 && cp <= 0xd7a3 || cp >= 0xf900 && cp <= 0xfaff ||
+       cp >= 0xfe10 && cp <= 0xfe6f || cp >= 0xff01 && cp <= 0xff60 || cp >= 0xffe0 && cp <= 0xffe6 ||
+       cp >= 0x20000) ? 2 : 1;
+  }
+  return result;
+}
+export function fit(text, columns, pad = false) {
+  text = clean(text);
+  if (columns <= 0) return '';
+  let out = '', used = 0;
+  const truncated = width(text) > columns;
+  for (const { segment } of segmenter.segment(text)) {
+    const size = width(segment);
+    if (used + size > columns - (truncated ? 1 : 0)) break;
+    out += segment; used += size;
+  }
+  if (truncated) { out += '…'; used += 1; }
+  return out + (pad ? ' '.repeat(Math.max(0, columns - used)) : '');
+}
+// Streamed output grows at its end, so keep the newest characters visible.
+export function fitTail(text, columns) {
+  text = clean(text);
+  if (columns <= 0) return '';
+  if (width(text) <= columns) return text;
+  const kept = [];
+  let used = 1;
+  for (const segment of [...segmenter.segment(text)].map(part => part.segment).reverse()) {
+    const size = width(segment);
+    if (used + size > columns) break;
+    kept.unshift(segment); used += size;
+  }
+  return `…${kept.join('')}`;
+}
+// A token phase with no new token, or a request with no first token, for this
+// long suggests a stalled model call. Tools may legitimately run for minutes.
+export const STALL_TOKEN_MS = 30000;
+export const STALL_WAIT_MS = 90000;
+const activityMarks = { text: '✎', thinking: '💭', toolArgs: '⚙', waiting: '⏳', tool: '▶', retry: '↻' };
+const tokenPhases = new Set(['text', 'thinking', 'toolArgs']);
+function compactDuration(language, ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
+  return [hours ? t(language, 'compactHours', { count: hours }) : '',
+    hours || minutes ? t(language, 'compactMinutes', { count: minutes }) : '',
+    t(language, 'compactSeconds', { count: seconds % 60 })].filter(Boolean).join(' ');
+}
+// Liveness of a running task's model call: which phase it is in, how long ago
+// it last produced output, and whether that gap looks stalled.
+export function activitySummary(task, language, now = Date.now()) {
+  const activity = task?.status === 'running' ? task.activity : undefined;
+  if (!activity || !activityMarks[activity.phase] || !Number.isFinite(activity.since) || !Number.isFinite(activity.lastAt)) return null;
+  const tokens = tokenPhases.has(activity.phase);
+  const gap = now - activity.lastAt, span = now - activity.since;
+  const stalled = tokens ? gap >= STALL_TOKEN_MS : activity.phase === 'waiting' && span >= STALL_WAIT_MS;
+  const tool = activity.tool ? clean(activity.tool) : '';
+  let label;
+  if (tokens) label = [activity.phase === 'toolArgs' ? tool : '', gap < 2000 ? t(language, 'activityNow') :
+    t(language, 'activityAgo', { time: compactDuration(language, gap) })].filter(Boolean).join(' ');
+  else if (activity.phase === 'waiting') label = t(language, 'activityWaiting', { time: compactDuration(language, span) });
+  else if (activity.phase === 'tool') label = t(language, 'activityTool', { tool: tool || '?', time: compactDuration(language, span) });
+  else label = t(language, 'activityRetry', { attempt: activity.attempt ?? '?', max: activity.maxAttempts ?? '?', time: compactDuration(language, span) });
+  return { head: stalled ? `⚠ ${t(language, 'activityStalled')} · ${label}` : `${activityMarks[activity.phase]} ${label}`,
+    text: tokens && typeof activity.text === 'string' ? clean(activity.text) : '', stalled };
+}
+const icons = { pending: '○', blocked: '◌', scheduled: '◷', running: '●', paused: 'Ⅱ', completed: '✓', failed: '×', cancelled: '−', skipped: '·', error: '×', interrupted: '−', lost: '?' };
+const colors = { running: '36', completed: '32', failed: '31', blocked: '33', paused: '33', scheduled: '36', error: '31' };
+const accent = '36';
+const paint = (text, color, enabled) => enabled && color ? `\x1b[${color}m${text}\x1b[0m` : text;
+const taskStatuses = new Set([...Object.keys(icons), 'error', 'interrupted', 'lost']);
+
+export function standaloneTasks(state) {
+  const linked = new Set((state?.runs ?? []).flatMap(run => run.nodes.map(node => node.taskId)));
+  return (state?.tasks ?? []).filter(task => !task.parentTaskId && !linked.has(task.id))
+    .sort((a, b) => Number(b.status === 'running') - Number(a.status === 'running') || a.id.localeCompare(b.id));
+}
+
+// Follow execution identity, not array order or the user's detail selection.
+export function runningTarget(state, previous) {
+  if (!state?.connected) return undefined;
+  const targets = (state.runs ?? []).flatMap(run => run.nodes.filter(node => node.state === 'running')
+    .map(node => ({ view: 'dag', runId: run.id, nodeId: node.id, taskId: node.taskId })));
+  targets.push(...standaloneTasks(state).filter(task => task.status === 'running')
+    .map(task => ({ view: 'tasks', taskId: task.id })));
+  return targets.find(target => target.view === previous?.view && (target.view === 'dag' ?
+    target.runId === previous.runId && target.nodeId === previous.nodeId : target.taskId === previous.taskId)) ??
+    (previous?.taskId ? targets.find(target => target.taskId === previous.taskId) : undefined) ?? targets[0];
+}
+
+export function graphLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], now = Date.now(), graphRanges } = {}) {
+  const output = [];
+  const stalledNodes = new Set();
+  const rows = layers(run, language);
+  let previous = [];
+  const glyphs = { 1: '│', 2: '─', 3: '└', 4: '│', 5: '│', 6: '┌', 7: '├', 8: '─', 9: '┘', 10: '─', 11: '┴', 12: '┐', 13: '┤', 14: '┬', 15: '┼' };
+  function connectors(current) {
+    const grid = Array.from({ length: 3 }, () => Array(columns).fill(0));
+    const targets = new Set();
+    for (const edge of run.edges) {
+      const from = previous.find(n => n.id === edge.from), to = current.find(n => n.id === edge.to);
+      if (!from || !to) continue;
+      const a = from.center, b = to.center;
+      grid[0][a] |= 5; grid[1][a] |= 1;
+      if (a < b) { for (let x = a; x < b; x++) { grid[1][x] |= 2; grid[1][x + 1] |= 8; } }
+      if (a > b) { for (let x = b; x < a; x++) { grid[1][x] |= 2; grid[1][x + 1] |= 8; } }
+      grid[1][b] |= 4; targets.add(b);
+    }
+    if (!targets.size) return [''];
+    return grid.map((row, y) => paint(row.map((bits, x) => y === 2 && targets.has(x) ? '▼' : glyphs[bits] ?? ' ').join('').trimEnd(), accent, color));
+  }
+  // Exact incoming IDs and the edge list disambiguate crossings and edges which
+  // skip a frontier. Wide frontiers wrap without changing their dependencies.
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const perRow = Math.max(1, Math.floor((columns + 2) / 22));
+    for (let offset = 0; offset < row.length; offset += perRow) {
+      const group = row.slice(offset, offset + perRow);
+      const boxWidth = Math.min(34, Math.floor((columns - 2 * (group.length - 1)) / group.length));
+      const left = Math.floor((columns - (boxWidth * group.length + 2 * (group.length - 1))) / 2);
+      const prefix = ' '.repeat(left);
+      const positions = group.map((node, i) => ({ id: node.id, center: left + i * (boxWidth + 2) + Math.floor(boxWidth / 2) }));
+      if (index || offset) output.push(...connectors(positions));
+      const start = output.length;
+      const interiors = group.map(node => {
+        const incoming = run.edges.filter(e => e.to === node.id).map(e => e.from);
+        const task = node.state === 'running' ? tasks.find(task => task.id === node.taskId) : undefined;
+        const state = `${icons[node.state]} ${t(language, node.state)}`;
+        const activity = activitySummary(task, language, now);
+        const head = activity ? `${state} ${activity.head}` : state;
+        const room = boxWidth - 4 - width(head) - 1;
+        const stateLine = activity?.text && room >= 4 ? `${head} ${fitTail(activity.text, room)}` : head;
+        stalledNodes.add(activity?.stalled ? node.id : undefined);
+        return [
+          fit(`${node.id === selectedNodeId ? '>' : ' '} [${isExpanded(viewState, run.id, node.id, node.state) ? '-' : '+'}] ${node.label}`, boxWidth - 4, true),
+          fit(stateLine, boxWidth - 4, true),
+          fit(incoming.length ? `← ${incoming.join(', ')}` : t(language, 'startNode'), boxWidth - 4, true),
+        ];
+      });
+      output.push(prefix + group.map(node => paint(`╭${'─'.repeat(Math.max(0, boxWidth - 2))}╮`, colors[node.state], color)).join('  '));
+      for (let line = 0; line < 3; line++) output.push(prefix + group.map((node, i) =>
+        `${paint('│', colors[node.state], color)} ${paint(interiors[i][line], line === 1 && stalledNodes.has(node.id) ? colors.paused : line < 2 ? colors[node.state] : undefined, color)} ${paint('│', colors[node.state], color)}`).join('  '));
+      output.push(prefix + group.map(node => paint(`╰${'─'.repeat(Math.max(0, boxWidth - 2))}╯`, colors[node.state], color)).join('  '));
+      if (graphRanges) for (const node of group) graphRanges[node.id] = { start, end: output.length };
+      if (offset + perRow < row.length) output.push(`  · ${t(language, 'sameFrontier')}`);
+      previous = positions;
+    }
+  }
+  return output;
+}
+
+// Wrap at word boundaries when possible, never dropping the tail of task text.
+function wrap(text, columns) {
+  const result = [];
+  let line = '';
+  for (const { segment } of segmenter.segment(clean(text))) {
+    if (line && width(line + segment) > columns) {
+      const space = line.lastIndexOf(' ');
+      if (space > 0 && segment !== ' ') {
+        result.push(line.slice(0, space));
+        line = line.slice(space + 1);
+      } else { result.push(line); line = ''; }
+      if (line && width(line + segment) > columns) { result.push(line); line = ''; }
+    }
+    line += segment;
+  }
+  result.push(line);
+  return result;
+}
+
+function elapsedTime(task, { now, connected, updatedAt }, status) {
+  const start = Date.parse(task.startedAt);
+  // Completion is authoritative. A terminal task without its endpoint is not
+  // still running; disconnected snapshots can only use their recorded time.
+  const end = task.completedAt !== undefined ? Date.parse(task.completedAt) :
+    status === 'running' ? (connected ? now : Date.parse(updatedAt)) : NaN;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  const seconds = Math.floor((end - start) / 1000);
+  return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+    .map(value => String(value).padStart(2, '0')).join(':');
+}
+
+const measured = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+function metricSummary(task, language) {
+  const metrics = task?.metrics;
+  const quality = metrics?.cost_status;
+  const knownCost = measured(metrics?.cost_usd) && quality !== 'unavailable' && quality !== 'invalid';
+  const cost = knownCost ? `${metrics.cost_usd > 0 && metrics.cost_usd < 0.0001 ?
+    '<$0.0001' : `$${metrics.cost_usd.toFixed(4)}`} [${t(language, quality === 'reported' || quality === 'estimated' ? quality : 'metricUnknown')}]` :
+    `${t(language, 'cost')}: ${t(language, 'metricUnknown')}`;
+  const native = measured(metrics?.tokens_per_second);
+  const derived = Number.isSafeInteger(metrics?.output_tokens) && metrics.output_tokens >= 0 &&
+    measured(metrics?.generation_ms) && metrics.generation_ms > 0;
+  const rate = native ? metrics.tokens_per_second : derived ? metrics.output_tokens * 1000 / metrics.generation_ms : undefined;
+  const speed = measured(rate) ? `${native ? rate : Math.round(rate)} tok/s${native ? '' : ` [${t(language, 'estimated')}]`}` :
+    `tok/s: ${t(language, 'metricUnknown')}`;
+  return `${cost} · ${speed}`;
+}
+
+function metricLines(task, language) {
+  const metrics = task.metrics;
+  const lines = [metricSummary(task, language)];
+  for (const key of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'total_tokens',
+    'generation_ms', 'runtime_ms']) {
+    const valid = key.endsWith('_tokens') ? Number.isSafeInteger(metrics?.[key]) && metrics[key] >= 0 : measured(metrics?.[key]);
+    lines.push(`${t(language, key)}: ${valid ? metrics[key] : t(language, 'metricUnknown')}`);
+  }
+  for (const key of ['token_status', 'cost_status', 'duration_status']) {
+    lines.push(`${t(language, key)}: ${metrics?.[key] === undefined ? t(language, 'metricUnknown') : clean(metrics[key])}`);
+  }
+  lines.push(`${t(language, 'metricSource')}: ${metrics?.source ? clean(metrics.source) : t(language, 'collectionPending')}`,
+    `${t(language, 'metricReportedAt')}: ${metrics?.reportedAt ? clean(metrics.reportedAt) : t(language, 'metricUnknown')}`,
+    `${t(language, 'reportedAt')}: ${task.reportedAt ? clean(task.reportedAt) : t(language, 'metricUnknown')}`);
+  return lines;
+}
+
+function taskLines(task, language, timing, nodeStatus) {
+  const value = key => task?.[key] === undefined || task[key] === null || task[key] === '' ? t(language, 'noData') : clean(task[key]);
+  if (!task) return [`${t(language, 'task')}: ${t(language, 'noData')}`];
+  const lines = [`${t(language, 'task')}: ${clean(task.id)}`];
+  if (task.status) lines.push(`${t(language, 'taskStatus')}: ${taskStatuses.has(task.status) ? t(language, task.status) : clean(task.status)}`);
+  for (const key of ['description', ...(task.category ? ['category'] : []), 'agent', 'model', 'progress']) lines.push(`${t(language, key)}: ${value(key)}`);
+  const activity = timing.connected ? activitySummary(task, language, timing.now) : null;
+  if (activity) lines.push(`${t(language, 'activity')}: ${activity.head}${activity.text ? ` · ${activity.text}` : ''}`);
+  const stats = [`${t(language, 'elapsed')}: ${elapsedTime(task, timing, task.status ?? nodeStatus) ?? t(language, 'noData')}`];
+  for (const key of ['turns', 'toolCalls']) {
+    if (task[key] !== undefined && task[key] !== null) stats.push(`${t(language, key)}: ${value(key)}`);
+  }
+  lines.push(stats.join(' · '));
+  for (const key of ['startedAt', 'completedAt']) {
+    if (task[key] !== undefined && task[key] !== null) lines.push(`${t(language, key)}: ${value(key)}`);
+  }
+  lines.push(...metricLines(task, language));
+  return lines;
+}
+
+function compactTaskLines(task, language, timing, columns, { selected = false, node, depth = 0, collapsed = false } = {}) {
+  const value = text => text === undefined || text === null || text === '' ? '-' : clean(text);
+  const status = node?.state ?? task?.status;
+  const duration = task ? elapsedTime(task, timing, status) : null;
+  let elapsed = '-';
+  if (duration !== null) {
+    const [hours, minutes, seconds] = duration.split(':').map(Number);
+    elapsed = [hours ? t(language, 'compactHours', { count: hours }) : '',
+      hours || minutes ? t(language, 'compactMinutes', { count: minutes }) : '',
+      t(language, 'compactSeconds', { count: seconds })].filter(Boolean).join(' ');
+  }
+  const stats = [elapsed];
+  for (const [key, label] of [['turns', 'compactTurns'], ['toolCalls', 'compactTools']]) {
+    if (task?.[key] !== undefined && task[key] !== null) stats.push(t(language, label, { count: value(task[key]) }));
+  }
+  const indent = '  '.repeat(Math.min(depth, 3));
+  const marker = depth ? '↳' : selected ? '>' : ' ';
+  const identity = [task?.agent, task?.category].filter(Boolean).map(clean).join('/');
+  return [
+    `${indent}${marker} ${icons[status] ?? '?'} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`,
+    `${indent}${value(identity)} · ${value(task?.model).replace(/^[^/\s]+\//u, '')}`,
+    `${indent}${value(task?.progress)}`,
+    `${indent}${stats.join(' · ')}`,
+    `${indent}${metricSummary(task, language)}`,
+  ].map((line, index) => {
+    const room = Math.max(1, columns - 4);
+    const activity = index === 2 && timing.connected ? activitySummary(task, language, timing.now) : null;
+    if (!activity) return fit(line, room);
+    const head = `${indent}${activity.head}`;
+    const rest = room - width(head) - 3;
+    return activity.text && rest >= 4 ? `${head} · ${fitTail(activity.text, rest)}` : fit(head, room);
+  });
+}
+
+function taskDescendants(task, tasks) {
+  // Only parentTaskId establishes ownership. DAG edges never imply subtasks.
+  const visited = new Set(task ? [task.id] : []);
+  const descendants = [];
+  const pending = task ? tasks.filter(child => child.parentTaskId === task.id).map(child => ({ task: child, depth: 1 })) : [];
+  while (pending.length) {
+    const { task: child, depth } = pending.shift();
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
+    descendants.push({ task: child, depth });
+    pending.unshift(...tasks.filter(task => task.parentTaskId === child.id).map(task => ({ task, depth: depth + 1 })));
+  }
+  return descendants;
+}
+
+export function completedTasks(state) {
+  return standaloneTasks(state).filter(task => task.status === 'completed' &&
+    taskDescendants(task, state?.tasks ?? []).every(({ task: child }) =>
+      terminal.has(child.status) && !['failed', 'error', 'lost'].includes(child.status)));
+}
+
+function descendantLines(task, tasks, language, timing, columns) {
+  return taskDescendants(task, tasks).flatMap(({ task: child, depth }) =>
+    compactTaskLines(child, language, timing, columns, { depth }));
+}
+
+function detailBox(text, columns, color, status, label) {
+  const inner = Math.max(1, columns - 4);
+  const border = colors[status];
+  const title = label !== undefined && columns >= 7 ? `─ ${fit(label, columns - 6)} ` : '';
+  return [paint(`╭${title}${'─'.repeat(Math.max(0, columns - 2 - width(title)))}╮`, border, color),
+    ...text.flatMap((line, index) => wrap(line, inner).map(part =>
+      `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color)} ${paint('│', border, color)}`)),
+    paint(`╰${'─'.repeat(Math.max(0, columns - 2))}╯`, border, color)];
+}
+
+function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
+  const detailed = selected && verbose;
+  const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded && !detailed });
+  const text = detailed ? [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${icons[node.state]} ${t(language, node.state)}`] : []),
+    ...taskLines(task, language, timing, node?.state)] : expanded ? compact : compact.slice(0, 1);
+  if (expanded || detailed) text.push(...descendantLines(task, tasks, language, timing, columns));
+  return compactCompleted && !expanded && !detailed ? [paint(fit(compact[0], columns), colors[task?.status], color)] :
+    detailBox(text, columns, color, node?.state ?? task?.status, node?.label ?? node?.id);
+}
+
+const RUN_SELECTOR_LIMIT = 5;
+
+function visibleRunSelector(runs, selectedId) {
+  if (runs.length <= RUN_SELECTOR_LIMIT) return runs;
+  const selected = Math.max(0, runs.findIndex(run => run.id === selectedId));
+  const start = Math.min(Math.max(0, selected - RUN_SELECTOR_LIMIT + 1), runs.length - RUN_SELECTOR_LIMIT);
+  return runs.slice(start, start + RUN_SELECTOR_LIMIT);
+}
+
+function runSummary(run, language, columns, selected) {
+  const total = run.nodes.length;
+  const running = run.nodes.filter(node => node.state === 'running').length;
+  const waiting = run.nodes.filter(node => !terminalState(node.state) && node.state !== 'running').length;
+  const completed = run.nodes.filter(node => node.state === 'completed').length;
+  const marker = selected ? '>' : ' ';
+  return fit(`${marker} ${run.name}  ${completed}/${total} ${t(language, 'total')} · ${t(language, 'runningCount', { count: running })} · ${t(language, 'waitingCount', { count: waiting })}`, columns);
+}
+function terminalState(status) { return terminal.has(status); }
+
+export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scroll = 0, color = true, error = '', language = state?.language ?? 'en',
+  selectedNodeId, selectedTaskId, view, viewState, verbose = false, revealSelection = false, notice = '', now = Date.now(), completedExpanded = false,
+  follow = true, runningNodeId, runningTaskId, offline = false } = {}) {
+  columns = Math.max(1, columns - 1);
+  rows = Math.max(1, rows);
+  const all = state?.runs ?? [];
+  const run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
+  const roots = standaloneTasks(state);
+  const tasksView = view === 'tasks' || !all.length;
+  const tasksTitle = `${t(language, 'tasks')} (${roots.length})`;
+  const switcher = tasksView ? (all.length ? `  t DAG (${all.length})` : '') : `  t ${tasksTitle}`;
+  const activeRuns = all.filter(candidate => candidate.status === 'running' || candidate.nodes.some(node => node.state === 'running'));
+  const completedRuns = all.filter(candidate => !activeRuns.includes(candidate));
+  const head = [paint(fit(`OMO  /  ${tasksView ? t(language, 'tasks') : 'DAG'}${switcher}`, columns), accent, color),
+    fit(tasksView ? tasksTitle : `${t(language, 'selectedRun', { name: run.name })} · ${t(language, 'activeRuns', { count: activeRuns.length })}`, columns)];
+  const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
+  if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'),
+    ...(state?.connected ? [] : [t(language, 'disconnected')]), '');
+  if (tasksView && (roots.length || all.length)) {
+    const completed = new Set(completedTasks(state).map(task => task.id));
+    if (completed.size) head[1] = fit(`${tasksTitle} · ${t(language, 'completedTasks', { count: completed.size })} ${completedExpanded ? '[-]' : '[+]'}`, columns);
+    for (const task of roots) {
+      const compactCompleted = completed.has(task.id);
+      const explicit = viewState?.expanded?.[JSON.stringify([TASK_SCOPE, task.id])];
+      const protectedParent = task.status === 'completed' && !compactCompleted;
+      const expanded = typeof explicit === 'boolean' ? explicit :
+        protectedParent || isExpanded(viewState, TASK_SCOPE, task.id, task.status);
+      if (compactCompleted && !completedExpanded && !expanded && task.id !== selectedTaskId) continue;
+      const start = body.length;
+      body.push(...taskCard(task, state?.tasks ?? [], columns, color, language,
+        { now, connected: state?.connected, updatedAt: state?.updatedAt },
+        { selected: task.id === selectedTaskId, expanded, verbose, compactCompleted }));
+      taskRanges[task.id] = { start, end: body.length };
+    }
+    if (!roots.length) body.push(t(language, 'none'));
+  } else if (run && !tasksView) {
+    if (all.length > 1) {
+      body.push(paint(t(language, 'activeRuns', { count: activeRuns.length }), accent, color));
+      const showCompleted = completedExpanded || !activeRuns.includes(run);
+      const selectorRuns = visibleRunSelector([...activeRuns, ...(showCompleted ? completedRuns : [])], run.id);
+      for (const candidate of selectorRuns) body.push(paint(runSummary(candidate, language, columns, candidate.id === run.id), candidate.id === run.id ? accent : undefined, color));
+      if (completedRuns.length) body.push(`${t(language, 'completedRuns', { count: completedRuns.length })} ${showCompleted ? '[-]' : '[+]'}`);
+      body.push('');
+    }
+    const done = run.nodes.filter(n => n.state === 'completed').length;
+    const failed = run.nodes.filter(n => n.state === 'failed').length;
+    head.push(fit(`${t(language, run.status)} · ${t(language, 'doneCount', { done, total: run.nodes.length })}${failed ? ` · ${t(language, 'failedCount', { count: failed })}` : ''}`, columns));
+    body.push('');
+    try {
+      const ranges = Object.create(null), start = body.length;
+      body.push(...graphLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.connected ? state.tasks ?? [] : [], now, graphRanges: ranges }));
+      for (const [id, range] of Object.entries(ranges)) graphRanges[id] = { start: start + range.start, end: start + range.end };
+    }
+    catch (error) { body.push(t(language, 'graphError', { error: clean(error.message) })); }
+    body.push('', t(language, 'dependencies'));
+    if (!run.edges.length) body.push(`  ${t(language, 'none')}`);
+    for (const edge of run.edges) body.push(`  ${clean(edge.from)} → ${clean(edge.to)}`);
+    body.push('', t(language, 'details'));
+    for (const node of run.nodes) {
+      const start = body.length;
+      body.push(...taskCard(state?.tasks?.find(task => task.id === node.taskId), state?.tasks ?? [], columns, color, language,
+        { now, connected: state?.connected, updatedAt: state?.updatedAt },
+        { selected: node.id === selectedNodeId, expanded: isExpanded(viewState, run.id, node.id, node.state), verbose, node }));
+      nodeRanges[node.id] = { start, end: body.length };
+    }
+    for (const node of run.nodes) if (node.error) body.push('', `× ${clean(node.id)}: ${node.error}`);
+  } else {
+    head.push('');
+    body.push('', `  ○  ${t(language, 'waiting')}`, '', `  ${t(language, 'waitingLine1')}`, `  ${t(language, 'waitingLine2')}`);
+  }
+  const showCloseHint = !state?.connected;
+  const narrow = columns < 40;
+  const available = Math.max(0, rows - head.length - (narrow ? 4 : tasksView ? 3 : showCloseHint ? 6 : 5));
+  const selected = tasksView ? taskRanges[selectedTaskId] : nodeRanges[selectedNodeId];
+  if (revealSelection && selected && available > 0) {
+    if (verbose || selected.start < scroll || selected.start + Math.min(3, available) > scroll + available) scroll = selected.start;
+  }
+  const running = tasksView ? taskRanges[runningTaskId] : graphRanges[runningNodeId];
+  if (follow && state?.connected && !revealSelection && running && available > 0 &&
+      (running.start < scroll || running.end > scroll + available)) scroll = running.start;
+  const start = Math.min(Math.max(0, scroll), Math.max(0, body.length - available));
+  const visible = body.slice(start, start + available).map(line => {
+    // Preserve ANSI colors when the already sized graph fits.
+    return width(line) <= columns ? line : fit(line, columns);
+  });
+  if (tasksView) for (const range of Object.values(taskRanges)) {
+    const from = Math.max(start, range.start), to = Math.min(start + available, range.end);
+    if (to - from === 1 && (from === range.start || from === range.end - 1) &&
+        /^[╭╰]─+[╮╯]$/.test(clean(body[from]))) visible[from - start] = '';
+  }
+  while (visible.length < available) visible.push('');
+  if (!tasksView && narrow && available === 1) {
+    const node = run.nodes.find(node => node.id === runningNodeId) ??
+      run.nodes.find(node => graphRanges[node.id]?.start <= start && graphRanges[node.id]?.end > start) ??
+      run.nodes.find(node => node.id === selectedNodeId) ?? run.nodes[0];
+    if (node) visible[0] = fit(`${icons[node.state]} ${clean(node.label ?? node.id)}`, columns);
+  }
+  const range = body.length > available ? ` ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : '';
+  const status = error ? t(language, offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: clean(error) }) :
+    narrow ? `f ${t(language, follow && state?.connected ? 'followShortOn' : 'followShortOff')} ${t(language, offline || !state?.connected ? 'offlineShort' : 'liveShort')}${range}` :
+      `f ${t(language, follow && state?.connected ? 'followOn' : 'followOff')} · ${notice || `${state?.connected ? `● ${t(language, 'connected')}` : `○ ${t(language, 'disconnected')}`}${body.length > available ? `  ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : ''}`}`;
+  const foot = narrow ? [fit(status, columns), fit('n/p Space/Enter', columns),
+    fit(t(language, tasksView ? 'workerGroupKeys' : 'dagGroupKeys'), columns), fit(t(language, 'detailCloseKeys'), columns)] : [...(tasksView ? [] : ['─'.repeat(columns)]),
+    fit(status, columns),
+    ...(!tasksView && showCloseHint ? [fit(t(language, 'closeHint'), columns)] : []),
+    ...(tasksView ? [fit(columns < 40 ? 'n/p Space/Enter' : `${t(language, 'nodeControls')}  ${t(language, 'toggleControls')}`, columns),
+      fit(t(language, columns < 40 ? 'workerControlsNarrow' : 'workerControls'), columns)] :
+      [fit(t(language, 'nodeControls'), columns), fit(t(language, 'toggleControls'), columns),
+        fit(`${t(language, 'controls')}  c ${t(language, 'toggleCompleted')}`, columns)])];
+  return { text: [...head, ...visible, ...foot].slice(0, rows).join('\n'), scroll: start, nodeRanges, taskRanges, graphRanges };
+}
+
+export const render = (state, options) => renderFrame(state, options).text;
