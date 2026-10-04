@@ -32,7 +32,7 @@ Todo is a separate source repository. DAG changes use the concurrent companion b
 | 8 | Independent follow/manual exploration | Verified, including same-scope error recovery |
 | 9 | Truthful reported metrics | Verified |
 | 10 | Compact completed groups without hiding active/error work | Verified |
-| 11 | Isolated packages/installers | Technical proof verified; overall boundary pending incident decision |
+| 11 | Isolated packages/installers | Verified technical proof; user-approved current-file quarantine completed |
 | 12 | Combined actual native/Herdr QA and docs | Locally accepted |
 | 13 | Sanitized source/plan history | Local preflight; external upload remains pending approval |
 | 14 | Child-session exclusion | Verified |
@@ -42,9 +42,10 @@ Todo is a separate source repository. DAG changes use the concurrent companion b
 | 18 | Current SDK identity compatibility rebind | Verified |
 | 19 | Completed-summary status color | Verified in actual captured ANSI/PNG |
 | 20 | Installer rollback after wrapper replacement failure | Verified |
-| 21 | Test isolation incident prevention/disclosure | Corrected test isolation; user decision still pending |
+| 21 | Test isolation incident prevention/disclosure | Corrected isolation; approved quarantine and recovery archive verified |
 | 22 | Preserve readable composition after viewer reopen | Verified actual reopen geometry and regressions |
 | 23 | Fit active worker card in initial product viewport | Verified wide viewport; narrow path preserved |
+| 24 | Preserve observed input target after owned reopen | Verified affected cases and actual current Herdr inspection |
 
 ## Local verification and final gate
 
@@ -75,5 +76,11 @@ Parent directly accepted the new selected-tab process/geometry/input-target
 proof and three readable captures. The public affected command retained exit 1
 for its inspection timeout despite both functional cases passing; the separate
 inspect-only run exited 0. Final metadata/preflight records bind this scope
-without claiming a new full-matrix pass. The external upload and prior
-primary-agent incident decision remain pending.
+without claiming a new full-matrix pass. The external upload remains pending.
+The user subsequently approved current-file quarantine for the primary-agent
+incident. Its 35 files and two test generations were identity-checked, moved out
+of default discovery and preserved byte-for-byte in a verified recovery archive.
+No unrelated process was terminated. Prior original bytes/existence and
+historical or cached loading remain unknown; no original restoration or global
+nonmutation claim is made. This closes the local incident disposition while
+keeping external upload and primary activation outside the current grant.

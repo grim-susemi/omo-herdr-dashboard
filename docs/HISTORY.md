@@ -17,7 +17,7 @@ Current product checks: Todo133/133, native-host30/30, affected DAG70/70; builds
 
 Privacy: exact known synthetic rejection/child-session/Windows-argv literals in five test files are content- and violation-hash bounded, not scanner bypasses. Four inherited upstream README reference PNGs remain byte-identical to the local candidate baseline; new QA captures and private evidence are excluded. SDK files are not copied into public source or archives.
 
-The earlier ambient installer incident remains disclosed with a pending user decision. No overall global-nonmutation, primary activation or external upload is claimed here.
+The earlier ambient installer incident remains disclosed. The approved quarantine below closes the current-file disposition; no overall global-nonmutation, original restoration, primary activation or external upload is claimed here.
 
 ## Final review focus repair
 
@@ -34,3 +34,19 @@ captures. The changed controller and 23 unchanged runtime modules are bound
 separately from historical full-matrix receipts. The parent accepted the actual
 focus repair; transient swap selection and non-atomic observation limits remain
 explicit. No second independent review or publication was performed.
+
+## User-approved incident disposition
+
+On 2026-10-04 the user approved the recommended quarantine of the current
+generated extension and its two test generations. All 35 files matched the
+recorded hashes, sizes and creation/write identities before the move. The
+namespace contained no foreign items or reparse points, and no process argv
+referenced those exact default-root targets. The files were moved into retained
+evidence, removed from the default extension path, and preserved in a recovery
+archive whose 35 entries were independently checked against the original hashes.
+No process was terminated. The declared SDK and stable-installation anchors
+remain unchanged. Prior same-name file existence/content and historical or
+cached loading remain unknown; this is current-file quarantine, not a claim
+that an unknown original was restored or that the incident never occurred.
+All authorized local work and the sole review finding are now resolved.
+External source upload remains a separately approved stage.
