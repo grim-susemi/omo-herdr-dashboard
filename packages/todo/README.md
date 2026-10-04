@@ -8,7 +8,7 @@ The unified `omo-herdr-dashboard` extension loads both runtime components in an 
 
 Each role starts with automatic follow. Press `f` in one pane to toggle its follow. Scrolling/selecting manually pauses only that pane; `f` resumes it. `c` controls completed work for that role. Completed ordinary workers and closed Todo phases fold automatically; active/error descendants and manual expansions remain accessible. DAG topology stays canonical. Fixed DAG/workers panes ignore `t`.
 
-Press `q` to close one role. Source updates respect that closure. `/dashboard` is the single command to open or explicitly reopen all three roles. Surviving role identities and verified input selection remain intact. Losing current ready coverage restores the actual native inline widget factory.
+Press `q` to close one role. Source updates respect that closure. `/dashboard`, issued from the conversation pane, is the single command to open or explicitly reopen all three roles. Restoring the two-column layout can recreate owned role panes; native data and independent view preferences remain intact. Losing current ready coverage restores the actual native inline widget factory. Use the [root README](../../README.md) for the unified installer and [current verification](../../VERIFICATION.md) for current QA.
 
 Read errors, valid empty state and disconnected last-known state have distinct labels. A disconnected cache is not live progress. Cost is producer-reported or unknown; zero is shown only when reported. Speed uses generation time, not wall time. These figures are not an invoice.
 
@@ -23,10 +23,9 @@ npm test
 npm run build
 npm run test:package
 npm run test:host -- --senpi-root <installed-senpi-sdk>
-npm run qa:live -- --senpi-root <installed-senpi-sdk> --dag-root <dag-source-checkout> --evidence <private-evidence-directory>
 ```
 
-`test:pty` aliases that same actual native/Herdr scenario with the same arguments. QA creates isolated HOME/agent/cache and an unfocused owned tab, installs candidates there, checks real processes/painted ACKs, records visible ANSI frames, and removes its own resources.
+`scripts/qa-live.mjs` is retained as a historical fixture for the earlier three-row, two-extension candidate. It uses retired slash commands and identity-preserving reopen assumptions and is not a current dashboard QA entry point. The `qa:legacy` script exposes it only for historical reproduction with its matching source revision. Current two-column QA is described in the root verification document.
 
 Optional arguments: `--herdr-bin` selects the existing CLI; `--session` defaults to `piomo`; `--todo-package` and `--dag-package` select local archives instead of packing source; `--static-agent-dir` adds a read-only comparison of declared installation anchors.
 
@@ -40,7 +39,7 @@ Runtime packages include compiled runtime, CLI, README, MIT license and third-pa
 
 The SDK is imported read-only and is not redistributed. Reuse origins are recorded in `THIRD-PARTY-NOTICES.md`.
 
-From a clean source checkout, `npm run record:preflight` prints reviewed files/hashes, local heads, target repositories/branches and exclusions without external writes. If the named companion checkout is unavailable, pass `-- --dag-root <dag-source-checkout>`. See the [sanitized plan](docs/plans/omo-herdr-todo.md) and [verified history](docs/HISTORY.md). External upload remains pending separate approval.
+`scripts/record-preflight.mjs`, the [sanitized plan](docs/plans/omo-herdr-todo.md), and [verified history](docs/HISTORY.md) retain the original split-source provenance. Current development uses this repository's root source and installer; there is no separate Todo repository or upstream upload.
 
 ## 한국어 요약
 

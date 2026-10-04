@@ -1,0 +1,18 @@
+{
+  "name": "omo-herdr-dashboard",
+  "version": "0.1.0",
+  "description": "One Herdr extension for the native Todo, workers and DAG dashboard.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "exports": { ".": "./dist/extension.mjs" },
+  "bin": { "omo-herdr-dashboard": "bin/omo-herdr-dashboard.mjs" },
+  "files": ["bin/", "dist/", "LICENSE", "THIRD-PARTY-NOTICES.md", "README.md"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:package": "node scripts/verify-package.mjs"
+  },
+  "repository": { "type": "git", "url": "git+https://github.com/grim-susemi/omo-herdr-dashboard.git" }
+}

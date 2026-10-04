@@ -582,13 +582,35 @@ export class FixedDagPane extends DagPane {
       if (await readJson(this.legacyRecordFile) && !await readJson(this.paneFile('dag'))) {
         this.status = 'layout-waiting'; return {};
       }
-      const todo = await this.coordinator?.inspectTodo?.();
+      let todo = await this.coordinator?.inspectTodo?.();
       if (todo && (!sameOwner(todo, this.binding) || todo.role !== 'todo' || todo.tabId !== parent.tabId ||
         todo.scopeEpoch !== this.scopeEpoch || todo.ready !== true || todo.manualClose || todo.paneId === this.parentPane))
         throw new Error('layout-waiting: stale or foreign Todo anchor');
       if (todo) await this.membership(todo.paneId);
-      const existing = await this.inspectPair();
+      let existing = await this.inspectPair();
       if (this.claim.layout === 'columns') {
+        const layout = (await this.herdr('layout', '--pane', this.parentPane))?.layout;
+        const ids = todo && existing.dag && existing.workers &&
+          { parent: this.parentPane, todo: todo.paneId, workers: existing.workers.paneId, dag: existing.dag.paneId };
+        const reversible = ids && isColumnDashboard(layout, { ...ids, todo: ids.workers, workers: ids.todo });
+        if (force && (todo || existing.dag || existing.workers) && (!ids || !isColumnDashboard(layout, ids) && !reversible)) {
+          // Herdr 0.9.3 reports same-tab move as a no-op. Explicit reopen
+          // rebuilds only verified role panes and retains their preference files.
+          const owned = new Set([this.parentPane, todo?.paneId, existing.dag?.paneId, existing.workers?.paneId].filter(Boolean));
+          if (layout?.tab_id !== parent.tabId || layout.panes?.some(pane => !owned.has(pane.pane_id)))
+            throw new Error('layout-waiting: dashboard region contains unowned panes');
+          await this.placementFocus(parent.tabId, this.parentPane);
+          if (todo && !await this.coordinator.closeTodoForLayout?.()) throw new Error('layout-waiting: Todo reset could not be verified');
+          for (const role of ['dag', 'workers']) {
+            const record = existing[role];
+            if (!record) continue;
+            if (!await this.verify(record)) throw new Error('layout-waiting: role changed before reset');
+            await this.roleWrite(() => writeJson(this.paneFile(role), { ...record, ready: false, manualClose: true }));
+            await this.herdr('close', record.paneId);
+            this.records.delete(role);
+          }
+          existing = {}; todo = null;
+        }
         const dag = await this.ensureRole('dag', existing.workers?.paneId ?? todo?.paneId ?? this.parentPane,
           'right', existing.workers || todo ? '0.5' : '0.4', parent.tabId, force);
         if (!dag) return {};
@@ -759,21 +781,14 @@ export class FixedDagPane extends DagPane {
           (await this.coordinator.inspectTodo())?.paneId !== todo.paneId)
           throw new Error('layout-waiting: dashboard owner changed during placement');
       };
-      const move = async (id, target, direction) => {
-        await guard();
-        await this.herdr('move', id, '--tab', tabId, '--target-pane', target, '--split', direction, '--no-focus');
-        await guard();
-      };
       const swap = async (id, target) => {
         await guard();
         await this.herdr('swap', '--source-pane', id, '--target-pane', target);
         await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
         await guard();
       };
-      await move(ids.dag, ids.parent, 'right');
-      await move(ids.workers, ids.dag, 'right');
-      await swap(ids.workers, ids.dag);
-      await move(ids.todo, ids.workers, 'down');
+      if (!isColumnDashboard(layout, { ...ids, todo: ids.workers, workers: ids.todo }))
+        throw new Error('layout-waiting: use /dashboard to rebuild the owned column layout');
       await swap(ids.todo, ids.workers);
       const placed = await geometry();
       if (!isColumnDashboard(placed, ids)) throw new Error('layout-waiting: dashboard column placement mismatch');

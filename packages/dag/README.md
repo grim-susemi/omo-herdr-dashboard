@@ -4,7 +4,7 @@
 
 ## Concurrent candidate on this branch
 
-The unified `omo-herdr-dashboard` entry shows native Todo above ordinary workers in the left dashboard column and a full-height DAG on the right. The conversation keeps 40% of the terminal width. Each role has independent `f` follow/manual navigation and `c` completion controls; `t` does not switch fixed roles. `q` closes one role, and updates do not reopen it. `/dashboard` opens or explicitly reopens all three roles. Verified placement preserves surviving role identities; input selection uses the observed guards described under [focus-safe owned reopen](#focus-safe-owned-reopen).
+The unified `omo-herdr-dashboard` entry shows native Todo above ordinary workers in the left dashboard column and a full-height DAG on the right. The conversation keeps 40% of the terminal width. Each role has independent `f` follow/manual navigation and `c` completion controls; `t` does not switch fixed roles. `q` closes one role, and updates do not reopen it. `/dashboard`, issued from the conversation pane, opens or explicitly reopens all three roles. Restoring the column layout may recreate owned role panes; native data and per-role preferences persist. Use the [root README](../../README.md) for current installation and [current verification](../../VERIFICATION.md) for accepted scope. The released reference below retains its original commands and screenshots.
 
 Completed ordinary roots fold only when descendants are terminal and non-error. Active/error descendants, blocked/paused/lost states and manual expansions remain accessible. Read-error and disconnected last-known status stay explicit. Cost/speed is reported, estimated or unknown; reported zero is retained and generation time differs from wall time.
 

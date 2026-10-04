@@ -183,9 +183,10 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   scroll = clamp(scroll, bodyLines.length - bodyRows);
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
   while (visible.length < bodyRows) visible.push('');
+  const fullControls = `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
   const footer = error ? t(language, 'readError', { error }) : columns < 40 ?
     `f ${t(language, follow ? columns < 30 ? 'followShortOn' : 'followOn' : columns < 30 ? 'followShortOff' : 'followOff')} j/k c q` :
-    `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
+    width(fullControls) >= columns ? `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controlsNarrow')}` : fullControls;
   const lines = [...top, ...ask, ...visible, paint(fit(footer, columns), error ? 'error' : 'accent', color)].slice(0, rows);
   return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll, bodyRows, askRows };
 }

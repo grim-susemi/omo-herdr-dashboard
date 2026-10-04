@@ -20,8 +20,7 @@
   "scripts": {
     "test": "node --test --test-isolation=none test/unit/*.test.mjs test/*.test.mjs",
     "test:host": "node scripts/test-host.mjs",
-    "test:pty": "node scripts/qa-live.mjs",
-    "qa:live": "node scripts/qa-live.mjs",
+    "qa:legacy": "node scripts/qa-live.mjs",
     "record:preflight": "node scripts/record-preflight.mjs",
     "build": "node scripts/build.mjs",
     "check": "npm test && npm run build && npm run test:package",
@@ -38,9 +37,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/grim-susemi/omo-herdr-todo.git"
+    "url": "git+https://github.com/grim-susemi/omo-herdr-dashboard.git"
   },
-  "private": false,
+  "private": true,
   "bin": {
     "omo-herdr-todo": "bin/omo-herdr-todo.mjs"
   }

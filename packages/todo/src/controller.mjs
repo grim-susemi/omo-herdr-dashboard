@@ -402,6 +402,15 @@ export class TodoPane {
   coordinator() {
     return { lifetimeId: this.lifetimeId, binding: this.binding,
       claim: { ...this.binding, lifetimeId: this.lifetimeId },
+      closeTodoForLayout: () => this.roleWrite(async () => {
+        const record = await readJson(this.recordFile);
+        if (this.stopped || !this.recordMatches(record) || record.manualClose ||
+          record.scopeEpoch !== this.scopeEpoch || !await this.verify(record)) return false;
+        await writeJson(this.recordFile, { ...record, ready: false, manualClose: true });
+        this.ownedRoles.delete('todo'); this.bridge?.readinessChanged();
+        await this.herdr('close', record.paneId);
+        return true;
+      }),
       inspectTodo: async () => {
         if (this.stopped) return null;
         const record = await readJson(this.recordFile);

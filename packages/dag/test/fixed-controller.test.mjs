@@ -193,6 +193,20 @@ test('late offers serialize existing role writes without launching or emitting s
   await assert.rejects(f.controller.setOffers({ ...offers, dag: { ...offers.dag, scopeEpoch: 1 } }), /Stale/);
 });
 
+test('explicit column reopen rebuilds only verified surviving roles when a fixed role was closed', async t => {
+  const f = await setup(t); await f.controller.start(); await f.controller.openPair();
+  const state = JSON.parse(await readFile(f.controller.roleFile('workers'), 'utf8'));
+  const closed = once(f.events, `closed:${state.paneId}`, { signal: AbortSignal.timeout(3000) });
+  await control('close', state, 6002); await closed;
+  const claim = { ...f.controller.binding, tabId: 'qa:tab', lifetimeId: f.controller.lifetimeId, layout: 'columns' };
+  const pair = await f.controller.openPair({ force: true, claim });
+  assert.notEqual(pair.dag.paneId, 'qa:role1');
+  assert.notEqual(pair.workers.paneId, state.paneId);
+  assert.ok(f.calls.some(call => call[0] === 'close' && call[1] === 'qa:role1'));
+  assert.equal(f.panes.size, 3);
+  assert.equal(f.focused, 'qa:parent');
+});
+
 test('reported task metrics and DAG topology survive fixed-role source updates', async t => {
   const f = await setup(t); await f.controller.start(); await f.controller.openPair();
   await f.controller.receive(payload());

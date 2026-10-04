@@ -3,13 +3,14 @@
   "version": "1.6.0",
   "description": "Live OmO workflow DAGs in a Herdr side pane.",
   "license": "MIT",
+  "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jc01rho/omo-herdr-dag.git"
+    "url": "git+https://github.com/grim-susemi/omo-herdr-dashboard.git"
   },
-  "homepage": "https://github.com/jc01rho/omo-herdr-dag#readme",
+  "homepage": "https://github.com/grim-susemi/omo-herdr-dashboard#readme",
   "bugs": {
-    "url": "https://github.com/jc01rho/omo-herdr-dag/issues"
+    "url": "https://github.com/grim-susemi/omo-herdr-dashboard/issues"
   },
   "keywords": [
     "omo",

@@ -36,7 +36,8 @@ test('owned stacked migration keeps pane identities, preserves input selection a
   final.panes[0].rect.width = 69;
   final.panes[1].rect.x = final.panes[2].rect.x = 69;
   final.panes[1].rect.width = final.panes[2].rect.width = 51;
-  let layout = { tab_id: 'qa:tab', area: final.area, panes: Object.values(ids).map(pane_id => ({ pane_id, rect: {} })) };
+  let layout = structuredClone(final);
+  [layout.panes[1].pane_id, layout.panes[2].pane_id] = [layout.panes[2].pane_id, layout.panes[1].pane_id];
   let selected = 'parent';
   const mutations = [];
   const owner = {
@@ -48,18 +49,23 @@ test('owned stacked migration keeps pane identities, preserves input selection a
     herdr: async (...args) => {
       if (args[0] === 'layout') return { layout };
       mutations.push(args);
-      if (args[0] === 'swap') selected = args[2];
-      if (mutations.length === 5) layout = final;
+      if (args[0] === 'move') return { move_result: { changed: false, reason: 'same_tab' } };
+      if (args[0] === 'swap') {
+        selected = args[2];
+        const source = layout.panes.find(pane => pane.pane_id === args[2]);
+        const target = layout.panes.find(pane => pane.pane_id === args[4]);
+        [source.pane_id, target.pane_id] = [target.pane_id, source.pane_id];
+      }
       return {};
     },
   };
   await FixedDagPane.prototype.arrangeDashboard.call(owner);
-  assert.deepEqual(mutations.map(args => args[0]), ['move', 'move', 'swap', 'move', 'swap']);
+  assert.deepEqual(mutations.map(args => args[0]), ['swap']);
   assert.equal(selected, 'parent');
   assert.equal(isColumnDashboard(layout, ids), true);
   await FixedDagPane.prototype.arrangeDashboard.call(owner);
-  assert.equal(mutations.length, 5);
+  assert.equal(mutations.length, 1);
   layout = { ...final, panes: [...final.panes, { pane_id: 'foreign', rect: final.panes[0].rect }] };
   await assert.rejects(FixedDagPane.prototype.arrangeDashboard.call(owner), /unowned panes/);
-  assert.equal(mutations.length, 5);
+  assert.equal(mutations.length, 1);
 });
