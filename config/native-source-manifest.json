@@ -1,13 +1,13 @@
 {
   "schema": "omo-herdr-todo/native-source-manifest/1",
   "sdkPackage": "@code-yeongyu/senpi",
-  "sdkVersion": "2026.10.3",
-  "recordedAtUtc": "2026-10-03T22:08:56.224Z",
+  "sdkVersion": "2026.10.7",
+  "recordedAtUtc": "2026-10-04T11:51:04.805Z",
   "purpose": "Read-only sha256 identity of the installed SDK files used by npm run test:host. test-host.mjs asserts the version and every hash before and after the run.",
   "files": [
     {
       "path": "package.json",
-      "sha256": "5e19864ac93ff30e7eff65c480f4425d79ad4b83e4e8e702f5c8643472a156de"
+      "sha256": "4ae54aecc7cff6e2bb36b45c854909fe7e3dc3be17046f436fa580d6d35a044b"
     },
     {
       "path": "dist/core/resource-loader.js",
@@ -23,11 +23,11 @@
     },
     {
       "path": "dist/core/extensions/loader.js",
-      "sha256": "d865cbe99d54f569482d6debc2bac4b0a7366af514721142467d2f22aebe5899"
+      "sha256": "9b2b4e480f019e15772daababc5cb5c702ade92cb245216c28b9f533c9d1f6f4"
     },
     {
       "path": "dist/core/extensions/runner.js",
-      "sha256": "9b8b50f85201ce1f7e38e8bf78c20abb89aae4cb24bb1503a833a7cf9caf7ce6"
+      "sha256": "922ce4e7038ea6a6b0f4cfccb316a732aba8e2c38535f5997741f3395f444da0"
     },
     {
       "path": "dist/core/extensions/builtin/index.js",
@@ -63,7 +63,7 @@
     },
     {
       "path": "dist/modes/interactive/interactive-mode.js",
-      "sha256": "b5acc6fd74c511f5920ddb205e65f13f463f8a3de5594b5fee305f7933568467"
+      "sha256": "2d5540c419fa7fce86d32d88fc7fad8cc16c29a9113d2f19714999149fdffc12"
     },
     {
       "path": "dist/modes/interactive/theme/theme.js",

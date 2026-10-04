@@ -1,5 +1,17 @@
 # Verified local source history
 
+## Deployment compatibility check — 2026-10-04
+
+The installed SDK was updated independently after the prior local acceptance:
+2026.10.3 to 2026.10.7. Package metadata, extension loader/runner and
+InteractiveMode identities changed; twelve other declared files were identical.
+The previous identity guard correctly rejected the new installation. With an
+explicit current SDK identity, all thirty real native-host/display-bridge tests
+passed with zero failures/skips, and the sixteen SDK files remained unchanged.
+Only the source manifest and this history document are updated; dashboard
+runtime bytes and previous source-bound visual evidence are unchanged. Earlier
+2026.10.3 results remain historical and are not reported as fresh SDK tests.
+
 These commits are local provenance, not remote publication claims. The sanitized [reviewed plan](plans/omo-herdr-todo.md) and source preflight describe the intended external record. The preflight captures current heads, parent/root lineage and exact relative file hashes rather than embedding private execution logs.
 
 | Increment | Todo commit | DAG commit |
