@@ -16,6 +16,8 @@ Read errors, valid empty state and disconnected last-known state have distinct l
 
 Node24 or later and an already running Herdr session are required. SDK version and file hashes must match `config/native-source-manifest.json`; there is no ambient SDK fallback or provider/model request.
 
+Run verification and build commands from the source checkout. The extracted runtime archive omits development scripts/tests and installs through `node bin/omo-herdr-todo.mjs install --agent-dir <disposable-agent-directory>`.
+
 ```bash
 npm test
 npm run build
@@ -37,6 +39,8 @@ See [installation](docs/INSTALL.md), [protocol](docs/PROTOCOL.md), and [roadmap]
 Runtime packages include compiled runtime, CLI, README, MIT license and third-party notices. They exclude tests, private evidence, session/task logs, auth/config profiles and copied SDK files. Public-source preflight is separate from the runtime scan. Hostile examples in safety tests are synthetic rejection fixtures.
 
 The SDK is imported read-only and is not redistributed. Reuse origins are recorded in `THIRD-PARTY-NOTICES.md`.
+
+From a clean source checkout, `npm run record:preflight` prints reviewed files/hashes, local heads, target repositories/branches and exclusions without external writes. If the named companion checkout is unavailable, pass `-- --dag-root <dag-source-checkout>`. See the [sanitized plan](docs/plans/omo-herdr-todo.md) and [verified history](docs/HISTORY.md). External upload remains pending separate approval.
 
 ## 한국어 요약
 

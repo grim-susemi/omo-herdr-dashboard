@@ -1,6 +1,6 @@
 # Isolated candidate installation
 
-Build and inspect a local archive before changing an intended installation. These commands use an explicitly chosen disposable agent directory:
+Build and inspect a local archive before changing an intended installation. Run build, pack and verification commands from the source checkout. An extracted runtime archive omits development scripts/tests; use its `node bin/omo-herdr-todo.mjs install --agent-dir <disposable-agent-directory>` CLI. These commands use an explicitly chosen disposable agent directory:
 
 ```bash
 npm run build
