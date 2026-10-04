@@ -420,7 +420,7 @@ export class TodoPane {
       await provider.sourceReady;
       if (this.stopped || this.provider !== provider) return;
       const { tabId } = await this.membership(this.binding.parentPaneId);
-      const claim = { ...this.binding, tabId, lifetimeId: this.lifetimeId };
+      const claim = { ...this.binding, tabId, lifetimeId: this.lifetimeId, layout: 'columns' };
       this.claim = claim;
       const offers = { dag: this.presence.offer('dag'), workers: this.presence.offer('workers') };
       const pair = await provider.openPair({ force: forceRoles.includes('dag') || forceRoles.includes('workers'), offers, claim });
@@ -439,6 +439,7 @@ export class TodoPane {
       }
       await this.membership(pair.workers.paneId);
       if (!existing || forceRoles.includes('todo')) await this.ensureTodo(pair.workers, forceRoles.includes('todo'));
+      await provider.arrangeDashboard?.();
     });
   }
   async ensureTodo(anchor, force) {

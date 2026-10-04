@@ -70,6 +70,18 @@ function fixture(options = {}) {
   };
 }
 
+test('a readable branch without native Todo publishes waiting without authorizing a mask', () => {
+  const f = fixture();
+  f.setBranch([]);
+  f.bridge.observe({ type: 'tool_execution_end' }, f.ctx);
+  assert.equal(f.published.at(-1).availability, 'waiting');
+  f.ready.add('todo');
+  f.ui.setWidget('todo-sidebar', ['native pending content']);
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, []);
+  assert.deepEqual(f.widgets.get('todo-sidebar'), ['native pending content']);
+});
+
 test('initial recovery is prepared, labelled and same-key; own calls never capture', () => {
   const f = fixture();
   assert.equal(f.bridge.captured('todo-sidebar'), undefined);

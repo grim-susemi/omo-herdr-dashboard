@@ -135,7 +135,9 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       snapshot = value;
       readFailed = value.availability === 'waiting';
       recovery = readFailed ? null : inlineRecoveryFactory(value);
-      return !readFailed;
+      // A fresh readable branch has no native Todo yet. Publish that waiting
+      // state so its viewer can start; readFailed still prevents native masks.
+      return true;
     } catch (error) {
       fail('read', error);
       readFailed = true;

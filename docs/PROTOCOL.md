@@ -8,7 +8,7 @@ Scoped extension events join Todo owner and DAG provider. Source readiness allow
 
 Follow/folding/scroll preferences belong to one role/scope. Automatic reveal is transient. Completion/removal hands follow to the next eligible target. A same-scope read error retains the target privately and shows unavailable/last-known status; recovery cannot jump to an earlier still-running target.
 
-Reopened roles use verified surviving sibling regions. Swap involves only a new owned pane and its verified sibling, preserving conversation geometry and surviving role identities. Unready/foreign anchors cannot authorize a split. Initial column height is 40/30/30 with terminal rounding.
+The integrated owner claims the column layout. Todo sits above ordinary workers, and DAG spans the full height on their right. Existing stacked layouts migrate only when all four panes belong to the verified owner, including the conversation. Pane identities and independent view preferences survive movement. A foreign pane or changed input selection defers migration. `/dashboard` explicitly reopens every role; source updates respect manual closure.
 
 Metrics distinguish missing, partial, estimated and reported values. Reported zero is retained. Generation speed uses generation milliseconds, never runtime milliseconds. Missing data cannot imply free usage or a billing estimate.
 
@@ -24,8 +24,8 @@ authoritative. Selection checks and separate RPCs are not atomic. An inactive
 owner tab defers placement before split; missing DAG-owned roles have no live
 coverage. Todo coverage is independent: its own ready ACK may still cover its
 native display, and closing or losing Todo readiness restores its original
-native factory. Selecting the owner tab and retrying `/dag-pane`, plus
-`/todo-pane` if Todo was closed, recovers the matching roles and ACK-based
+native factory. Selecting the owner tab and retrying `/dashboard`
+recovers the matching roles and ACK-based
 masking. Validation checks the final observed input target. Transient selection
 can occur; no OS foreground or hardware keyboard guarantee is claimed.
 

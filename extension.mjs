@@ -57,11 +57,4 @@ export default function extension(pi) {
     void controller.rebase(ctx).catch(error => ctx.ui.notify(error.message, 'warning'));
   });
   pi.on('session_shutdown', stop);
-  pi.registerCommand('todo-pane', {
-    description: 'Open the owned native Todo pane.',
-    handler: async (_args, ctx) => {
-      if (!eligible(ctx) || !controller) return;
-      await controller.schedule({ forceRoles: ['todo'] });
-    },
-  });
 }

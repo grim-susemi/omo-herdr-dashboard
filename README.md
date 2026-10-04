@@ -4,11 +4,11 @@ Native Todo, workflow DAG and ordinary workers remain visible together in three 
 
 ## Everyday controls
 
-With both candidate extensions installed and loaded in an eligible parent session, the right column opens without taking conversation focus: DAG above workers above Todo, initially 40/30/30 of its height. Child sessions cannot own the layout.
+The unified `omo-herdr-dashboard` extension loads both runtime components in an eligible parent session. Todo sits above ordinary workers in the left dashboard column; DAG uses the full right dashboard column. The conversation keeps 40% of the terminal width. Child sessions cannot own the layout.
 
 Each role starts with automatic follow. Press `f` in one pane to toggle its follow. Scrolling/selecting manually pauses only that pane; `f` resumes it. `c` controls completed work for that role. Completed ordinary workers and closed Todo phases fold automatically; active/error descendants and manual expansions remain accessible. DAG topology stays canonical. Fixed DAG/workers panes ignore `t`.
 
-Press `q` to close one role. Source updates respect that closure. `/todo-pane` explicitly reopens Todo; `/dag-pane` reopens DAG/workers. Surviving role identities and conversation focus remain intact. Losing current ready coverage restores the actual native inline widget factory.
+Press `q` to close one role. Source updates respect that closure. `/dashboard` is the single command to open or explicitly reopen all three roles. Surviving role identities and verified input selection remain intact. Losing current ready coverage restores the actual native inline widget factory.
 
 Read errors, valid empty state and disconnected last-known state have distinct labels. A disconnected cache is not live progress. Cost is producer-reported or unknown; zero is shown only when reported. Speed uses generation time, not wall time. These figures are not an invoice.
 
@@ -45,5 +45,5 @@ From a clean source checkout, `npm run record:preflight` prints reviewed files/h
 ## 한국어 요약
 
 - DAG·작업자·Todo를 동시에 봅니다. 각 화면의 `f` 추적과 수동 탐색은 독립적입니다.
-- `c`로 완료 항목을 펼치고 `q`로 해당 화면만 닫습니다. `/todo-pane`, `/dag-pane`으로 다시 엽니다.
+- `c`로 완료 항목을 펼치고 `q`로 해당 화면만 닫습니다. `/dashboard` 하나로 세 화면을 다시 엽니다.
 - 설치 파일 복사와 세션 활성화는 다릅니다. 보고된 비용과 연결이 끊긴 화면을 실제 청구·최신 진행으로 혼동하지 마세요.

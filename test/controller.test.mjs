@@ -13,7 +13,7 @@ const snapshot = { type: 'custom', customType: 'senpi.todo-state', data: {
   schema: 'v2', phases: [{ name: 'Build', tasks: [{ content: 'Native work', status: 'in_progress' }] }],
 } };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
-async function fixture(t) {
+async function fixture(t, branch = [snapshot]) {
   const directory = join(tmpdir(), `todo-controller-${process.pid}-${randomUUID()}`);
   console.log(JSON.stringify({ event: 'resource-planned', pid: process.pid, directory }));
   await mkdir(directory);
@@ -24,7 +24,7 @@ async function fixture(t) {
   const processes = new Map();
   const ctx = { hasUI: true, mode: 'tui', ui: { setWidget() {} },
     sessionManager: { getSessionFile: () => 'selected.jsonl', getSessionId: () => 'synthetic-session',
-      getBranch: () => [snapshot], getLeafId: () => 'leaf' } };
+      getBranch: () => branch, getLeafId: () => 'leaf' } };
   let number = 0;
   const herdr = async (...args) => {
     calls.push(args);
@@ -72,6 +72,25 @@ async function fixture(t) {
     emit: (name, value) => bus.emit(name, value) } };
   return { controller, calls, panes, processes, events, directory, provider, ready, source, pi, bus };
 }
+
+test('fresh native branch opens a waiting Todo and later native commit updates the same pane', async t => {
+  const branch = [];
+  const f = await fixture(t, branch);
+  assert.equal(f.controller.presence.state.snapshot.availability, 'waiting');
+  assert.deepEqual(f.controller.bridge.status.masked, []);
+  f.ready.resolve(); f.controller.bind(f.pi);
+  f.pi.events.emit(dashboardChannels.provider, { v: 1, kind: 'dag-provider', ...f.controller.binding, provider: f.provider });
+  await f.controller.schedule();
+  const before = await readRoleState(f.controller.stateFile);
+  assert.equal(f.calls.filter(call => call[0] === 'split').length, 1);
+  branch.push(snapshot);
+  f.controller.bridge.observe({ type: 'tool_execution_end' }, f.controller.ctx);
+  await f.controller.presence.idle();
+  assert.equal(f.controller.presence.state.snapshot.availability, 'current');
+  assert.equal(f.controller.presence.state.snapshot.counts.total, 1);
+  assert.equal((await readRoleState(f.controller.stateFile)).paneId, before.paneId);
+  assert.equal(f.calls.filter(call => call[0] === 'split').length, 1);
+});
 
 for (const order of ['provider-first', 'todo-first']) test(`${order}: source readiness, query/reply and concurrent layout create one Todo`, async t => {
   const f = await fixture(t), { controller, pi, bus, provider, ready } = f;
@@ -338,7 +357,7 @@ test('child exclusion precedes UI getters; noninteractive lifecycle and commands
   const child = { sessionManager: { getSessionFile: () => '/synthetic/senpi-task/children/child/session.jsonl' },
     get hasUI() { throw new Error('UI must not be read'); } };
   await handlers.get('session_start')({}, child);
-  await commands.get('todo-pane').handler('', child);
+  assert.equal(commands.size, 0, 'the integrated DAG entry owns the one dashboard command');
   await handlers.get('session_start')({}, { hasUI: true, mode: 'rpc',
     sessionManager: { getSessionFile: () => '/synthetic/parent.jsonl' } });
 });
