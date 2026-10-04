@@ -402,6 +402,12 @@ export class TodoPane {
   coordinator() {
     return { lifetimeId: this.lifetimeId, binding: this.binding,
       claim: { ...this.binding, lifetimeId: this.lifetimeId },
+      inspectTodo: async () => {
+        if (this.stopped) return null;
+        const record = await readJson(this.recordFile);
+        if (!this.recordMatches(record) || record.manualClose || record.scopeEpoch !== this.scopeEpoch) return null;
+        return await this.verify(record) ? record : null;
+      },
       schedule: options => this.schedule(options) };
   }
   schedule({ forceRoles = [] } = {}) {

@@ -98,6 +98,18 @@ for (const order of ['provider-first', 'todo-first']) test(`${order}: source rea
   assert.equal(controller.status, 'current');
 });
 
+test('verified Todo pending readiness remains an owned anchor instead of pretending it is absent', async t => {
+  const f = await fixture(t);
+  f.ready.resolve(); f.controller.bind(f.pi);
+  f.pi.events.emit(dashboardChannels.provider, { v: 1, kind: 'dag-provider', ...f.controller.binding, provider: f.provider });
+  await f.controller.schedule();
+  const record = JSON.parse(await readFile(f.controller.recordFile, 'utf8'));
+  await writeFile(f.controller.recordFile, JSON.stringify({ ...record, ready: false }));
+  const anchor = await f.controller.coordinator().inspectTodo();
+  assert.equal(anchor?.paneId, record.paneId);
+  assert.equal(anchor.ready, false);
+});
+
 test('manual close is authenticated, durable and reopened only by an explicit command', async t => {
   const f = await fixture(t);
   f.ready.resolve(); f.controller.bind(f.pi);
