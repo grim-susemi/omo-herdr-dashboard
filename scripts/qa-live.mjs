@@ -16,11 +16,12 @@ import { promisify, stripVTControlCharacters } from 'node:util';
 const args = process.argv.slice(2);
 const options = new Map();
 for (let i = 0; i < args.length; i += 2) {
-  if (!['--senpi-root', '--dag-root', '--evidence', '--session', '--herdr-bin', '--todo-package', '--dag-package', '--static-agent-dir'].includes(args[i]) ||
+  if (!['--senpi-root', '--dag-root', '--evidence', '--session', '--herdr-bin', '--todo-package', '--dag-package', '--static-agent-dir', '--scenario'].includes(args[i]) ||
       options.has(args[i]) || !args[i + 1] || args[i + 1].startsWith('--')) throw new Error('Invalid QA option: ' + args[i]);
   options.set(args[i], args[i + 1]);
 }
 for (const name of ['--senpi-root', '--dag-root', '--evidence']) if (!options.has(name)) throw new Error('Required QA option: ' + name);
+if (options.has('--scenario') && options.get('--scenario') !== 'focus-reopen') throw new Error('Invalid QA scenario');
 const W = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const D = resolve(options.get('--dag-root'));
 const S = resolve(options.get('--senpi-root'));
@@ -81,6 +82,100 @@ async function cli(args, raw = false) {
   return reply.result;
 }
 const herdr = (...args) => cli(['pane', ...args]);
+async function selection() {
+  const env = { ...process.env };
+  for (const name of ['HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID']) delete env[name];
+  const { stdout } = await execute(bin, ['pane', 'current'], { env, timeout: 10000 });
+  const reply = JSON.parse(stdout);
+  if (!reply.result?.pane) throw new Error('Actual selected Herdr pane unavailable');
+  return reply.result.pane;
+}
+async function selectOwned(qa, target) {
+  let current = await selection();
+  if (current.tab_id !== qa.tabId) {
+    await cli(['tab', 'focus', qa.tabId]); resources.focusActions++;
+    current = await selection();
+  }
+  for (let step = 0; step < 3 && current.pane_id !== target; step++) {
+    assert.equal(current.tab_id, qa.tabId, 'External user selection interrupts owned rehearsal');
+    const layout = (await herdr('layout', '--pane', current.pane_id)).layout;
+    const from = layout.panes.find(p => p.pane_id === current.pane_id)?.rect;
+    const to = layout.panes.find(p => p.pane_id === target)?.rect;
+    assert.ok(from && to, 'Owned rehearsal target membership');
+    const direction = to.x < from.x ? 'left' : to.x > from.x ? 'right' : to.y < from.y ? 'up' : 'down';
+    const neighbor = (await herdr('neighbor', '--pane', current.pane_id, '--direction', direction)).neighbor;
+    assert.ok(layout.panes.some(p => p.pane_id === neighbor.neighbor_pane_id));
+    assert.equal((await selection()).pane_id, current.pane_id, 'Late selection interrupts rehearsal');
+    await herdr('focus', '--pane', current.pane_id, '--direction', direction); resources.focusActions++;
+    current = await selection();
+  }
+  assert.equal(current.pane_id, target);
+  record('actual-owned-selection', { order: qa.order, tabId: current.tab_id, paneId: current.pane_id });
+}
+async function tracedReopen(qa, label, target) {
+  assert.equal((await selection()).pane_id, target);
+  let done = false;
+  const action = qa.host.runner.getCommand('dag-pane').handler('', qa.host.runner.createCommandContext());
+  action.finally(() => { done = true; }).catch(() => {});
+  const observations = [];
+  while (!done) {
+    observations.push({ at: new Date().toISOString(), pane: await selection() });
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await action;
+  const after = await selection(); observations.push({ at: new Date().toISOString(), pane: after });
+  assert.equal(after.pane_id, target, 'Foreground reopen changed final input target');
+  assert.equal(after.tab_id, qa.tabId);
+  record('foreground-reopen-selection', { label, target, observations, transientFocusPossible: true,
+    boundary: 'Herdr selected tab/pane; not OS foreground or hardware keyboard proof' });
+}
+async function focusReopenScenario(qa, host) {
+  qa.host = host;
+  let records = await roleRecords(qa);
+  for (const [role, targetRole] of [['workers', 'parent'], ['dag', 'workers'], ['dag', 'todo']]) {
+    await selectOwned(qa, targetRole === 'parent' ? qa.parentPane : records[targetRole].paneId);
+    await closeRole(qa, role);
+    const target = targetRole === 'parent' ? qa.parentPane : records[targetRole].paneId;
+    const ack = signal('wire-ack', value => value.role === role && value.ownerKey === qa.binding.ownerKey);
+    ack.catch(() => {});
+    await tracedReopen(qa, role + '-from-' + targetRole, target); await ack;
+    const next = await roleRecords(qa);
+    for (const other of ['dag', 'workers', 'todo'].filter(value => value !== role)) assert.equal(next[other].paneId, records[other].paneId);
+    records = next; await composition(qa, records, role + '-focus-' + targetRole);
+  }
+  await selectOwned(qa, qa.parentPane);
+  await closeRole(qa, 'dag');
+  await closeRole(qa, 'todo');
+  assert.ok(host.surface.nativeWidget(), 'Actual closed Todo must restore its genuine native factory');
+  const other = await cli(['tab', 'create', '--cwd', qa.directory, '--label', 'owned-inactive-defer', '--no-focus']);
+  const otherTab = other.tab.tab_id;
+  resources.allocated.push({ kind: 'owned-selection-probe-tab', tabId: otherTab }); await manifest();
+  try {
+    await cli(['tab', 'focus', otherTab]); resources.focusActions++;
+    const beforeSelection = await selection(), beforePanes = (await herdr('list')).panes.map(p => p.pane_id);
+    await host.runner.getCommand('dag-pane').handler('', host.runner.createCommandContext());
+    assert.equal((await selection()).pane_id, beforeSelection.pane_id);
+    assert.deepEqual((await herdr('list')).panes.map(p => p.pane_id), beforePanes, 'Inactive defer must allocate no shell');
+    assert.ok(host.surface.nativeWidget(), 'Inactive deferred pair must retain actual native Todo display');
+    record('inactive-placement-deferred', { order: qa.order, selected: beforeSelection, inlineNativeVisible: true });
+    await selectOwned(qa, qa.parentPane);
+    const ack = signal('wire-ack', value => value.role === 'dag' && value.ownerKey === qa.binding.ownerKey);
+    ack.catch(() => {});
+    await tracedReopen(qa, 'deferred-foreground-retry', qa.parentPane); await ack;
+    const todoAck = signal('wire-ack', value => value.role === 'todo' && value.ownerKey === qa.binding.ownerKey);
+    todoAck.catch(() => {});
+    await host.runner.getCommand('todo-pane').handler('', host.runner.createCommandContext()); await todoAck;
+    assert.equal(host.surface.nativeWidget(), undefined, 'Fresh verified pair must restore pane masking');
+  } finally {
+    await cli(['tab', 'close', otherTab]);
+    resources.cleaned.push({ kind: 'owned-tab', tabId: otherTab, verifiedAbsent: !(await cli(['tab', 'list'])).tabs.some(tab => tab.tab_id === otherTab) });
+  }
+  records = await roleRecords(qa); await composition(qa, records, 'focus-final');
+  for (const role of ['dag', 'workers', 'todo']) await frame(qa, role,
+    role === 'dag' ? `QA_DAG_${qa.order}` : role === 'workers' ? `QA_WORKER_${qa.order}` : qa.todoMarker,
+    `${qa.order}-focus-final-${role}`);
+  return records;
+}
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 async function identity() {
   const values = {};
@@ -373,6 +468,8 @@ async function runOrder(order) {
     qa.parentPane = roots[0].pane_id;
   }
   assert.ok(qa.tabId && qa.parentPane, `Official owned tab identity absent: ${JSON.stringify(tab)}`);
+  qa.originalSelection = await selection();
+  await cli(['tab', 'focus', qa.tabId]); resources.focusActions++;
   resources.allocated.push({ kind: 'owned-tab', tabId: qa.tabId, parentPane: qa.parentPane, order });
   await manifest();
   const saved = applyHostEnvironment({ home, tmp, agentDir });
@@ -431,6 +528,9 @@ async function runOrder(order) {
     records = await roleRecords(qa); await noDuplicates(qa, records);
     await composition(qa, records, 'initial');
     for (const role of ['dag', 'workers', 'todo']) assert.equal(records[role].paneId, first[role].paneId);
+    if (options.get('--scenario') === 'focus-reopen') {
+      records = await focusReopenScenario(qa, host);
+    } else {
     for (const role of ['dag', 'workers']) {
       const state = await json(records[role].statePath);
       await frame(qa, role, t(state.language, 'followOff'), `${order}-${role}-t-locked`, recordValue =>
@@ -538,13 +638,21 @@ async function runOrder(order) {
       }
       await composition(qa, roles, 'final-restored');
     }
+    }
     cases.push({ order, status: 'passed', ownerKey: qa.binding.ownerKey, tabId: qa.tabId,
       parentPane: qa.parentPane, roles: records, nativeCalls: host.calls,
-      scopeEpoch: 2, noDuplicates: true, registrationOrder: paths,
+      scopeEpoch: options.get('--scenario') === 'focus-reopen' ? 1 : 2, noDuplicates: true, registrationOrder: paths,
+      scenario: options.get('--scenario') ?? 'full',
       scope: 'Actual SDK callbacks and isolated installed package extensions in owned Herdr role processes; no user conversation mutation.' });
     if (order === 'd-first' && process.env.OMO_HERDR_QA_INSPECTION_PIPE) {
       assert.deepEqual(await identity(), before, 'Source changed before final live inspection');
-      const payload = { schema: 'omo-herdr-todo/inspection/1', run, root, sessionName, socketPath: originalHerdr.HERDR_SOCKET_PATH, herdrBin: bin, tabId: qa.tabId, roles: records, installed, sourceHashes: before, captures: captures.map(({ raw, text, ...value }) => value) };
+      const payload = { schema: 'omo-herdr-todo/inspection/1', run, root, sessionName, socketPath: originalHerdr.HERDR_SOCKET_PATH, herdrBin: bin, tabId: qa.tabId, roles: records, installed, sourceHashes: before,
+        actualSelection: { observedAt: new Date().toISOString(), callerContextRemoved: true, pane: await selection(),
+          tabs: (await cli(['tab', 'list'])).tabs, panes: (await herdr('list')).panes,
+          boundary: 'Herdr server selected foreground tab/input pane, not OS or hardware keyboard',
+          neighborReplySchema: 'result.neighbor.{neighbor_pane_id,layout}',
+          schemaProvenance: 'https://raw.githubusercontent.com/herdrdev/herdr/v0.9.3/docs/next/website/src/content/docs/socket-api.mdx' },
+        captures: captures.map(({ raw, text, ...value }) => value) };
       await save('FINAL-ROLE-INSPECTION-READY.json', payload);
       await new Promise((resolveInspection, rejectInspection) => {
         const socket = net.createConnection(process.env.OMO_HERDR_QA_INSPECTION_PIPE);
@@ -589,6 +697,12 @@ async function runOrder(order) {
     } finally {
       saved.restore(); active = null; delete globalThis[key];
       if (qa.tabId) {
+        const selected = await selection();
+        if (selected.tab_id === qa.tabId && (await herdr('list')).panes.some(p =>
+          p.pane_id === qa.originalSelection.pane_id && p.tab_id === qa.originalSelection.tab_id)) {
+          await cli(['tab', 'focus', qa.originalSelection.tab_id]); resources.focusActions++;
+          record('guarded-original-selection-restored', { previous: selected, original: qa.originalSelection });
+        } else record('external-selection-preserved', { selected });
         await cli(['tab', 'close', qa.tabId]);
         const remaining = (await herdr('list')).panes;
         assert.ok(!remaining.some(pane => pane.tab_id === qa.tabId));

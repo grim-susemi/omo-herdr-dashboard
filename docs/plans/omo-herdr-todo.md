@@ -61,3 +61,19 @@ One final independent read-only review covers plan compliance, code quality, act
 ## Proposed external record
 
 Targets: [Todo repository](https://github.com/grim-susemi/omo-herdr-todo), branch `feat/concurrent-dashboard`; [DAG repository](https://github.com/grim-susemi/omo-herdr-dag), branch `feat/concurrent-views-and-metrics`. The local preflight prints exact heads, lineage, relative allowlisted files and hashes. No external writes have been authorized by this record. Existing unrelated DAG branches remain outside the proposal.
+
+## Final review continuation
+
+Task 24 resolves the one independent review's foreground focus acceptance gap.
+Selected-tab preflight defers inactive placement; owned-neighbor restoration
+restores the verified final observed input target unless a later observed manual
+selection wins. Separate observation and RPC calls are not atomic, and transient
+swap selection remains possible.
+Only affected reopen/native restoration cases require new packed-runtime proof;
+unchanged rendering and native mechanisms retain qualified historical evidence.
+Parent directly accepted the new selected-tab process/geometry/input-target
+proof and three readable captures. The public affected command retained exit 1
+for its inspection timeout despite both functional cases passing; the separate
+inspect-only run exited 0. Final metadata/preflight records bind this scope
+without claiming a new full-matrix pass. The external upload and prior
+primary-agent incident decision remain pending.

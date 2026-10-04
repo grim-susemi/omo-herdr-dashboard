@@ -17,4 +17,20 @@ Current product checks: Todo133/133, native-host30/30, affected DAG70/70; builds
 
 Privacy: exact known synthetic rejection/child-session/Windows-argv literals in five test files are content- and violation-hash bounded, not scanner bypasses. Four inherited upstream README reference PNGs remain byte-identical to the local candidate baseline; new QA captures and private evidence are excluded. SDK files are not copied into public source or archives.
 
-The earlier ambient installer incident remains disclosed with a pending user decision. No overall global-nonmutation, primary activation, external upload or final independent review completion is claimed here.
+The earlier ambient installer incident remains disclosed with a pending user decision. No overall global-nonmutation, primary activation or external upload is claimed here.
+
+## Final review focus repair
+
+One independent final review identified the foreground reopen focus proof gap;
+the sole confirmed blocker. Prior caller-environment focus claims
+were withdrawn. The bounded repair adds selected-owner-tab preflight and guarded
+owned-neighbor restoration, with inactive defer and foreground retry. Current
+affected controller tests passed 34/34. Both registration orders passed the
+foreground parent/worker/Todo reopen and inactive defer/recovery cases. Their
+public command exited 1 after the private inspection handshake timed out; it is
+not recorded as a successful command. A separate SHA-bound inspect-only run
+exited 0 after parent directly read the current three roles and inspected their
+captures. The changed controller and 23 unchanged runtime modules are bound
+separately from historical full-matrix receipts. The parent accepted the actual
+focus repair; transient swap selection and non-atomic observation limits remain
+explicit. No second independent review or publication was performed.

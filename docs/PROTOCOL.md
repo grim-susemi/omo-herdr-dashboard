@@ -13,3 +13,26 @@ Reopened roles use verified surviving sibling regions. Swap involves only a new 
 Metrics distinguish missing, partial, estimated and reported values. Reported zero is retained. Generation speed uses generation milliseconds, never runtime milliseconds. Missing data cannot imply free usage or a billing estimate.
 
 한국어: 현재 범위와 실제 화면 준비 신호가 모두 맞아야 기본 Todo를 숨깁니다. 화면별 탐색을 보존하고 오류·연결 종료 때 기본 표시를 복구합니다.
+
+## Selected-tab focus qualification
+
+The selected Herdr pane is observed without caller pane environment variables.
+Herdr 0.9.3 swap selects the swapped source; owned reopening restores the prior
+verified input target through verified neighbors only while that operation still
+owns the observed current selection. A later observed manual choice remains
+authoritative. Selection checks and separate RPCs are not atomic. An inactive
+owner tab defers placement before split; missing DAG-owned roles have no live
+coverage. Todo coverage is independent: its own ready ACK may still cover its
+native display, and closing or losing Todo readiness restores its original
+native factory. Selecting the owner tab and retrying `/dag-pane`, plus
+`/todo-pane` if Todo was closed, recovers the matching roles and ACK-based
+masking. Validation checks the final observed input target. Transient selection
+can occur; no OS foreground or hardware keyboard guarantee is claimed.
+
+From the source checkout, `npm run qa:live -- --senpi-root <sdk> --dag-root
+<companion> --evidence <directory> --scenario focus-reopen` runs this bounded
+repair scenario in both registration orders. Omitting `--scenario` retains the
+full matrix. QA briefly selects only its created tabs and restores the original
+tab only while a fresh observation still selects an owned QA tab; an external
+observed manual selection is preserved. The focus-reopen scenario is affected
+proof only; historical full-matrix captures remain qualified by unchanged bytes.
