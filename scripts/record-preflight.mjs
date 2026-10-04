@@ -29,7 +29,7 @@ function allowlisted(name, role) {
   if (name.includes('..') || name.includes('\\') || name.startsWith('/')) return false;
   return topLevel.has(name) || role === 'D' && referenceAssets.has(name) ||
     /^(?:bin|src|scripts|test)\/[A-Za-z0-9_./-]+\.mjs$/.test(name) ||
-    /^config\/[A-Za-z0-9_.-]+\.json$/.test(name) || /^docs\/[A-Za-z0-9_./-]+\.md$/.test(name) ||
+    role === 'W' && name === 'config/native-source-manifest.json' || /^docs\/[A-Za-z0-9_./-]+\.md$/.test(name) ||
     /^\.github\/(?:workflows\/[A-Za-z0-9_.-]+\.ya?ml|ISSUE_TEMPLATE\/[A-Za-z0-9_.-]+\.md)$/.test(name);
 }
 async function git(directory, ...args) {
