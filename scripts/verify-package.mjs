@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -22,6 +22,9 @@ try {
   const installed = join(consumer, 'node_modules/omo-herdr-dashboard');
   let runtime = 0;
   for (const component of ['todo', 'dag']) {
+    execFileSync(process.execPath, ['--input-type=module', '--eval',
+      `await import(${JSON.stringify(pathToFileURL(join(installed, 'dist', component, 'src/viewer.mjs')).href)})`],
+    { env, cwd: consumer, stdio: 'pipe' });
     const { readdir } = await import('node:fs/promises');
     for (const file of ['extension.mjs', ...(await readdir(join(root, 'dist', component, 'src'))).filter(file => file.endsWith('.mjs')).map(file => 'src/' + file)]) {
       assert.equal(sha(await readFile(join(installed, 'dist', component, file))), sha(await readFile(join(root, 'dist', component, file))));

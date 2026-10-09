@@ -10,7 +10,7 @@ test('English is the default for active, empty, error, and disconnected screens'
   const frame = render(state, { color: false });
   assert.match(frame, /Running · Done 1\/5/);
   assert.match(frame, /Dependencies/);
-  assert.match(frame, /Connected/);
+  assert.match(frame, /LIVE/);
   assert.doesNotMatch(frame, /[가-힣]/);
   assert.doesNotMatch(frame, /[\u4e00-\u9fff]/);
   const empty = render({ runs: [], connected: false }, { color: false, error: 'test error' });

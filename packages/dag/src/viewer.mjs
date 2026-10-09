@@ -3,7 +3,7 @@ import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { emitKeypressEvents } from 'node:readline';
+import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
 import { completedTasks, fit, renderFrame, runningTarget, standaloneTasks } from './render.mjs';
@@ -19,9 +19,7 @@ export function renderFixedFrame(state, options, view) {
     const status = options.error ? t(state?.language, options.offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: options.error }) :
       narrow ? `f ${t(state?.language, options.follow && state?.connected ? 'followShortOn' : 'followShortOff')} ${t(state?.language, options.offline || !state?.connected ? 'offlineShort' : 'liveShort')}` :
       `f ${t(state?.language, options.follow && state?.connected ? 'followOn' : 'followOff')}`;
-    const foot = narrow ? [status, 'n/p Space/Enter', t(state?.language,'dagGroupKeys'), t(state?.language,'detailCloseKeys')] : [options.error ? t(state?.language, options.offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: options.error }) :
-      `f ${t(state?.language, options.follow && state?.connected ? 'followOn' : 'followOff')}`,
-      t(state?.language, 'nodeControls'), t(state?.language, 'toggleControls'), t(state?.language, 'controls')];
+    const foot = [status.replace(/^f /, '')];
     const lines = [...head, ...body];
     while (lines.length < Math.max(0, rows - foot.length)) lines.push('');
     return { text: [...lines, ...foot].slice(0, rows).map(line => fit(line, columns)).join('\n'),
@@ -91,7 +89,7 @@ let scroll = 0, error = '', timer, drawing = false, again = false;
 let viewState = emptyViewState(state?.sessionId), viewError = '', saving = Promise.resolve(), closing = false;
 const selectedNodes = new Map();
 let revealSelection = false, verbose = false, detailSelection, completedExpanded = false;
-let follow = true, target;
+let follow = true, target, lastFrame, dragY, disposeFocus;
 let presenceClient, presenceMessage, presenceKey, controlKey, presenceNotice = '';
 function bindPresence() {
   if (!fixedView || !interactive || !launchToken || !validManaged(state)) return;
@@ -139,7 +137,7 @@ async function restorePreferences() {
   try { viewState = await loadViewState(file, state?.sessionId, scope); viewError = ''; }
   catch (cause) { viewState = emptyViewState(state?.sessionId, scope); viewError = cause.message; }
   const navigation = viewState.navigation;
-  follow = navigation?.follow ?? true;
+  follow = true;
   scroll = navigation?.scroll ?? 0;
   view = fixedView ?? navigation?.view ?? view;
   selectedId = navigation?.selectedId ?? selectedId;
@@ -176,6 +174,7 @@ function draw() {
     selectedNodeId: selectedNodes.get(selectedId), selectedTaskId, view, viewState, verbose, revealSelection, follow,
     runningNodeId: running?.nodeId, runningTaskId: running?.taskId };
   const result = fixedView ? renderFixedFrame(state, options, fixedView) : renderFrame(state, options);
+  lastFrame = result;
   scroll = result.scroll;
   const frame = result.text;
   const client = presenceClient, message = presenceMessage, paintedScope = state;
@@ -212,11 +211,10 @@ async function refresh() {
   if (again) { again = false; void refresh(); }
 }
 if (process.argv.includes('--once') || !interactive) { draw(); process.exit(0); }
-process.stdout.write('\x1b[?1049h\x1b[?25l\x1b]0;OmO DAG\x07');
+process.stdout.write(`\x1b[?1049h\x1b[?25l${enablePointer}\x1b]0;OmO DAG\x07`);
 process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
-emitKeypressEvents(process.stdin);
 const watcher = watch(dirname(file), (_event, name) => {
   if (name && String(name) !== basename(file)) return;
   clearTimeout(timer); timer = setTimeout(() => { void refresh(); }, 40);
@@ -234,9 +232,11 @@ async function close(closePane = false) {
   closing = true;
   clearTimeout(timer); clearInterval(clock); watcher.close(); process.stdout.off('resize', resize);
   presenceClient?.destroy();
+  disposeInput();
+  disposeFocus?.();
   await saving;
   process.stdin.setRawMode(false);
-  process.stdout.write('\x1b[?25h\x1b[?1049l');
+  process.stdout.write(`${disablePointer}\x1b[?25h\x1b[?1049l`);
   if (viewError) process.stderr.write(`${t(state?.language, 'viewError', { error: viewError })}\n`);
   if (closePane && process.argv.includes('--close-pane')) {
     const pane = process.argv[process.argv.indexOf('--close-pane') + 1];
@@ -248,7 +248,7 @@ async function close(closePane = false) {
   }
   process.exit(0);
 }
-process.stdin.on('keypress', (text, pressed) => {
+const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   if (closing) return;
   const key = pressed.sequence || pressed.name || text;
   if (key === 'q' || key === '\x03' || key === '\x04') return void close(true);
@@ -334,7 +334,47 @@ process.stdin.on('keypress', (text, pressed) => {
       });
     }
   }
-});
+}, focus: focused => {
+  if (focused || closing) return;
+  dragY = undefined; follow = true; revealSelection = false; verbose = false;
+  draw();
+}, pointer: mouse => {
+  if (closing) return;
+  if (mouse.release) { dragY = undefined; return; }
+  if (mouse.button & 64) {
+    follow = false; revealSelection = false;
+    scroll = Math.max(0, scroll + (mouse.button & 1 ? 3 : -3));
+  } else if ((mouse.button & 3) === 0) {
+    follow = false; revealSelection = false;
+    if (mouse.button & 32) {
+      if (dragY !== undefined) scroll = Math.max(0, scroll + dragY - mouse.y);
+    } else {
+      const ranges = view === 'tasks' ? lastFrame?.taskRanges : lastFrame?.nodeRanges;
+      const row = mouse.y - 1 - (lastFrame?.bodyStart ?? 0) + scroll;
+      const inBody = mouse.y - 1 >= lastFrame?.bodyStart &&
+        mouse.y - 1 < lastFrame.bodyStart + lastFrame.bodyRows;
+      const hit = inBody ? Object.entries(ranges ?? {}).find(([, range]) => row >= range.start && row < range.end) ??
+        (view === 'dag' ? Object.entries(lastFrame?.graphRanges ?? {}).find(([, range]) =>
+          row >= range.start && row < range.end) : undefined) : undefined;
+      if (hit) {
+        const id = hit[0];
+        if (view === 'tasks') selectedTaskId = id;
+        else selectedNodes.set(selectedId, id);
+        const item = view === 'tasks' ? standaloneTasks(state).find(item => item.id === id) :
+          state.runs?.find(run => run.id === selectedId)?.nodes.find(item => item.id === id);
+        if (item) setExpanded(viewState, view === 'tasks' ? TASK_SCOPE : selectedId, id,
+          !isExpanded(viewState, view === 'tasks' ? TASK_SCOPE : selectedId, id, item.status ?? item.state));
+      }
+    }
+    dragY = mouse.y;
+  } else return;
+  draw();
+} });
+disposeFocus = await watchHerdrFocus(paneId ?? process.env.HERDR_PANE_ID, () => {
+  if (closing) return;
+  dragY = undefined; follow = true; revealSelection = false; verbose = false; draw();
+}, cause => { presenceNotice = `Focus: ${cause.message}`; draw(); })
+  .catch(cause => { presenceNotice = `Focus: ${cause.message}`; return () => {}; });
 process.on('SIGTERM', () => { void close(); }); process.on('SIGINT', () => { void close(); }); process.on('SIGHUP', () => { void close(); });
 bindPresence();
 draw();

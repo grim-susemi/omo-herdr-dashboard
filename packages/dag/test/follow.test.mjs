@@ -11,14 +11,14 @@ test('execution colors emphasize unselected graph and task titles, borders and s
   const frame = renderFrame(state, { columns: 35, rows: 200, color: true, selectedNodeId: 'completed' });
   const lines = frame.text.split('\n');
   for (const [id, color] of Object.entries(colors)) {
-    const graph = lines.slice(3 + frame.graphRanges[id].start, 3 + frame.graphRanges[id].end);
-    const card = lines.slice(3 + frame.nodeRanges[id].start, 3 + frame.nodeRanges[id].end);
+    const graph = lines.slice(frame.bodyStart + frame.graphRanges[id].start, frame.bodyStart + frame.graphRanges[id].end);
+    const card = lines.slice(frame.bodyStart + frame.nodeRanges[id].start, frame.bodyStart + frame.nodeRanges[id].end);
     assert.ok(graph[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(graph[1].includes(`\x1b[${color}m${id === 'completed' ? '>' : ' '}`), id);
+    assert.ok(graph[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
     assert.ok(graph[2].includes(`\x1b[${color}m`), id);
     assert.ok(graph[4].startsWith(`\x1b[${color}m╰`), id);
     assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(card[1].includes(`\x1b[${color}m${id === 'completed' ? '>' : ' '}`), id);
+    assert.ok(card[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
     assert.ok(card.at(-1).startsWith(`\x1b[${color}m╰`), id);
   }
   const pending = lines.slice(3 + frame.graphRanges.pending.start, 3 + frame.graphRanges.pending.end).join('\n');
@@ -28,13 +28,13 @@ test('execution colors emphasize unselected graph and task titles, borders and s
   const standalone = renderFrame(state, { columns: 35, rows: 200, color: true, selectedTaskId: 'completed' });
   for (const [id, color] of Object.entries(colors)) {
     const range = standalone.taskRanges[id];
-    const card = standalone.text.split('\n').slice(2 + range.start, 2 + range.end);
+    const card = standalone.text.split('\n').slice(standalone.bodyStart + range.start, standalone.bodyStart + range.end);
     if (id === 'completed') {
       assert.equal(range.end-range.start,1);
       assert.ok(card[0].includes(`\x1b[${color}m> ✓ [+] T_completed`),id);
     } else {
       assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-      assert.ok(card[1].includes(`\x1b[${color}m `), id);
+      assert.ok(card[1].includes(`\x1b[1;${color}m `), id);
     }
     if (id === 'completed') assert.ok(!card.join('\n').includes('\x1b[36m'));
   }

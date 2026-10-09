@@ -430,7 +430,7 @@ test('elapsed duration follows explicit descendants without borrowing the parent
   const interior = frame.split('\n').filter(line => line.startsWith('│')).slice(-15);
   assert.match(interior[3], /2m 3s/);
   assert.match(interior[8], /1m 3s/);
-  assert.match(interior[13], /^│\s+-\s+│$/);
+  assert.match(interior[13], /^│\s+│$/);
   assert.doesNotMatch(interior[13], /1m 3s|2m 3s/);
 });
 

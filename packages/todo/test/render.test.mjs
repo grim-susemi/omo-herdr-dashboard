@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 
-test('tiny Korean Todo footer keeps follow and c/q controls visible',()=>{
+test('tiny Korean Todo footer keeps follow and live state without keyboard guides',()=>{
   const frame=renderFrame({...mixed(),availability:'current'},{
     columns:22,rows:8,color:false,language:'ko',follow:false});
   const foot=stripVTControlCharacters(frame.text).split('\n').at(-1);
-  for(const key of ['OFF','j/k','c','q'])assert.ok(foot.includes(key),foot);
+  assert.match(foot, /OFF/);
+  assert.doesNotMatch(foot, /j\/k|a\/z|c q|^f /);
   assert.ok(fixtureCells(foot)<22);
 });
 
@@ -40,7 +41,8 @@ test('grapheme width, truncation and wrapping retain independently expected cell
   assert.deepEqual(wrap('한글', 1), ['?', '?']);
 });
 
-for (const [columns, rows, bodyRows] of [[80, 24, 16], [40, 16, 8], [24, 8, 2], [12, 4, 0], [1, 1, 0]]) {
+for (const [columns, rows, bodyRows] of [[80, 24, 15], [40, 16, 7], [24, 8, 2],
+  [52, 23, 14], [34, 18, 9], [51, 46, 37], [12, 4, 0], [1, 1, 0]]) {
   test(`${columns}x${rows}: visible bounded frame without ask starving current work`, () => {
     const frame = renderFrame(mixed(), { columns, rows, revealTarget: true, color: false });
     assert.equal(frame.lines.length, rows);
@@ -50,7 +52,10 @@ for (const [columns, rows, bodyRows] of [[80, 24, 16], [40, 16, 8], [24, 8, 2], 
     if (columns === 24) assert.match(frame.text, /2\/5 done:1 drop:1/);
     if (bodyRows > 0) {
       assert.ok(frame.lines.some(line => line.includes('>* ')), 'actual target remains visible');
-      assert.ok(frame.askRows <= 3);
+      assert.ok(frame.askRows <= 2);
+      assert.equal(frame.lines[frame.bodyStart], frame.bodyLines[frame.scroll]);
+      assert.equal(frame.bodyStart + frame.bodyRows + 1, rows);
+      assert.doesNotMatch(frame.text, /j\/k|a\/z|^f /m);
     }
   });
 }
@@ -68,7 +73,7 @@ test('every phase shell and every actual status remain accessible by basic body 
     assert.ok(frame.lines.some(line => line.includes(phase.name)));
   }
   const shell = renderFrame(project([{ name: 'Empty', tasks: [] }]), { columns: 40, rows: 16, color: false });
-  assert.match(shell.text, /Empty 0\/0 done:0 drop:0/);
+  assert.match(shell.text, /Empty 0\/0/);
   assert.doesNotMatch(shell.text, /100%/);
 });
 
@@ -78,7 +83,7 @@ test('closed includes dropped; dropped never becomes completed', () => {
   ] }]);
   const frame = renderFrame(snapshot, { color: false, completedExpanded: true });
   assert.match(frame.text, /2\/2 closed done:0 drop:2/);
-  assert.match(frame.text, /Dropped 2\/2 done:0 drop:2/);
+  assert.match(frame.text, /Dropped 2\/2 drop:2/);
   assert.equal(snapshot.target, null);
   assert.deepEqual(Object.values(frame.taskRanges).map(range => range.status), ['abandoned', 'abandoned']);
 });
@@ -89,7 +94,7 @@ test('ask has its own bounded scroll; long unspaced labels lose no content in th
   const second = renderFrame(snapshot, { color: false, revealTarget: true, askScroll: 2 });
   assert.equal(first.scroll, second.scroll);
   assert.equal(second.askScroll, 2);
-  assert.notDeepEqual(first.lines.slice(4, 7), second.lines.slice(4, 7));
+  assert.notDeepEqual(first.lines.slice(5, first.bodyStart), second.lines.slice(5, second.bodyStart));
   const range = first.taskRanges[snapshot.target.key];
   const body = first.bodyLines.slice(range.start, range.end).map(line => line.slice(3)).join('');
   assert.equal(body, snapshot.target.content);
@@ -154,8 +159,8 @@ test('fully closed nonempty phases fold task rows but keep truthful shells and c
   const folded=renderFrame(snapshot,{columns:80,rows:40,color:false});
   const expanded=renderFrame(snapshot,{columns:80,rows:40,color:false,completedExpanded:true});
   assert.doesNotMatch(folded.text,/DONE_HIDE|DROP_HIDE/);
-  assert.match(folded.text,/Closed 2\/2 done:1 drop:1/);
-  assert.match(folded.text,/Empty 0\/0 done:0 drop:0/);
+  assert.match(folded.text,/Closed 2\/2 drop:1/);
+  assert.match(folded.text,/Empty 0\/0/);
   assert.equal(Object.keys(folded.phaseRanges).length,3);
   assert.match(expanded.text,/DONE_HIDE/);assert.match(expanded.text,/DROP_HIDE/);
   assert.ok(expanded.bodyLines.length>folded.bodyLines.length);
@@ -176,4 +181,32 @@ test('retained native target drives marker and reveal without replacing the snap
     target: retained, follow: false, revealTarget: false });
   assert.equal(paused.scroll, 0);
   assert.deepEqual(snapshot, original);
+});
+
+test('reference hierarchy emphasizes active work and exposes body-relative click ranges', () => {
+  const snapshot = project([{ name: 'Closed', tasks: [{ content: 'DONE', status: 'completed' }] },
+    { name: 'Open', tasks: [{ content: 'ACTIVE', status: 'in_progress' },
+      { content: 'PENDING', status: 'pending' }] }]);
+  const frame = renderFrame(snapshot, { columns: 52, rows: 23, color: true, completedExpanded: true });
+  assert.deepEqual(frame.closedRange, { start: 0, end: 1 });
+  assert.ok(frame.lines[0].startsWith('\x1b[1;36m'));
+  const phase = frame.phaseRanges[snapshot.phaseSummaries[1].key];
+  assert.ok(frame.bodyLines[phase.start].startsWith('\x1b[1;35m'));
+  const active = frame.taskRanges[snapshot.target.key];
+  assert.ok(frame.bodyLines[active.start].startsWith('\x1b[1;35m'));
+  const done = frame.taskRanges[snapshot.phaseSummaries[0].taskKeys[0]];
+  assert.ok(frame.bodyLines[done.start].startsWith('\x1b[9;90m'));
+  assert.equal(frame.lines[frame.bodyStart + active.start - frame.scroll], frame.bodyLines[active.start]);
+  assert.ok(frame.bodyLines.includes(''));
+  assert.equal(renderFrame(project([]), { color: false }).closedRange, null);
+});
+
+test('read errors remain pinned while closed summaries retain stable click coordinates', () => {
+  const snapshot = mixed();
+  const frame = renderFrame(snapshot, { columns: 34, rows: 18, color: false,
+    error: 'READ_FAILURE', availability: 'last-known', scroll: 100 });
+  assert.deepEqual(frame.closedRange, { start: 0, end: 1 });
+  assert.match(frame.lines.at(-2), /READ_FAILURE/);
+  assert.equal(frame.bodyStart + frame.bodyRows + 2, frame.lines.length);
+  assert.ok(frame.lines.every(line => width(line) < 34));
 });

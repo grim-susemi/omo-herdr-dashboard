@@ -76,7 +76,8 @@ export function activitySummary(task, language, now = Date.now()) {
 const icons = { pending: '○', blocked: '◌', scheduled: '◷', running: '●', paused: 'Ⅱ', completed: '✓', failed: '×', cancelled: '−', skipped: '·', error: '×', interrupted: '−', lost: '?' };
 const colors = { running: '36', completed: '32', failed: '31', blocked: '33', paused: '33', scheduled: '36', error: '31' };
 const accent = '36';
-const paint = (text, color, enabled) => enabled && color ? `\x1b[${color}m${text}\x1b[0m` : text;
+const paint = (text, color, enabled, heading = false) => enabled && (color || heading) ?
+  `\x1b[${heading ? `1${color ? `;${color}` : ''}` : color}m${text}\x1b[0m` : text;
 const taskStatuses = new Set([...Object.keys(icons), 'error', 'interrupted', 'lost']);
 
 export function standaloneTasks(state) {
@@ -136,19 +137,19 @@ export function graphLines(run, columns, color = true, language = 'en', { select
         const task = node.state === 'running' ? tasks.find(task => task.id === node.taskId) : undefined;
         const state = `${icons[node.state]} ${t(language, node.state)}`;
         const activity = activitySummary(task, language, now);
-        const head = activity ? `${state} ${activity.head}` : state;
+        const head = activity ? `${state} ${activity.head}` : node.error ? `${state} · ${clean(node.error)}` : state;
         const room = boxWidth - 4 - width(head) - 1;
         const stateLine = activity?.text && room >= 4 ? `${head} ${fitTail(activity.text, room)}` : head;
         stalledNodes.add(activity?.stalled ? node.id : undefined);
         return [
           fit(`${node.id === selectedNodeId ? '>' : ' '} [${isExpanded(viewState, run.id, node.id, node.state) ? '-' : '+'}] ${node.label}`, boxWidth - 4, true),
           fit(stateLine, boxWidth - 4, true),
-          fit(incoming.length ? `← ${incoming.join(', ')}` : t(language, 'startNode'), boxWidth - 4, true),
+          fit(incoming.length ? `← ${incoming.join(', ')}` : '', boxWidth - 4, true),
         ];
       });
       output.push(prefix + group.map(node => paint(`╭${'─'.repeat(Math.max(0, boxWidth - 2))}╮`, colors[node.state], color)).join('  '));
       for (let line = 0; line < 3; line++) output.push(prefix + group.map((node, i) =>
-        `${paint('│', colors[node.state], color)} ${paint(interiors[i][line], line === 1 && stalledNodes.has(node.id) ? colors.paused : line < 2 ? colors[node.state] : undefined, color)} ${paint('│', colors[node.state], color)}`).join('  '));
+        `${paint('│', colors[node.state], color)} ${paint(interiors[i][line], line === 1 && stalledNodes.has(node.id) ? colors.paused : line < 2 ? colors[node.state] : undefined, color, line === 0)} ${paint('│', colors[node.state], color)}`).join('  '));
       output.push(prefix + group.map(node => paint(`╰${'─'.repeat(Math.max(0, boxWidth - 2))}╯`, colors[node.state], color)).join('  '));
       if (graphRanges) for (const node of group) graphRanges[node.id] = { start, end: output.length };
       if (offset + perRow < row.length) output.push(`  · ${t(language, 'sameFrontier')}`);
@@ -247,14 +248,14 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const value = text => text === undefined || text === null || text === '' ? '-' : clean(text);
   const status = node?.state ?? task?.status;
   const duration = task ? elapsedTime(task, timing, status) : null;
-  let elapsed = '-';
+  let elapsed = '';
   if (duration !== null) {
     const [hours, minutes, seconds] = duration.split(':').map(Number);
     elapsed = [hours ? t(language, 'compactHours', { count: hours }) : '',
       hours || minutes ? t(language, 'compactMinutes', { count: minutes }) : '',
       t(language, 'compactSeconds', { count: seconds })].filter(Boolean).join(' ');
   }
-  const stats = [elapsed];
+  const stats = elapsed ? [elapsed] : [];
   for (const [key, label] of [['turns', 'compactTurns'], ['toolCalls', 'compactTools']]) {
     if (task?.[key] !== undefined && task[key] !== null) stats.push(t(language, label, { count: value(task[key]) }));
   }
@@ -263,10 +264,10 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const identity = [task?.agent, task?.category].filter(Boolean).map(clean).join('/');
   return [
     `${indent}${marker} ${icons[status] ?? '?'} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`,
-    `${indent}${value(identity)} · ${value(task?.model).replace(/^[^/\s]+\//u, '')}`,
-    `${indent}${value(task?.progress)}`,
+    `${indent}${[identity, task?.model ? clean(task.model).replace(/^[^/\s]+\//u, '') : ''].filter(Boolean).join(' · ')}`,
+    `${indent}${task?.progress || node?.error ? clean(task?.progress || node.error) : ''}`,
     `${indent}${stats.join(' · ')}`,
-    `${indent}${metricSummary(task, language)}`,
+    `${indent}${task?.metrics ? metricSummary(task, language) : ''}`,
   ].map((line, index) => {
     const room = Math.max(1, columns - 4);
     const activity = index === 2 && timing.connected ? activitySummary(task, language, timing.now) : null;
@@ -309,7 +310,7 @@ function detailBox(text, columns, color, status, label) {
   const title = label !== undefined && columns >= 7 ? `─ ${fit(label, columns - 6)} ` : '';
   return [paint(`╭${title}${'─'.repeat(Math.max(0, columns - 2 - width(title)))}╮`, border, color),
     ...text.flatMap((line, index) => wrap(line, inner).map(part =>
-      `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color)} ${paint('│', border, color)}`)),
+      `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color, index === 0)} ${paint('│', border, color)}`)),
     paint(`╰${'─'.repeat(Math.max(0, columns - 2))}╯`, border, color)];
 }
 
@@ -352,10 +353,10 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const roots = standaloneTasks(state);
   const tasksView = view === 'tasks' || !all.length;
   const tasksTitle = `${t(language, 'tasks')} (${roots.length})`;
-  const switcher = tasksView ? (all.length ? `  t DAG (${all.length})` : '') : `  t ${tasksTitle}`;
+  const switcher = tasksView ? (all.length ? `  DAG (${all.length})` : '') : `  ${tasksTitle}`;
   const activeRuns = all.filter(candidate => candidate.status === 'running' || candidate.nodes.some(node => node.state === 'running'));
   const completedRuns = all.filter(candidate => !activeRuns.includes(candidate));
-  const head = [paint(fit(`OMO  /  ${tasksView ? t(language, 'tasks') : 'DAG'}${switcher}`, columns), accent, color),
+  const head = [paint(fit(`OMO  /  ${tasksView ? t(language, 'tasks') : 'DAG'}${switcher}`, columns), accent, color, true),
     fit(tasksView ? tasksTitle : `${t(language, 'selectedRun', { name: run.name })} · ${t(language, 'activeRuns', { count: activeRuns.length })}`, columns)];
   const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
   if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'),
@@ -370,6 +371,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       const expanded = typeof explicit === 'boolean' ? explicit :
         protectedParent || isExpanded(viewState, TASK_SCOPE, task.id, task.status);
       if (compactCompleted && !completedExpanded && !expanded && task.id !== selectedTaskId) continue;
+      if (body.length && body.at(-1) !== '') body.push('');
       const start = body.length;
       body.push(...taskCard(task, state?.tasks ?? [], columns, color, language,
         { now, connected: state?.connected, updatedAt: state?.updatedAt },
@@ -396,11 +398,12 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       for (const [id, range] of Object.entries(ranges)) graphRanges[id] = { start: start + range.start, end: start + range.end };
     }
     catch (error) { body.push(t(language, 'graphError', { error: clean(error.message) })); }
-    body.push('', t(language, 'dependencies'));
+    body.push('', paint(t(language, 'dependencies'), accent, color, true));
     if (!run.edges.length) body.push(`  ${t(language, 'none')}`);
     for (const edge of run.edges) body.push(`  ${clean(edge.from)} → ${clean(edge.to)}`);
-    body.push('', t(language, 'details'));
+    body.push('', paint(t(language, 'details'), accent, color, true));
     for (const node of run.nodes) {
+      body.push('');
       const start = body.length;
       body.push(...taskCard(state?.tasks?.find(task => task.id === node.taskId), state?.tasks ?? [], columns, color, language,
         { now, connected: state?.connected, updatedAt: state?.updatedAt },
@@ -412,9 +415,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     head.push('');
     body.push('', `  ○  ${t(language, 'waiting')}`, '', `  ${t(language, 'waitingLine1')}`, `  ${t(language, 'waitingLine2')}`);
   }
-  const showCloseHint = !state?.connected;
   const narrow = columns < 40;
-  const available = Math.max(0, rows - head.length - (narrow ? 4 : tasksView ? 3 : showCloseHint ? 6 : 5));
+  const available = Math.max(0, rows - head.length - 1 - Number(Boolean(error)) - Number(Boolean(notice)));
   const selected = tasksView ? taskRanges[selectedTaskId] : nodeRanges[selectedNodeId];
   if (revealSelection && selected && available > 0) {
     if (verbose || selected.start < scroll || selected.start + Math.min(3, available) > scroll + available) scroll = selected.start;
@@ -440,18 +442,18 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     if (node) visible[0] = fit(`${icons[node.state]} ${clean(node.label ?? node.id)}`, columns);
   }
   const range = body.length > available ? ` ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : '';
-  const status = error ? t(language, offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: clean(error) }) :
-    narrow ? `f ${t(language, follow && state?.connected ? 'followShortOn' : 'followShortOff')} ${t(language, offline || !state?.connected ? 'offlineShort' : 'liveShort')}${range}` :
-      `f ${t(language, follow && state?.connected ? 'followOn' : 'followOff')} · ${notice || `${state?.connected ? `● ${t(language, 'connected')}` : `○ ${t(language, 'disconnected')}`}${body.length > available ? `  ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : ''}`}`;
-  const foot = narrow ? [fit(status, columns), fit('n/p Space/Enter', columns),
-    fit(t(language, tasksView ? 'workerGroupKeys' : 'dagGroupKeys'), columns), fit(t(language, 'detailCloseKeys'), columns)] : [...(tasksView ? [] : ['─'.repeat(columns)]),
-    fit(status, columns),
-    ...(!tasksView && showCloseHint ? [fit(t(language, 'closeHint'), columns)] : []),
-    ...(tasksView ? [fit(columns < 40 ? 'n/p Space/Enter' : `${t(language, 'nodeControls')}  ${t(language, 'toggleControls')}`, columns),
-      fit(t(language, columns < 40 ? 'workerControlsNarrow' : 'workerControls'), columns)] :
-      [fit(t(language, 'nodeControls'), columns), fit(t(language, 'toggleControls'), columns),
-        fit(`${t(language, 'controls')}  c ${t(language, 'toggleCompleted')}`, columns)])];
-  return { text: [...head, ...visible, ...foot].slice(0, rows).join('\n'), scroll: start, nodeRanges, taskRanges, graphRanges };
+  const live = state?.connected && !error;
+  const source = offline || !state?.connected ? t(language, !state?.connected && !narrow ? 'disconnected' : 'offlineShort') :
+    t(language, error ? 'error' : 'liveShort');
+  const status = `${t(language, narrow ? follow && live ? 'followShortOn' : 'followShortOff' :
+    follow && live ? 'followOn' : 'followOff')} · ${source}${range}`;
+  const foot = [
+    ...(error ? [paint(fit(t(language, offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: clean(error) }), columns), colors.error, color)] : []),
+    ...(notice ? [paint(fit(notice, columns), colors.paused, color)] : []),
+    paint(fit(status, columns), live ? accent : colors.paused, color),
+  ];
+  return { text: [...head, ...visible, ...foot].slice(0, rows).join('\n'), scroll: start,
+    bodyStart: head.length, bodyRows: available, nodeRanges, taskRanges, graphRanges };
 }
 
 export const render = (state, options) => renderFrame(state, options).text;

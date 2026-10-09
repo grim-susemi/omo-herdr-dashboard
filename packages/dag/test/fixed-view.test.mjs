@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 
 for(const language of ['en','ko','zh-cn']) for(const view of ['dag','tasks']) for(const columns of [40,24])
-  test(`narrow ${view} keeps current target, live/follow and role controls at ${columns} in ${language}`,()=>{
+  test(`narrow ${view} keeps current target and live/follow without keyboard guides at ${columns} in ${language}`,()=>{
     const frame=renderFixedFrame({...state,language},{columns,rows:8,color:false,
       follow:true,runningNodeId:'first',selectedNodeId:'first',runningTaskId:'st_ordinary'},view);
     const lines=frame.text.split('\n'), foot=lines.slice(-4).join('\n');
     assert.match(foot,/ON/);assert.match(foot,/LIVE|연결|在线/);
-    for(const key of ['n/p','Space/Enter','j/k','c','d','q'])assert.ok(foot.includes(key),key+' '+foot);
-    if(view==='dag')assert.ok(lines.slice(0,-4).some(line=>line.includes('ACTUAL_FIRST')||line.includes('ACTUAL_…')));
+    assert.doesNotMatch(foot, /n\/p|Space\/Enter|j\/k|Details q|^f /m);
+    if(view==='dag')assert.ok(lines.slice(frame.bodyStart,-1).some(line=>line.includes('ACTUAL_FIRST')||line.includes('ACTUAL_…')));
     const offline=renderFixedFrame({...state,language},{columns,rows:8,color:false,offline:true,follow:false},view);
     assert.match(offline.text.split('\n').slice(-4).join('\n'),/OFFLINE|오프라인|离线/);
     assert.ok(lines.every(line=>width(line)<columns));
@@ -23,29 +23,31 @@ for (const view of ['dag', 'tasks']) for (const columns of [80, 29, 24])
     assert.match(foot, /OFFLINE/);
     assert.ok(frame.text.split('\n').every(line => width(line) < columns));
   });
-test('initial 60x12 worker viewport shows the whole active card and role controls', () => {
+test('initial 60x12 worker viewport shows the whole active card and concise follow state', () => {
   const frame = renderFixedFrame(state, { columns:60, rows:12, color:false, selectedTaskId:'st_ordinary' }, 'tasks');
   const lines = frame.text.split('\n');
   assert.ok(lines.some(line => /^╰─+╯$/.test(line)), 'Active card bottom is clipped');
   assert.ok(frame.text.includes('ORDINARY_ROOT'));
   assert.match(frame.text, /\$0\.4493.*21 tok\/s/);
   assert.ok(lines.slice(-3).some(line => line.includes('Follow ON')));
-  assert.ok(lines.slice(-3).some(line => line.includes('c') && line.includes('q')));
+  assert.doesNotMatch(lines.at(-1), /j\/k|Space\/Enter|^f /);
 });
 test('workers viewport suppresses a border-only card edge without changing task ranges', () => {
   const source = {...state, runs:[], tasks:[
     {id:'active',status:'running',description:'ACTIVE',progress:'PROGRESS'},
     {id:'next',status:'pending',description:'NEXT'}]};
-  const frame = renderFixedFrame(source,{columns:80,rows:13,color:false,
+  const frame = renderFixedFrame(source,{columns:80,rows:12,color:false,
     selectedTaskId:'active'},'tasks');
   assert.deepEqual(frame.taskRanges.active,{start:0,end:7});
-  assert.deepEqual(frame.taskRanges.next,{start:7,end:10});
-  const body=frame.text.split('\n').slice(2,10);
+  assert.deepEqual(frame.taskRanges.next,{start:8,end:11});
+  assert.equal(frame.bodyStart, 2);
+  const body=frame.text.split('\n').slice(frame.bodyStart, frame.bodyStart + frame.bodyRows);
   assert.match(body[6], /^╰/);
   assert.equal(body[7], '');
-  const colored = renderFixedFrame(source,{columns:80,rows:13,color:true,
+  assert.equal(body[8], '');
+  const colored = renderFixedFrame(source,{columns:80,rows:12,color:true,
     selectedTaskId:'active'},'tasks');
-  assert.equal(colored.text.split('\n')[9], '');
+  assert.equal(colored.text.split('\n')[10], '');
   const bottomOnly=renderFixedFrame(source,{columns:80,rows:7,color:false,scroll:6},'tasks');
   assert.equal(bottomOnly.text.split('\n')[2],'');
   assert.deepEqual(bottomOnly.taskRanges,frame.taskRanges);
@@ -106,7 +108,7 @@ for (const view of ['dag', 'tasks']) for (const columns of [80, 24])
     assert.ok(frame.split('\n').every(line => width(line) < columns));
     if (view === 'dag') {
       const empty = renderFixedFrame({ ...state, runs: [] }, options, view).text;
-      assert.match(empty.split('\n').at(-4), /^Read error:/);
+      assert.match(empty.split('\n').slice(-2).join('\n'), /^Read error:/m);
       assert.doesNotMatch(empty, /ORDINARY_ROOT|Tasks|Follow ON/);
     }
   });
@@ -152,6 +154,31 @@ test('14-row workers fit the entire selected running card including metrics and 
   assert.match(frame.text,/\$0\.4493.*21 tok\/s/);
   const lines=frame.text.split('\n');
   assert.ok(lines.findIndex(line=>line.startsWith('╰'))>lines.findIndex(line=>line.includes('21 tok/s')));
+});
+
+for (const view of ['dag', 'tasks']) for (const [columns, rows] of [[52, 23], [34, 18], [51, 46]])
+  test(`readable ${view} exposes body offsets and current work at ${columns}x${rows}`, () => {
+    const frame = renderFixedFrame(state, { columns, rows, color: false,
+      runningNodeId: 'first', runningTaskId: 'st_ordinary', follow: true }, view);
+    const lines = frame.text.split('\n');
+    assert.equal(lines.length, rows);
+    assert.equal(frame.bodyStart, view === 'dag' ? 3 : 2);
+    assert.ok(frame.bodyRows > 0);
+    const range = view === 'dag' ? frame.graphRanges.first : frame.taskRanges.st_ordinary;
+    const visible = lines.slice(frame.bodyStart + Math.max(0, range.start - frame.scroll),
+      frame.bodyStart + Math.min(frame.bodyRows, range.end - frame.scroll)).join('\n');
+    assert.match(visible, /●/);
+    assert.ok(lines.every(line => width(line) < columns));
+    assert.doesNotMatch(frame.text, /n\/p|Space\/Enter|j\/k|Tab\/n|^f /m);
+  });
+
+test('follow preference stays on when presence is offline but a valid connected snapshot remains', () => {
+  const frame = renderFixedFrame(state, { columns: 52, rows: 23, color: false,
+    offline: true, follow: true }, 'tasks');
+  assert.match(frame.text.split('\n').at(-1), /Follow ON.*OFFLINE/);
+  const failed = renderFixedFrame(state, { columns: 52, rows: 23, color: false,
+    offline: true, follow: true, error: 'READ_FAILURE' }, 'tasks');
+  assert.match(failed.text.split('\n').at(-1), /Follow OFF.*OFFLINE/);
 });
 
 const fixedPosixBridge = String.raw`

@@ -130,7 +130,7 @@ async function fixture(t, { offers = true, hold = false } = {}) {
   }
   await writeState();
   const options = { statePath, paneId: state.paneId, launchToken: state.launchToken };
-  return { directory, statePath, cachePath, controlPipe, presence, output, time, requests, controlEvents, options, writeState,
+  return { directory, statePath, cachePath, controlPipe, presence, output, input, time, requests, controlEvents, options, writeState,
     get state() { return state; }, set acceptClose(value) { acceptClose = value; },
     async publish(content) { return presence.publish({ ...native(content), ...presence.getOwner() }); },
     async start(overrides = {}) {
@@ -139,6 +139,34 @@ async function fixture(t, { offers = true, hold = false } = {}) {
     },
   };
 }
+
+test('mouse inspection is local and blur reveals the running target without a key', async t => {
+  const f = await fixture(t);
+  await f.publish('Mouse target');
+  const ack = signal(f.presence.events, 'event', value => value.type === 'ack');
+  const viewer = await f.start(); await ack;
+  const mouse = async (sequence, follow) => {
+    const painted = signal(viewer.events, 'frame');
+    f.input.write(sequence);
+    await painted;
+    assert.equal(viewer.state.follow, follow);
+  };
+  await mouse('\x1b[<65;4;12M', false);
+  const wheelScroll = viewer.frame.scroll;
+  assert.ok(wheelScroll > 0);
+  await mouse('\x1b[<0;4;12M', false);
+  await mouse('\x1b[<32;4;9M', false);
+  assert.ok(viewer.frame.scroll > wheelScroll);
+  f.input.write('\x1b[<0;4;9m');
+  await mouse('\x1b[O', true);
+  const range = viewer.frame.taskRanges[viewer.state.target.key];
+  assert.ok(range.start >= viewer.frame.scroll &&
+    range.start < viewer.frame.scroll + viewer.frame.bodyRows);
+  assert.equal(viewer.state.target.content, 'Mouse target');
+  assert.equal(f.requests.filter(value => value.type === 'close').length, 0);
+  await viewer.close(false);
+  assert.equal(f.input.listenerCount('data'), 0);
+});
 
 test('CLI and role/offer bindings reject foreign identity before any connection or close', async t => {
   const f = await fixture(t);
@@ -368,7 +396,7 @@ test('rejected close has no direct fallback; termination does not request manual
   assert.equal(f.requests.filter(value => value.type === 'close').length, 1);
 });
 
-test('follow keeps automatic reveal transient and manual choices survive duplicate, resize and same-scope restart', async t => {
+test('follow keeps reveal transient, retains navigation but resumes automatically on restart', async t => {
   const f = await fixture(t);
   const phases = [{ name: 'Long phase', tasks: Array.from({ length: 35 }, (_, index) => ({
     content: `FOLLOW_NATIVE_${index}`, status: index === 31 ? 'in_progress' : 'completed',
@@ -402,12 +430,12 @@ test('follow keeps automatic reveal transient and manual choices survive duplica
   await viewer.close(false);
   const restarted = signal(f.presence.events, 'event', event => event.type === 'ack');
   viewer = await f.start(); await restarted;
-  assert.equal(viewer.state.follow, false);
+  assert.equal(viewer.state.follow, true);
   assert.equal(viewer.state.scroll, manualScroll);
   assert.equal(viewer.state.askScroll, 1);
   assert.equal(await fs.readFile(f.statePath, 'utf8'), source);
   const following = signal(viewer.events, 'frame', value => value.text.includes('Follow ON'));
-  viewer.key('f'); await following;
+  await viewer.draw(); await following;
   phases.unshift({ name: 'Parallel phase', tasks: [{ content: 'EARLY_ARRIVAL', status: 'in_progress' }] });
   const retained = signal(viewer.events, 'frame', value => value.sequence === 2 && value.text.includes('FOLLOW_NATIVE_31'));
   await publish(); await retained;
@@ -444,7 +472,7 @@ test('closed phase c persists manual expansion only in its validated scope', asy
   f.output.columns=24;f.output.rows=8;await viewer.draw();assert.equal(viewer.state.completedExpanded,true);
   assert.equal(await fs.readFile(f.state.prefsPath,'utf8'),saved);await viewer.close(false);
   const restarted=signal(f.presence.events,'event',v=>v.type==='ack');viewer=await f.start();await restarted;
-  assert.equal(viewer.state.completedExpanded,true);assert.equal(viewer.state.follow,false);
+  assert.equal(viewer.state.completedExpanded,true);assert.equal(viewer.state.follow,true);
   const owner=f.presence.getOwner();await f.presence.rebase({...owner,scopeEpoch:2});
   const rebound=signal(viewer.events,'registered',v=>v.scope.scopeEpoch===2);
   await f.writeState({...f.state,scopeEpoch:2,presenceOffer:f.presence.offer('todo'),controlOffer:{...f.state.controlOffer,scopeEpoch:2}});await rebound;

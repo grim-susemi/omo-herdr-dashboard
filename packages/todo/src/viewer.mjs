@@ -2,7 +2,7 @@ import { watch } from 'node:fs';
 import { readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { emitKeypressEvents } from 'node:readline';
+import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { EventEmitter } from 'node:events';
 import { createRoleClient } from './presence.mjs';
 import { sameSnapshotScope, validSnapshot } from './storage.mjs';
@@ -81,7 +81,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   let resolveClosed;
   const closed = new Promise(done => { resolveClosed = done; });
   const temporaryPrefs = `${options.statePath}.view.json.${pid}.pending`;
-  let watcher, timer;
+  let watcher, timer, disposeInput, disposeFocus, dragY;
   const current = (epoch, source) => !closing && epoch === generation && source === client;
   const write = text => new Promise((done, fail) => output.write(text, cause => cause ? fail(cause) : done()));
   function draw() {
@@ -162,7 +162,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
         [value.scroll, value.askScroll].every(number => Number.isSafeInteger(number) && number >= 0) &&
         (value.follow === undefined || typeof value.follow === 'boolean') &&
         (value.completedExpanded === undefined || typeof value.completedExpanded === 'boolean')) {
-        prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: value.follow ?? true,
+        prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: true,
           completedExpanded: value.completedExpanded ?? false };
         scroll = prefs.scroll;
       }
@@ -271,11 +271,11 @@ export async function startViewer(options, { input = process.stdin, output = pro
       }
       retire();
       watcher?.close(); clock.clearInterval(timer);
-      output.off?.('resize', resize); input.off?.('keypress', keypress);
+      output.off?.('resize', resize); disposeInput?.(); disposeFocus?.();
       if (interactive) { input.setRawMode?.(false); input.pause?.(); }
       await saving;
       await painting;
-      if (interactive) await write('\x1b[?25h\x1b[?1049l').catch(cause => events.emit('output-error', cause));
+      if (interactive) await write(`${disablePointer}\x1b[?25h\x1b[?1049l`).catch(cause => events.emit('output-error', cause));
       events.emit('closed', { manual, accepted });
       resolveClosed({ manual, accepted });
       return { manual, accepted };
@@ -307,6 +307,31 @@ export async function startViewer(options, { input = process.stdin, output = pro
     if (state) savePreferences();
   }
   const keypress = (text, pressed) => { void key(pressed.sequence || text || pressed.name); };
+  const pointer = mouse => {
+    if (closing) return;
+    if (mouse.release) { dragY = undefined; return; }
+    if (mouse.button & 64) {
+      prefs.follow = false;
+      scroll = Math.max(0, scroll + (mouse.button & 1 ? 3 : -3));
+    } else if ((mouse.button & 3) === 0) {
+      prefs.follow = false;
+      if (mouse.button & 32) {
+        if (dragY !== undefined) scroll = Math.max(0, scroll + dragY - mouse.y);
+      } else {
+        const row = mouse.y - 1 - (lastFrame?.bodyStart ?? 0) + scroll;
+        if (mouse.y - 1 >= lastFrame?.bodyStart && mouse.y - 1 < lastFrame.bodyStart + lastFrame.bodyRows &&
+          lastFrame?.closedRange && row >= lastFrame.closedRange.start && row < lastFrame.closedRange.end)
+          prefs.completedExpanded = !prefs.completedExpanded;
+      }
+      dragY = mouse.y;
+    } else return;
+    void draw();
+  };
+  const focus = focused => {
+    if (focused || closing) return;
+    dragY = undefined; prefs.follow = true;
+    void draw();
+  };
   const resize = () => { void draw(); };
   try {
     if (interactive) {
@@ -321,15 +346,17 @@ export async function startViewer(options, { input = process.stdin, output = pro
         retire(); snapshot = lastKnown; invalidState = true;
         availability = snapshot ? 'last-known' : 'error'; error = cause.message; void draw();
       });
-      output.write('\x1b[?1049h\x1b[?25l');
+      output.write(`\x1b[?1049h\x1b[?25l${enablePointer}`);
       input.setRawMode?.(true); input.resume?.();
-      emitKeypressEvents(input);
-      input.on('keypress', keypress); output.on?.('resize', resize);
+      disposeInput = terminalInput(input, { key: keypress, pointer, focus });
+      output.on?.('resize', resize);
       // Repaint even idle/empty baselines. No frame completion means no renewal.
       timer = clock.setInterval(() => { void draw(); }, 1000);
       timer?.unref?.();
     }
     await refresh();
+    if (interactive) disposeFocus = await watchHerdrFocus(options.paneId, () => focus(false),
+      cause => { error = `Focus: ${cause.message}`; void draw(); });
     if (!interactive) await painting;
   } catch (cause) {
     await close(false);

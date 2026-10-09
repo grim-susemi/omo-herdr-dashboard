@@ -1,5 +1,34 @@
 # Current dashboard verification
 
+## 2026-10-09 mouse-first source candidate
+
+The source candidate has a quieter layout, no keyboard legend, and independent
+mouse inspection in Todo, workers and DAG. Click, vertical drag and wheel pause
+the inspected view. Losing pane/tab/workspace focus restores automatic tracking;
+reopening starts in automatic mode while retaining fold and selection preferences.
+Todo styling follows the supplied Senpi reference.
+
+Actual Windows ConPTY viewers passed 18 click/drag/wheel/blur/resize captures
+across the three roles. Normal and 34-column frames were inspected as xterm
+screenshots. Actual Herdr pane moves restored tracking in both DAG and Todo.
+Herdr 0.9.3 did not forward those moves as terminal focus reports, so the candidate
+also subscribes to the public focus event stream. It does not poll or modify Herdr.
+All owned viewers, streams and fixtures were closed after the checks.
+
+Root tests passed 6/6; Todo passed 141/141; DAG passed 216/219. The remaining three
+failures are unchanged Windows fixtures in `packages/dag/test/herdr.test.mjs`
+that create a POSIX `herdr` stub while the Windows resolver searches for
+`herdr.exe`. JavaScript syntax checks, unified build, offline installation and
+imports of both packaged viewers passed. The archive contains 40 files and 26
+runtime modules. The package check now imports each viewer because hash parity
+alone missed a required input module omitted by the Todo build list.
+
+LSP diagnostics were unavailable because `typescript-language-server` is not
+installed. These results verify the source candidate, not an update of the
+owner's existing installation or already-running panes.
+
+## 2026-10-04 installed baseline
+
 Verified on Windows on 2026-10-04 with Node 24.12.0, Herdr 0.9.3, OmO 5.1.16 and stock Senpi 2026.10.7. The unified runtime supersedes earlier split-extension acceptance; earlier file hashes are historical evidence only.
 
 ## Source provenance

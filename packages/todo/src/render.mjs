@@ -20,11 +20,12 @@ import { t } from './i18n.mjs';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 // Terminal primitives: one-cell inset, semantic ANSI colors and bounded ask.
-const style = { accent: '36', completed: '32', abandoned: '90', pending: '90',
-  in_progress: '36', warning: '33', error: '31' };
-const layout = { taskInset: 3, askMaxRows: 3, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
+const style = { accent: '36', phase: '35', muted: '90', completed: '90', abandoned: '90', pending: '90',
+  in_progress: '35', warning: '33', error: '31' };
+const layout = { taskInset: 3, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
 const marks = { pending: '.', in_progress: '*', completed: 'x', abandoned: '-' };
-const paint = (text, token, enabled) => enabled && style[token] ? `\x1b[${style[token]}m${text}\x1b[0m` : text;
+const paint = (text, token, enabled, heading = false) => enabled && style[token] ?
+  `\x1b[${heading ? '1;' : token === 'completed' ? '9;' : ''}${style[token]}m${text}\x1b[0m` : text;
 export const clean = value => stripVTControlCharacters(String(value ?? ''))
   .replace(/\r\n?/g, '\n').replaceAll('\t', ' ')
   .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, '');
@@ -108,34 +109,38 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const phases = snapshot?.phases ?? [];
   const total = counts(phases.flatMap(phase => phase.tasks));
   const tally = count => `${count.closed}/${count.total}${columns >= 24 ? ` ${t(language, 'closed')}` : ''} ${t(language, 'completed')}:${count.completed} ${t(language, 'dropped')}:${count.dropped}`;
-  const head = `${t(language, 'todo')} | ${t(language, availability)}`;
+  const source = error && availability === 'current' ? 'error' : availability;
+  const head = `${t(language, 'todo')} | ${t(language, source)}`;
   const current = `${t(language, 'now')}: ${target ? clean(target.content) : t(language, 'idle')}`;
   const taskRanges = Object.create(null), phaseRanges = Object.create(null);
   const bodyLines = [];
-  if (error) bodyLines.push(...wrap(t(language, 'readError', { error: clean(error) }), columns));
   const phaseOccurrences = new Map();
   const closedPhases = phases.filter(isClosedPhase).length;
-  if (closedPhases) bodyLines.push(paint(fit(`${t(language, 'closedPhases', { count: closedPhases })} ${completedExpanded ? '[-]' : '[+]'}`, columns), 'completed', color));
+  const closedRange = closedPhases ? { start: 0, end: 1 } : null;
+  if (closedPhases) bodyLines.push(paint(fit(`${t(language, 'closedPhases', { count: closedPhases })} ${completedExpanded ? '[-]' : '[+]'}`, columns), 'muted', color));
   for (const [phaseIndex, phase] of phases.entries()) {
     const occurrence = phaseOccurrences.get(phase.name) ?? 0;
     phaseOccurrences.set(phase.name, occurrence + 1);
     const phaseKey = snapshot?.phaseSummaries?.[phaseIndex]?.key ?? JSON.stringify([phase.name, occurrence]);
+    if (bodyLines.length) bodyLines.push('');
     const start = bodyLines.length;
     const count = counts(phase.tasks);
-    const summary = `${count.closed}/${count.total} ${t(language, 'completed')}:${count.completed} ${t(language, 'dropped')}:${count.dropped}`;
+    const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}`;
     const nameRoom = columns - width(summary) - 1;
-    if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)} ${summary}`, 'accent', color));
-    else bodyLines.push(paint(fit(phase.name, columns), 'accent', color), ...wrap(summary, columns));
+    const phaseStyle = isClosedPhase(phase) ? 'muted' : 'phase';
+    if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)} ${summary}`, phaseStyle, color, true));
+    else bodyLines.push(paint(fit(phase.name, columns), phaseStyle, color, true), ...wrap(summary, columns));
     const taskOccurrences = new Map();
     for (const [taskIndex, task] of (isClosedPhase(phase) && !completedExpanded ? [] : phase.tasks).entries()) {
       const taskOccurrence = taskOccurrences.get(task.content) ?? 0;
       taskOccurrences.set(task.content, taskOccurrence + 1);
       const key = snapshot?.phaseSummaries?.[phaseIndex]?.taskKeys?.[taskIndex] ??
         JSON.stringify([phase.name, occurrence, task.content, taskOccurrence]);
+      if (taskIndex && (task.status === 'in_progress' || phase.tasks[taskIndex - 1].status === 'in_progress')) bodyLines.push('');
       const taskStart = bodyLines.length;
       const prefix = `${target?.key === key ? '>' : ' '}${marks[task.status]} `;
       for (const [index, line] of wrap(task.content, columns - layout.taskInset).entries()) {
-        bodyLines.push(paint(`${index === 0 ? prefix : ' '.repeat(layout.taskInset)}${line}`, task.status, color));
+        bodyLines.push(paint(`${index === 0 ? prefix : ' '.repeat(layout.taskInset)}${line}`, task.status, color, task.status === 'in_progress'));
       }
       taskRanges[key] = { start: taskStart, end: bodyLines.length, phaseStart: start, status: task.status };
     }
@@ -154,26 +159,30 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     const lines = fallback.slice(0, rows).map(line => fit(line, columns));
     while (lines.length < rows) lines.push('');
     return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges,
-      scroll, askScroll, bodyRows: 0, askRows: 0 };
+      scroll, askScroll, bodyStart: 0, bodyRows: 0, askRows: 0, closedRange };
   }
-  const top = [paint(fit(head, columns), ['last-known', 'disconnected'].includes(availability) ? 'warning' :
-    availability === 'error' ? 'error' : 'accent', color), fit(tally(total), columns), fit(current, columns)];
+  const top = [paint(fit(head, columns), ['last-known', 'disconnected'].includes(source) ? 'warning' :
+    source === 'error' ? 'error' : 'accent', color, true), paint(fit(tally(total), columns), 'muted', color)];
+  if (rows >= 12) top.push('');
+  top.push(paint(fit(current, columns), target ? 'in_progress' : 'pending', color, Boolean(target)));
   const askLines = wrap(snapshot?.ask?.text ?? t(language, 'noAsk'), columns);
-  const room = rows - top.length - 1;
-  const askBudget = Math.min(layout.askMaxRows + 1, Math.max(0, room - layout.minimumWorkRows));
+  const room = rows - top.length - 1 - Number(Boolean(error));
+  const askBudget = Math.min(layout.askMaxRows + 1,
+    Math.max(0, room - layout.minimumWorkRows - layout.sectionGap));
   const askRows = askBudget > 1 ? askBudget - 1 : askBudget;
   askScroll = clamp(askScroll, askLines.length - askRows);
   const ask = [];
   if (askBudget > 1) {
-    ask.push(paint(fit(`${t(language, 'ask')} ${askScroll + 1}-${Math.min(askScroll + askRows, askLines.length)}/${askLines.length} [a/z]`, columns), 'accent', color));
-    ask.push(...askLines.slice(askScroll, askScroll + askRows));
+    ask.push(paint(fit(`${t(language, 'ask')} ${askScroll + 1}-${Math.min(askScroll + askRows, askLines.length)}/${askLines.length}`, columns), 'muted', color));
+    ask.push(...askLines.slice(askScroll, askScroll + askRows).map(line => paint(line, 'muted', color)));
     while (ask.length < askBudget) ask.push('');
   } else if (askBudget === 1) {
     const label = `${t(language, 'ask')} ${askScroll + 1}/${askLines.length}: `;
     const narrowAsk = wrap(snapshot?.ask?.text ?? t(language, 'noAsk'), Math.max(1, columns - width(label)));
     askScroll = clamp(askScroll, narrowAsk.length - 1);
-    ask.push(fit(`${t(language, 'ask')} ${askScroll + 1}/${narrowAsk.length}: ${narrowAsk[askScroll]}`, columns));
+    ask.push(paint(fit(`${t(language, 'ask')} ${askScroll + 1}/${narrowAsk.length}: ${narrowAsk[askScroll]}`, columns), 'muted', color));
   }
+  if (room > layout.minimumWorkRows) ask.push('');
   const bodyRows = Math.max(0, room - ask.length);
   const active = taskRanges[target?.key];
   if (revealTarget && active && bodyRows > 0 &&
@@ -183,12 +192,14 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   scroll = clamp(scroll, bodyLines.length - bodyRows);
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
   while (visible.length < bodyRows) visible.push('');
-  const fullControls = `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controls')}`;
-  const footer = error ? t(language, 'readError', { error }) : columns < 40 ?
-    `f ${t(language, follow ? columns < 30 ? 'followShortOn' : 'followOn' : columns < 30 ? 'followShortOff' : 'followOff')} j/k c q` :
-    width(fullControls) >= columns ? `f ${t(language, follow ? 'followOn' : 'followOff')} | ${t(language, 'controlsNarrow')}` : fullControls;
-  const lines = [...top, ...ask, ...visible, paint(fit(footer, columns), error ? 'error' : 'accent', color)].slice(0, rows);
-  return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll, bodyRows, askRows };
+  const live = !error && ['current', 'empty'].includes(availability);
+  const footer = `${t(language, columns < 30 ? follow && live ? 'followShortOn' : 'followShortOff' :
+    follow && live ? 'followOn' : 'followOff')} | ${t(language, source)}`;
+  const lines = [...top, ...ask, ...visible,
+    ...(error ? [paint(fit(t(language, 'readError', { error: clean(error) }), columns), 'error', color)] : []),
+    paint(fit(footer, columns), live ? 'accent' : 'warning', color)].slice(0, rows);
+  return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll,
+    bodyStart: top.length + ask.length, bodyRows, askRows, closedRange };
 }
 
 export const render = (snapshot, options) => renderFrame(snapshot, options).text;
