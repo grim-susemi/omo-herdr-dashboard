@@ -82,6 +82,77 @@ test('a readable branch without native Todo publishes waiting without authorizin
   assert.deepEqual(f.widgets.get('todo-sidebar'), ['native pending content']);
 });
 
+test('waiting without a native Todo masks native worker and DAG lines but not todo-sidebar', () => {
+  const f = fixture();
+  f.setBranch([]);
+  f.bridge.observe({ type: 'tool_execution_end' }, f.ctx);
+  assert.equal(f.bridge.snapshot.availability, 'waiting');
+  const todo = ['native pending content'];
+  const workers = ['running worker line'];
+  const dag = ['dag line'];
+  f.ui.setWidget('todo-sidebar', todo);
+  f.ui.setWidget('omo-task', workers, { placement: 'belowEditor' });
+  f.ui.setWidget('omo-dag', dag, { placement: 'belowEditor' });
+  for (const role of ['todo', 'workers', 'dag']) f.ready.add(role);
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['omo-task', 'omo-dag']);
+  assert.equal(f.widgets.has('omo-task'), false);
+  assert.equal(f.widgets.has('omo-dag'), false);
+  assert.equal(f.widgets.get('todo-sidebar'), todo);
+  f.bridge.remove();
+});
+
+test('a read exception masks no key, including worker and DAG lines already masked', () => {
+  const f = fixture();
+  f.setBranch([]);
+  f.bridge.observe({ type: 'tool_execution_end' }, f.ctx);
+  const workers = ['running worker line'];
+  const dag = ['dag line'];
+  f.ui.setWidget('omo-task', workers, { placement: 'belowEditor' });
+  f.ui.setWidget('omo-dag', dag, { placement: 'belowEditor' });
+  f.ready.add('workers');
+  f.ready.add('dag');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['omo-task', 'omo-dag']);
+  f.setFailRead(true);
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, []);
+  assert.equal(f.widgets.get('omo-task'), workers);
+  assert.equal(f.widgets.get('omo-dag'), dag);
+  // Still failing: a new native publication and a readiness signal hide nothing.
+  f.ui.setWidget('omo-task', workers);
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, []);
+  assert.equal(f.widgets.get('omo-task'), workers);
+  f.bridge.remove();
+});
+
+test('readiness lost restores worker and DAG lines without a native Todo; regained masks again', () => {
+  const f = fixture();
+  f.setBranch([]);
+  f.bridge.observe({ type: 'tool_execution_end' }, f.ctx);
+  const workers = ['running worker line'];
+  const dag = ['dag line'];
+  f.ui.setWidget('omo-task', workers, { placement: 'belowEditor' });
+  f.ui.setWidget('omo-dag', dag, { placement: 'belowEditor' });
+  f.ready.add('workers');
+  f.ready.add('dag');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['omo-task', 'omo-dag']);
+  f.ready.clear();
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, []);
+  assert.equal(f.widgets.get('omo-task'), workers);
+  assert.equal(f.widgets.get('omo-dag'), dag);
+  assert.equal(f.calls.at(-2).settings.placement, 'belowEditor');
+  f.ready.add('workers');
+  f.ready.add('dag');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['omo-task', 'omo-dag']);
+  assert.equal(f.widgets.has('omo-task'), false);
+  f.bridge.remove();
+});
+
 test('initial recovery is prepared, labelled and same-key; own calls never capture', () => {
   const f = fixture();
   assert.equal(f.bridge.captured('todo-sidebar'), undefined);

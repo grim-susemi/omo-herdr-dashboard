@@ -306,3 +306,74 @@ test('product display bridge with actual builtin-first native tool/manual/lifecy
     console.log('DISPLAY_BRIDGE_RESULT_END');
   }
 });
+
+test('host replay: worker and DAG lines are masked without a native Todo, restored when readiness is lost', async () => {
+  const senpiRoot = process.env.OMO_HERDR_SENPI_ROOT;
+  const parentRoot = process.env.OMO_HERDR_FIXTURE_ROOT;
+  assert.ok(senpiRoot && parentRoot, 'run through the explicit test:host command');
+  const fixtureRoot = join(parentRoot, 'display-task3');
+  const cwd = join(fixtureRoot, 'cwd');
+  const agentDir = join(fixtureRoot, 'agent');
+  const tmp = join(fixtureRoot, 'tmp');
+  for (const path of [cwd, agentDir, tmp]) mkdirSync(path, { recursive: true });
+  const ready = new Set();
+  let sequence = 0;
+  let host;
+  const fixture = {
+    environment: { HERDR_SOCKET_PATH: 'native-host-fixture-socket', HERDR_PANE_ID: 'native-host-fixture-parent' },
+    advance(ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      this.owner = { socketPath: this.environment.HERDR_SOCKET_PATH, parentPaneId: this.environment.HERDR_PANE_ID,
+        sessionId, scopeEpoch: (this.owner?.scopeEpoch ?? 0) + 1 };
+      this.owner.ownerKey = displayOwnerKey(this.owner.socketPath, this.owner.parentPaneId, sessionId);
+    },
+    adapter: {
+      getOwner: () => fixture.owner,
+      publish: () => ({ ...fixture.owner, sequence: ++sequence }),
+      isReady: binding => ready.has(binding.role),
+      hasDagOwnedTasks: () => false,
+    },
+  };
+  globalThis[DISPLAY_HOST_KEY] = fixture;
+  try {
+    host = await createNativeHost({ senpiRoot, cwd, agentDir, home: fixtureRoot, tmp,
+      extensionPaths: [join(dirname(fileURLToPath(import.meta.url)), 'display-bridge-fixture.mjs')] });
+    fixture.host = host;
+    // No todo tool call: the branch has no native Todo.
+    await host.emitSessionStart();
+    const ui = host.runner.getUIContext();
+    const below = () => host.surface.surface.extensionWidgetsBelow;
+    assert.equal(fixture.bridge.snapshot.availability, 'waiting');
+    assert.equal(host.surface.nativeWidget(), undefined);
+
+    // The exact call shape the OmO plugin uses for its worker line.
+    const lines = ['running worker line'];
+    ui.setWidget('omo-task', lines, { placement: 'belowEditor' });
+    assert.equal(below().has('omo-task'), true, 'visible until readiness is proven');
+    assert.deepEqual(fixture.bridge.status.masked, []);
+
+    ready.add('workers');
+    fixture.bridge.readinessChanged();
+    assert.deepEqual(fixture.bridge.status.masked, ['omo-task']);
+    assert.equal(below().has('omo-task'), false);
+
+    ready.clear();
+    fixture.bridge.readinessChanged();
+    assert.deepEqual(fixture.bridge.status.masked, []);
+    assert.equal(host.surface.nativeCalls.at(-1).content, lines);
+    assert.equal(host.surface.nativeCalls.at(-1).options.placement, 'belowEditor');
+    assert.deepEqual(below().get('omo-task').render(80).map(row => row.trim()).filter(Boolean), lines);
+
+    ready.add('workers');
+    fixture.bridge.readinessChanged();
+    assert.deepEqual(fixture.bridge.status.masked, ['omo-task']);
+    assert.equal(below().has('omo-task'), false);
+    assert.deepEqual(host.errors, []);
+  } finally {
+    fixture.bridge?.remove();
+    fixture.unbind?.();
+    host?.close();
+    delete globalThis[DISPLAY_HOST_KEY];
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});

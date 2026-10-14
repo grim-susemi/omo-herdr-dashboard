@@ -46,6 +46,9 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
   let pending = null;
   let revision = 0;
   let readFailed = false;
+  // True only when the source read threw: unlike a readable but empty
+  // ('waiting') branch, it must block every mask.
+  let readThrew = false;
   const captures = new Map();
   const masks = new Set();
   const failures = [];
@@ -86,7 +89,9 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
 
   function covered(key) {
     const role = roles.get(key);
-    if (!receipt || readFailed || suspended || blockedEpoch !== null || !current()) return false;
+    if (!receipt || readThrew || suspended || blockedEpoch !== null || !current()) return false;
+    // A readable branch without a native Todo has nothing to replace in the sidebar.
+    if (key === 'todo-sidebar' && readFailed) return false;
     const setting = adapter.settings?.[role] ?? 'auto';
     if (setting !== 'auto') return false;
     try {
@@ -134,13 +139,15 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       };
       snapshot = value;
       readFailed = value.availability === 'waiting';
+      readThrew = false;
       recovery = readFailed ? null : inlineRecoveryFactory(value);
       // A fresh readable branch has no native Todo yet. Publish that waiting
-      // state so its viewer can start; readFailed still prevents native masks.
+      // state so its viewer can start; readFailed still prevents the Todo mask.
       return true;
     } catch (error) {
       fail('read', error);
       readFailed = true;
+      readThrew = true;
       recovery = snapshot ? inlineRecoveryFactory(snapshot, 'last-known; source read failed') : null;
       return false;
     }
