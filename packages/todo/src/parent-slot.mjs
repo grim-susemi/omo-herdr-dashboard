@@ -2,6 +2,7 @@ import * as filesystem from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const parentSlotSchema = 'omo-herdr-dashboard/parent-slot/2';
 const actors = globalThis[Symbol.for(parentSlotSchema)] ??= new Map();
@@ -221,7 +222,7 @@ export async function claimParentSlot(options) {
 
 class ParentSlot {
   constructor({ paths, db, fs, options, actorKey, previous }) {
-    Object.assign(this, { paths, db, fs, observe: options.observe, actorKey });
+    Object.assign(this, { paths, db, fs, observe: options.observe, delay: options.delay ?? delay, actorKey });
     this.tail = Promise.resolve();
     this.epoch = 0;
     this.draining = false;
@@ -317,7 +318,16 @@ class ParentSlot {
       await file.writeFile(JSON.stringify(next));
       await file.sync();
       await file.close(); file = null;
-      await this.fs.rename(temporary, this.paths.slotPath);
+      // Windows denies replacing slot.json while any reader holds it open and
+      // allows it once the reader closes. Retry only those codes, briefly and
+      // bounded (as dag storage writeJson); anything else fails closed below.
+      for (let attempt = 0; ; attempt++) {
+        try { await this.fs.rename(temporary, this.paths.slotPath); break; }
+        catch (error) {
+          if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt === 5) throw error;
+          await this.delay(10 * 2 ** attempt);
+        }
+      }
       // Flush the rename's directory entry on filesystem-socket platforms.
       if (process.platform !== 'win32') {
         const directory = await this.fs.open(dirname(this.paths.slotPath), 'r');

@@ -88,7 +88,9 @@ for (const [failure, state] of Object.entries(unavailable))
       const write = await f.todo.managedWrite(async () => {}).then(() => null, error => error);
       for (let update = 0; update < 3; update++) await assert.rejects(f.todo.schedule(), recoveryAwaits);
       assert.equal(f.notices.length, 1);
-      assert.match(f.notices[0], recoveryAwaits);
+      // Blocked with nothing to reconcile: /dashboard cannot rebuild it, so the latch names the restart action.
+      if (failure === 'blocked') assert.ok(f.notices[0].startsWith('BLOCKED: ') && f.notices[0].includes('restart'));
+      else assert.match(f.notices[0], recoveryAwaits);
       assert.equal(f.todo.recoveryBlocked, true);
       assert.equal(f.todo.status, 'BLOCKED');
       assert.deepEqual(f.retries, []);

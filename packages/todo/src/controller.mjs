@@ -334,6 +334,9 @@ async function nativeShellProcesses(pid) {
   { timeout: 5000, maxBuffer: 65536 });
   return JSON.parse(stdout);
 }
+// An explicit /dashboard only reconciles unresolved operations; it cannot
+// rebuild a blocked actor. Restarting the OmO window releases and re-claims it.
+const managedUnavailable = 'managed controller or lease unavailable; restart this OmO window, then run /dashboard in this tab if the dashboard does not return';
 const blocked = (cause, code) => Object.assign(new Error(`BLOCKED: ${cause?.message ?? cause}`), { inlineFallback: true, cause },
   code ? { code } : {});
 const nativeIdentity = row => {
@@ -968,7 +971,7 @@ export class TodoPane {
     if (this.stopped || this.managedBlocked || this.custodyLost || !this.actor?.leaseHeld || this.actor.draining || this.actor.blocked) {
       this.status = 'BLOCKED';
       this.bridge?.readinessChanged();
-      throw blocked('managed controller or lease unavailable', 'MANAGED_UNAVAILABLE');
+      throw blocked(managedUnavailable, 'MANAGED_UNAVAILABLE');
     }
   }
   managedWrite(job) {
@@ -1425,9 +1428,15 @@ export class TodoPane {
   // latch shows one warning: restating its unavailability adds nothing.
   warnOnce(error) {
     const restates = ['MANAGED_UNAVAILABLE', 'RECOVERY_BLOCKED'].includes(error?.code);
-    if (this.stopped || this.warned.has(error?.message) || restates && [...this.warned.values()].includes(true)) return;
-    this.warned.set(error?.message, this.recoveryBlocked === true);
-    this.notify(error?.message);
+    // While the actor is blocked with nothing left to reconcile, /dashboard
+    // cannot rebuild it: the latch's one warning, whether the blocking error or
+    // the first 'recovery awaits', names the restart action instead.
+    const message = error?.code !== 'MANAGED_UNAVAILABLE' && this.actor?.blocked &&
+      this.actor.snapshot.operations.every(operation => operation.status === 'SETTLED')
+      ? `BLOCKED: ${managedUnavailable}` : error?.message;
+    if (this.stopped || this.warned.has(message) || restates && [...this.warned.values()].includes(true)) return;
+    this.warned.set(message, this.recoveryBlocked === true);
+    this.notify(message);
   }
   enqueue(job) {
     const lifetime = this.lifetimeId;
