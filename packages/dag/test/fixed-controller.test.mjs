@@ -150,13 +150,24 @@ test('inactive selected tab defers before any split or swap', async t => {
   await control('close', state, 6001); await closed;
   f.panes.set('foreign:selected', { pane_id: 'foreign:selected', tab_id: 'foreign:tab' }); f.focused = 'foreign:selected';
   const count = f.calls.filter(args => ['split', 'swap', 'focus'].includes(args[0])).length;
-  await assert.rejects(f.controller.openPair({ force: true }), /selected owned tab/);
+  await assert.rejects(f.controller.openPair({ force: true }),
+    error => /^layout-waiting: /.test(error.message) && error.message.includes('/dashboard'));
   assert.equal(f.calls.filter(args => ['split', 'swap', 'focus'].includes(args[0])).length, count);
   assert.equal(f.focused, 'foreign:selected');
   f.focused = 'qa:parent'; await f.controller.openPair({ force: true });
   assert.equal(f.focused, 'qa:parent');
 });
 
+test('managed dashboard without a coordinator stays BLOCKED with the unchanged parsed prefixes', async t => {
+  const f = await setup(t);
+  f.controller.managedAvailable = true; f.controller.coordinator = null;
+  for (const call of [() => f.controller.open(), () => f.controller.openPair(),
+    () => f.controller.mutate('dag', 'arrange', 'qa:parent', ['focus', '--pane', 'qa:parent'])])
+    await assert.rejects(call(), error => error.message.startsWith('BLOCKED: ') && error.inlineFallback === true);
+  assert.equal(f.controller.status, 'BLOCKED');
+  assert.ok(f.warnings.length >= 2);
+  for (const warning of f.warnings) assert.ok(warning.startsWith('DAG pane: BLOCKED: '));
+});
 test('initial source save precedes launches; concurrent opens create exactly one fixed pair', async t => {
   const f = await setup(t);
   await f.controller.start();

@@ -624,7 +624,7 @@ export class FixedDagPane extends DagPane {
   }
   async mutate(role, type, paneId, args, effect) {
     if (!this.managedAvailable) return this.herdr(...args);
-    if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable'); }
+    if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
     const record = await readJson(this.paneFile(role));
     const target = record?.paneId === paneId ? await this.nativeTarget(record) : await this.coordinator.target(paneId);
     return this.coordinator.mutate(role, type, target, args, effect);
@@ -744,7 +744,7 @@ export class FixedDagPane extends DagPane {
     return this.enqueue(async () => {
       if (this.stopped) return {};
       if (this.managedAvailable) {
-        if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable'); }
+        if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
         try { this.coordinator.assertCurrent(); }
         catch (error) { this.status = 'BLOCKED'; throw blocked(error); }
         await this.coordinator.join(this.lifetimeId);
@@ -1184,7 +1184,7 @@ export class FixedDagPane extends DagPane {
     const layout = (await this.herdr('layout', '--pane', anchor))?.layout;
     if (selected.length !== 1 || selected[0].tab_id !== tabId || layout?.tab_id !== tabId ||
       selected[0].pane_id !== layout.focused_pane_id)
-      throw new Error('layout-waiting: placement requires the selected owned tab');
+      throw new Error('layout-waiting: placement requires the selected owned tab; select this tab and run /dashboard');
     const id = selected[0].pane_id;
     await this.membership(id);
     await this.verifyInputPane(id, anchor, tabId);
@@ -1230,7 +1230,7 @@ export class FixedDagPane extends DagPane {
   }
   open() {
     if (this.managedAvailable && !this.coordinator?.actor) return this.enqueue(() => {
-      this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable');
+      this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window');
     });
     return this.coordinator ? this.coordinator.schedule({ forceRoles: ['dag', 'workers', 'todo'] }) : this.openPair({ force: true });
   }

@@ -1522,7 +1522,7 @@ export class TodoPane {
             entry.record.paneId === previous.roles.todo?.paneId &&
             entry.record.statePath === previous.roles.todo?.statePath &&
             entry.record.launchToken === previous.roles.todo?.launchToken && !entry.record.manualClose);
-          if (!custodian) throw blocked('surviving original producer custody unavailable');
+          if (!custodian) throw blocked('surviving original producer custody unavailable; restart this OmO window');
           capture = await captureCustodiedProducer({ stateDir: this.stateDir, recordPath: custodian.path,
             parent: observation.parent, herdr: this.herdr, slotPath: paths.slotPath, previous });
           this.legacyObservations.set(capture.recordPath, capture);

@@ -185,6 +185,23 @@ test('foreign and ambiguous anchors cannot create, close or resize panes', async
   assert.equal(f.calls.filter(call => ['split', 'close', 'resize'].includes(call[0])).length, 0);
 });
 
+test('enqueue tail keeps a placement wait layout-waiting and an inline-fallback block BLOCKED', async t => {
+  const f = await fixture(t);
+  const notices = []; f.controller.notify = message => notices.push(message);
+  const wait = 'layout-waiting: synthetic placement wait';
+  await assert.rejects(f.controller.enqueue(async () => { throw new Error(wait); }), /^Error: layout-waiting: /);
+  await f.controller.tail;
+  assert.equal(f.controller.status, 'layout-waiting');
+  assert.equal(notices.length, 1);
+  assert.ok(notices[0].startsWith('layout-waiting: '));
+  const block = Object.assign(new Error('BLOCKED: synthetic'),
+    { inlineFallback: true });
+  await assert.rejects(f.controller.enqueue(async () => { throw block; }), /^Error: BLOCKED: /);
+  await f.controller.tail;
+  assert.equal(f.controller.status, 'BLOCKED');
+  assert.equal(notices.length, 2);
+});
+
 test('process adoption requires exact PID, state, token and unambiguous argv', () => {
   const record = { paneId: 'qa:pane', statePath: '/synthetic/state.json', viewerPath: '/synthetic/viewer.mjs',
     nodePath: 'node', launchToken: 'launch', processId: 123 };
