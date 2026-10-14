@@ -5,11 +5,20 @@
 // Model: one tab whose panes are the leaves of a binary split tree. Each split
 // has a direction ('right' = side by side, 'down' = stacked) and the share of
 // its first child. Child rectangles are rounded exactly like the resize
-// verification at packages/todo/src/controller.mjs:1213-1218. A new split keeps
-// the source pane as the first child and gives it `--ratio` (assumption until
-// the isolated Herdr measurement says otherwise; see `splitRatioOwner`).
-// `resize --amount` is a fraction of the tab area along the moved axis, as
-// arrangeDashboard issues it.
+// verification at packages/todo/src/controller.mjs:1213-1218. Calibrated to the
+// isolated Herdr 0.9.3 measurement (todo 1, task-1-tree.md section 1):
+// - a new split keeps the source pane as the first child with `--ratio` (S1);
+// - ratios are stored as float32 and clamped to [0.1, 0.9]; the 0.1 floor is
+//   measured for split and resize, the 0.9 ceiling is assumed by symmetry;
+// - `resize --amount` changes the moved split's ratio by `amount`, a fraction of
+//   that split's own rect, not of the tab area (S3); one call moves at most 0.5
+//   (inferred from one measured +0.99 resize, 0.1 -> 0.6; not verified further);
+// - left/up moves the pane's left/top divider if it has one, else its
+//   right/bottom one; right/down the reverse (S4);
+// - close gives the sibling subtree the whole parent rect (S7);
+// - swap selects the source pane (S8);
+// - Herdr has no pane-size floor (S6): panes may be 0 cells; `minSize` adds one
+//   for tests that want it.
 //
 // Errors carry `code`: 'pane_not_found' for an unknown pane (the shape the
 // controllers treat as authoritative absence), 'invalid_argument' for malformed
@@ -28,7 +37,7 @@ export function childRects(rect, direction, ratio) {
 }
 
 export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, height: 40 }, focused,
-  tabId = 'tab', workspaceId = 'workspace', idPrefix = 'created', minSize = 1, shellPid = 100,
+  tabId = 'tab', workspaceId = 'workspace', idPrefix = 'created', minSize = 0, shellPid = 100,
   splitRatioOwner = 'source' } = {}) {
   let splitSerial = 0, paneSerial = 0;
   const build = spec => typeof spec === 'string' ? { pane: spec } : { id: `split-${++splitSerial}`,
@@ -88,6 +97,7 @@ export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, he
       throw invalid(`${name} must be a number between 0 and 1`);
     return number;
   };
+  const store = ratio => Math.fround(Math.min(0.9, Math.max(0.1, Math.fround(ratio))));
   const layout = () => {
     const { panes, splits } = walk();
     return { tab_id: tabId, workspace_id: workspaceId, focused_pane_id: focus, zoomed: false,
@@ -124,7 +134,7 @@ export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, he
       return commit(() => {
         const pane_id = `${idPrefix}-${++paneSerial}`;
         replace(node, { id: `split-${++splitSerial}`, direction,
-          ratio: splitRatioOwner === 'source' ? ratio : 1 - ratio, first: { pane: node.pane }, second: { pane: pane_id } });
+          ratio: store(splitRatioOwner === 'source' ? ratio : 1 - ratio), first: { pane: node.pane }, second: { pane: pane_id } });
         if (!args.includes('--no-focus')) focus = pane_id;
         return { pane: { pane_id, tab_id: tabId } };
       });
@@ -161,7 +171,7 @@ export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, he
       const divider = split => {
         const info = splits.find(value => value.id === split.id);
         const [first] = childRects(info.rect, split.direction, split.ratio);
-        return { split, rect: info.rect, first, edge: first[coordinate] + first[axis] };
+        return { split, edge: first[coordinate] + first[axis] };
       };
       // Same preference as the controller's resize verification: forward moves
       // take the divider on the far edge, backward moves the near edge.
@@ -169,8 +179,8 @@ export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, he
       const at = edge => ancestors.map(divider).find(value => value.edge === edge);
       const chosen = forward ? at(farEdge) ?? at(nearEdge) : at(nearEdge) ?? at(farEdge);
       if (!chosen) throw invalid(`no ${direction} divider to resize`);
-      const ratio = (chosen.first[axis] + (forward ? 1 : -1) * amount * area[axis]) / chosen.rect[axis];
-      if (!(ratio > 0 && ratio < 1)) throw invalid('resize would collapse a pane');
+      const step = Math.fround(Math.min(amount, 0.5));
+      const ratio = store(Math.fround(chosen.split.ratio) + (forward ? step : -step));
       return commit(() => { chosen.split.ratio = ratio; return {}; });
     },
     focus: args => {

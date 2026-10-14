@@ -63,7 +63,7 @@ test('split rounds the first child exactly like the controller resize verificati
   assertConsistent(layout);
 });
 
-test('resize moves the nearest divider by the area fraction and rounds like the controller', async () => {
+test('resize moves the nearest divider by a fraction of its split rect and rounds like the controller', async () => {
   const fake = createSplitTreeHerdr({ tree: { direction: 'right', ratio: 0.5, first: 'parent', second: 'todo' },
     area: { x: 0, y: 0, width: 172, height: 46 } });
   const parent = rectOf(fake.layout(), 'parent');
@@ -78,24 +78,26 @@ test('resize moves the nearest divider by the area fraction and rounds like the 
   assert.equal(after.focused_pane_id, before.focused_pane_id);
   assert.equal(after.splits[0].id, before.splits[0].id);
   assertConsistent(after);
-  // 0.3 of 101 = 30.3 cells; the ratio is rounded through Math.fround and Math.round.
+  // The ratio moves 0.5 -> 0.2 (S3); 0.2 of 101 = 20.2 cells, rounded through Math.fround and Math.round.
   const odd = createSplitTreeHerdr({ tree: { direction: 'down', ratio: 0.5, first: 'a', second: 'b' },
     area: { x: 0, y: 0, width: 10, height: 101 } });
   assert.equal(rectOf(odd.layout(), 'a').height, 51);
   await odd.herdr('resize', '--pane', 'b', '--direction', 'up', '--amount', '0.3');
-  assert.deepEqual(rectOf(odd.layout(), 'a'), { x: 0, y: 0, width: 10, height: 21 });
-  assert.deepEqual(rectOf(odd.layout(), 'b'), { x: 0, y: 21, width: 10, height: 80 });
+  assert.deepEqual(rectOf(odd.layout(), 'a'), { x: 0, y: 0, width: 10, height: 20 });
+  assert.deepEqual(rectOf(odd.layout(), 'b'), { x: 0, y: 20, width: 10, height: 81 });
   assertConsistent(odd.layout());
 });
 
 test('resize selects the divider on the far edge for forward and the near edge for backward moves', async () => {
   const fake = createSplitTreeHerdr({ tree: { direction: 'right', ratio: 0.25, first: 'a',
     second: { direction: 'right', ratio: 0.5, first: 'b', second: 'c' } }, area: { x: 0, y: 0, width: 100, height: 10 } });
+  // Far edge: the inner split (75 wide) moves 0.5 -> 0.6 of its own width.
   await fake.herdr('resize', '--pane', 'b', '--direction', 'right', '--amount', '0.1');
-  assert.deepEqual(fake.layout().panes.map(pane => pane.rect.width), [25, 48, 27]);
+  assert.deepEqual(fake.layout().panes.map(pane => pane.rect.width), [25, 45, 30]);
   await fake.herdr('resize', '--pane', 'b', '--direction', 'left', '--amount', '0.05');
-  // The inner split keeps its ratio, so its children rescale with the narrower subtree.
-  assert.deepEqual(fake.layout().panes.map(pane => pane.rect.width), [20, 51, 29]);
+  // Near edge: the root moves 0.25 -> 0.2; the inner split keeps 0.6 and rescales to 80 wide.
+  assert.deepEqual(fake.layout().panes.map(pane => pane.rect.width), [20, 48, 32]);
+  assert.deepEqual(fake.layout().splits.map(split => split.ratio), [Math.fround(0.2), Math.fround(0.6)]);
   assertConsistent(fake.layout());
 });
 
@@ -159,7 +161,6 @@ for (const [name, args] of [
   ['resize direction', ['resize', '--pane', 'parent', '--direction', 'sideways', '--amount', '0.1']],
   ['resize amount 0', ['resize', '--pane', 'parent', '--direction', 'left', '--amount', '0']],
   ['resize amount negative', ['resize', '--pane', 'parent', '--direction', 'left', '--amount', '-0.1']],
-  ['resize collapsing a pane', ['resize', '--pane', 'parent', '--direction', 'left', '--amount', '0.6']],
   ['resize without divider', ['resize', '--pane', 'parent', '--direction', 'up', '--amount', '0.1']],
   ['swap with itself', ['swap', '--source-pane', 'todo', '--target-pane', 'todo']],
   ['unknown verb', ['teleport', 'todo']],
@@ -171,6 +172,17 @@ for (const [name, args] of [
   assert.notEqual(error.code, 'pane_not_found');
   assert.equal(authoritativePaneNotFound(error), false);
   assert.equal(JSON.stringify(fake.layout()), before);
+});
+
+test('resize clamps the ratio at 0.1 instead of collapsing a pane and moves at most 0.5 per call', async () => {
+  const fake = createSplitTreeHerdr({ tree: stacked });
+  await fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', '0.6');
+  assert.equal(fake.layout().splits[0].ratio, Math.fround(0.1));
+  assert.equal(rectOf(fake.layout(), 'parent').width, 10);
+  // Measured: +0.99 from 0.1 lands at 0.6.
+  await fake.herdr('resize', '--pane', 'parent', '--direction', 'right', '--amount', '0.99');
+  assert.equal(fake.layout().splits[0].ratio, Math.fround(0.6));
+  assertConsistent(fake.layout());
 });
 
 test('closing the last pane is refused', async () => {
