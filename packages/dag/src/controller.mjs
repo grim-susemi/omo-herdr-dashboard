@@ -34,6 +34,39 @@ export function isColumnDashboard(layout, ids) {
     dag.y === area.y && dag.height === area.height && dag.x + dag.width === area.x + area.width;
 }
 
+// Single place for the band layout ratios and floors (measured in layout-c task 1).
+// chatShare applies only to fresh managed band creation, never to an existing dashboard.
+// readableWorkersColumns is reporting-only and never a refusal reason.
+export const BAND_LAYOUT = Object.freeze({
+  chatShare: 0.5,
+  todoHeight: 0.35,
+  workersWidth: 0.4,
+  minWorkersColumns: 24,
+  readableWorkersColumns: 40,
+  minTodoRows: 8,
+  minLowerRows: 12,
+  tolerance: 0,
+});
+
+// Band shape: parent on the left; Todo spans the rest of the width on top; workers (left) and DAG
+// (right) share the row below it. Shape only, ratios are ignored.
+export function isBandDashboard(layout, ids) {
+  if (!layout?.area || !Array.isArray(layout.panes) || layout.panes.length !== 4 || !ids || new Set(Object.values(ids)).size !== 4) return false;
+  const rects = Object.fromEntries(Object.entries(ids).map(([role, id]) => {
+    const matches = layout.panes.filter(pane => pane?.pane_id === id);
+    return [role, matches.length === 1 ? matches[0].rect : null];
+  }));
+  const { parent, todo, workers, dag } = rects, area = layout.area;
+  if (![parent, todo, workers, dag, area].every(rect => rect &&
+    ['x', 'y', 'width', 'height'].every(key => Number.isFinite(rect[key])) && rect.width > 0 && rect.height > 0)) return false;
+  return parent.x === area.x && parent.y === area.y && parent.height === area.height &&
+    todo.x === parent.x + parent.width && todo.y === area.y && todo.x + todo.width === area.x + area.width &&
+    todo.width === workers.width + dag.width &&
+    workers.x === todo.x && workers.y === todo.y + todo.height &&
+    dag.x === workers.x + workers.width && dag.y === workers.y && dag.height === workers.height &&
+    todo.height + workers.height === area.height;
+}
+
 export function dagTitle(sessionId) {
   return `DAG · ${sessionId.slice(0, 8)}`;
 }
