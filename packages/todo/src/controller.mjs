@@ -334,7 +334,8 @@ async function nativeShellProcesses(pid) {
   { timeout: 5000, maxBuffer: 65536 });
   return JSON.parse(stdout);
 }
-const blocked = cause => Object.assign(new Error(`BLOCKED: ${cause?.message ?? cause}`), { inlineFallback: true, cause });
+const blocked = (cause, code) => Object.assign(new Error(`BLOCKED: ${cause?.message ?? cause}`), { inlineFallback: true, cause },
+  code ? { code } : {});
 const nativeIdentity = row => {
   if (!Number.isSafeInteger(row?.ProcessId) || !row.Birth || !row.ExecutablePath || !row.CommandLine) throw blocked('native identity unavailable');
   return { pid: row.ProcessId, birth: row.Birth, executable: row.ExecutablePath,
@@ -958,6 +959,8 @@ export class TodoPane {
     this.legacyObservations = retirementObservations;
     this.retirementSubscribers = new Map();
     this.custodyLost = false;
+    this.warned = new Map();
+    this.unavailableDiagnosed = false;
     this.retainedTargets = new Map();
     this.closureVersions = new Map();
   }
@@ -965,23 +968,31 @@ export class TodoPane {
     if (this.stopped || this.managedBlocked || this.custodyLost || !this.actor?.leaseHeld || this.actor.draining || this.actor.blocked) {
       this.status = 'BLOCKED';
       this.bridge?.readinessChanged();
-      throw blocked('managed controller or lease unavailable');
+      throw blocked('managed controller or lease unavailable', 'MANAGED_UNAVAILABLE');
     }
   }
   managedWrite(job) {
     const actor = this.actor, lifetime = this.lifetimeId;
     const result = this.managedTail.then(async () => {
       this.assertManaged();
+      this.unavailableDiagnosed = false;
       if (actor !== this.actor || lifetime !== this.lifetimeId) throw blocked('stale publisher');
       return job(actor);
     }).catch(error => {
+      // Only real unavailability latches recovery. A rejected stale ACK wrote
+      // nothing, and a healthy actor's write error belongs to its caller.
+      const unavailable = error?.code === 'MANAGED_UNAVAILABLE' || !actor?.leaseHeld || actor.blocked || actor.draining;
       if (this.actor === actor) {
-        this.status = 'BLOCKED';
-        this.recoveryBlocked = true;
+        if (unavailable && error?.code !== 'ACK_MISMATCH') {
+          this.status = 'BLOCKED';
+          this.recoveryBlocked = true;
+          void this.watchRecoveryMembership().catch(() => {});
+        }
         this.bridge?.readinessChanged();
-        void this.watchRecoveryMembership().catch(() => {});
       }
-      void actor?.diagnose('controller-write', error);
+      // One unavailable actor, one line: writes queued behind it add nothing.
+      if (!unavailable || !this.unavailableDiagnosed) void actor?.diagnose('controller-write', error);
+      if (unavailable) this.unavailableDiagnosed = true;
       throw error;
     });
     this.managedTail = result.catch(() => {});
@@ -1408,7 +1419,15 @@ export class TodoPane {
           await writeJson(this.stateFile, this.roleState(record));
       });
       this.bridge?.readinessChanged();
-    }).catch(error => { if (!this.stopped) this.notify(error.message); });
+    }).catch(error => { if (error?.code !== 'ACK_MISMATCH') this.warnOnce(error); });
+  }
+  // Each distinct warning is shown once until a scheduled pass succeeds. A
+  // latch shows one warning: restating its unavailability adds nothing.
+  warnOnce(error) {
+    const restates = ['MANAGED_UNAVAILABLE', 'RECOVERY_BLOCKED'].includes(error?.code);
+    if (this.stopped || this.warned.has(error?.message) || restates && [...this.warned.values()].includes(true)) return;
+    this.warned.set(error?.message, this.recoveryBlocked === true);
+    this.notify(error?.message);
   }
   enqueue(job) {
     const lifetime = this.lifetimeId;
@@ -1416,13 +1435,13 @@ export class TodoPane {
       if (this.stopped || lifetime !== this.lifetimeId) return;
       return job();
     });
-    this.tail = result.catch(error => { if (!this.stopped) {
-      this.status = this.managed || error.inlineFallback ? 'BLOCKED' : 'layout-waiting'; this.notify(error.message);
-      if (this.managed) {
-        this.recoveryBlocked = true;
-        this.bridge?.readinessChanged();
-        void this.watchRecoveryMembership().catch(() => {});
-      }
+    this.tail = result.then(() => { if (!this.recoveryBlocked) this.warned.clear(); }, error => { if (!this.stopped) {
+      this.status = this.managed || error.inlineFallback ? 'BLOCKED' : 'layout-waiting';
+      if (!this.managed) { this.notify(error.message); return; }
+      this.recoveryBlocked = true;
+      this.warnOnce(error);
+      this.bridge?.readinessChanged();
+      void this.watchRecoveryMembership().catch(() => {});
     } });
     return result;
   }
@@ -2049,8 +2068,17 @@ export class TodoPane {
       const forceCurrent = role => forceRoles.includes(role) &&
         (closureVersions.get(role) ?? 0) === (this.closureVersions.get(role) ?? 0);
       if (this.managed) {
-        if (this.recoveryBlocked && !forceRoles.length && !this.recoveryChanged)
-          throw blocked('recovery awaits relevant membership/control change or explicit dashboard');
+        if (forceRoles.length) this.warned.clear(); // An explicit /dashboard always gets its answer.
+        if (this.recoveryBlocked && !forceRoles.length && !this.recoveryChanged) {
+          const actor = this.actor, slot = actor?.snapshot;
+          // A latch only waits on a really unavailable actor. On a healthy READY
+          // actor it is stale: clear it and take the retry path once instead.
+          if (!actor?.leaseHeld || actor.blocked || actor.draining || this.custodyLost || this.managedBlocked ||
+            slot.phase !== 'READY' || slot.operations.some(op => op.status !== 'SETTLED'))
+            throw blocked('recovery awaits relevant membership/control change or explicit dashboard', 'RECOVERY_BLOCKED');
+          this.recoveryBlocked = false;
+          this.recoveryChanged = true;
+        }
         const retry = forceRoles.length || this.recoveryChanged;
         this.recoveryRetry = Boolean(retry);
         this.recoveryChanged = false;

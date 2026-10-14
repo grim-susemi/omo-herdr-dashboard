@@ -38,7 +38,10 @@ const diagnosticBranches = new Set(['claim', 'publish', 'validate-target', 'disp
   'release', 'controller-write', 'legacy-source', 'schedule', 'stop']);
 const diagnosticCodes = new Set(['NONE', 'EFFECT_UNKNOWN', 'IDENTITY_MISMATCH', 'OPERATION_MISMATCH',
   'LEASE_LOST', 'PUBLISH_FAILED', 'STALE_CAPABILITY', 'SLOT_CORRUPT', 'ACK_MISMATCH', 'CLOSURE_MISMATCH',
-  'SQLITE_BUSY', 'SOURCE_MISMATCH', 'RECOVERY_BLOCKED', 'EPERM', 'EBUSY', 'ENOENT', 'pane_not_found']);
+  'SQLITE_BUSY', 'SOURCE_MISMATCH', 'RECOVERY_BLOCKED', 'EPERM', 'EBUSY', 'ENOENT', 'pane_not_found', 'MANAGED_UNAVAILABLE']);
+// The ACK condition that failed; names only, never the compared values.
+const diagnosticReasons = new Set(['role-missing', 'paneId', 'statePath', 'launchToken', 'controlToken',
+  'generation', 'sessionId', 'painted', 'sequence-invalid', 'sequence-stale']);
 
 // A reload in the same native producer may reuse only the exact last published
 // journal of an actor whose SQLite handle was cooperatively closed. This
@@ -248,20 +251,23 @@ class ParentSlot {
     if (!diagnosticBranches.has(branch)) return Promise.resolve();
     const code = diagnosticCodes.has(cause?.code) ? cause.code :
       diagnosticCodes.has(cause?.cause?.code) ? cause.cause.code : 'NONE';
+    const reason = [cause?.reason, cause?.cause?.reason].find(value => diagnosticReasons.has(value));
     const entry = { time: new Date().toISOString(), branch, code,
       ...(['split', 'run', 'close', 'arrange', 'retire'].includes(operation?.type) ? { type: operation.type } : {}),
-      ...(Object.hasOwn(roleOwner, operation?.role ?? '') ? { role: operation.role } : {}) };
+      ...(Object.hasOwn(roleOwner, operation?.role ?? '') ? { role: operation.role } : {}),
+      ...(reason ? { reason } : {}) };
     const path = join(this.paths.directory, 'blocked-diagnostics.jsonl');
     this.diagnostics = this.diagnostics.then(async () => {
       let entries = [];
       try {
         if ((await this.fs.stat(path)).size <= 64 * 1024) {
           entries = (await this.fs.readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-            .filter(value => keys(value, ['time', 'branch', 'code'], ['type', 'role']) &&
+            .filter(value => keys(value, ['time', 'branch', 'code'], ['type', 'role', 'reason']) &&
               typeof value.time === 'string' && new Date(value.time).toISOString() === value.time &&
               diagnosticBranches.has(value.branch) && diagnosticCodes.has(value.code) &&
               (!value.type || ['split', 'run', 'close', 'arrange', 'retire'].includes(value.type)) &&
-              (!value.role || Object.hasOwn(roleOwner, value.role)));
+              (!value.role || Object.hasOwn(roleOwner, value.role)) &&
+              (!value.reason || diagnosticReasons.has(value.reason)));
         }
       } catch { /* Diagnostics are never authority or a reason to block recovery. */ }
       entries.push(entry);
@@ -459,10 +465,12 @@ class ParentSlot {
     return this.enqueue(async () => {
       this.check(selected, epoch);
       const record = this.record.roles[selected.role];
-      if (!record || !['paneId', 'statePath', 'launchToken', 'controlToken'].every(key => selected[key] === record[key]) ||
-        record.generation !== selected.generation || record.sessionId !== selected.sessionId ||
-        selected.painted !== true || !positive(selected.sequence) ||
-        selected.sequence <= (record.ack?.sequence ?? 0)) throw fail('ACK_MISMATCH');
+      const reason = !record ? 'role-missing' :
+        ['paneId', 'statePath', 'launchToken', 'controlToken'].find(key => selected[key] !== record[key]) ??
+        (record.generation !== selected.generation ? 'generation' : record.sessionId !== selected.sessionId ? 'sessionId' :
+          selected.painted !== true ? 'painted' : !positive(selected.sequence) ? 'sequence-invalid' :
+            selected.sequence <= (record.ack?.sequence ?? 0) ? 'sequence-stale' : null);
+      if (reason) throw Object.assign(fail('ACK_MISMATCH'), { reason });
       const target = Object.fromEntries(['paneId', 'tabId', 'shell', ...targetKeys].map(key => [key, record[key]]));
       await this.validateTarget(target);
       this.check(selected, epoch);
