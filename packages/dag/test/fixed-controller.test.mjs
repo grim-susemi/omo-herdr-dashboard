@@ -165,7 +165,8 @@ test('managed dashboard without a coordinator stays BLOCKED with the unchanged p
     () => f.controller.mutate('dag', 'arrange', 'qa:parent', ['focus', '--pane', 'qa:parent'])])
     await assert.rejects(call(), error => error.message.startsWith('BLOCKED: ') && error.inlineFallback === true);
   assert.equal(f.controller.status, 'BLOCKED');
-  assert.ok(f.warnings.length >= 2);
+  // The explicit open reports once; the identical automatic openPair failure is suppressed.
+  assert.equal(f.warnings.length, 1);
   for (const warning of f.warnings) assert.ok(warning.startsWith('DAG pane: BLOCKED: '));
 });
 test('initial source save precedes launches; concurrent opens create exactly one fixed pair', async t => {

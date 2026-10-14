@@ -100,9 +100,16 @@ export class DagPane {
       onChange: () => { if (!this.stopped) this.enqueue(() => this.save(true)); } });
   }
 
-  enqueue(job) {
+  // An identical warning is shown once until a job succeeds or the text changes;
+  // an explicit force call (/dashboard) always reports its result.
+  enqueue(job, { force = false } = {}) {
     const result = this.queue.then(job);
-    this.queue = result.catch(error => this.notify(`DAG pane: ${error.message}`));
+    this.queue = result.then(() => { this.lastWarning = undefined; }, error => {
+      const message = `DAG pane: ${error.message}`;
+      const repeat = message === this.lastWarning;
+      this.lastWarning = message;
+      if (force || !repeat) this.notify(message);
+    });
     return result;
   }
 
@@ -889,7 +896,7 @@ export class FixedDagPane extends DagPane {
         todo ? '0.5' : '0.4', parent.tabId, () => forceRole('workers'), todo?.paneId);
       this.status = workers ? 'current' : 'layout-waiting';
       return { dag, workers };
-    });
+    }, { force });
   }
   async ensureRole(role, anchor, direction, ratio, tabId, force, beforePane) {
     if (force()) await this.roleTail;
@@ -1264,7 +1271,7 @@ export class FixedDagPane extends DagPane {
   open() {
     if (this.managedAvailable && !this.coordinator?.actor) return this.enqueue(() => {
       this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window');
-    });
+    }, { force: true });
     return this.coordinator ? this.coordinator.schedule({ forceRoles: ['dag', 'workers', 'todo'] }) : this.openPair({ force: true });
   }
   rebase() {
