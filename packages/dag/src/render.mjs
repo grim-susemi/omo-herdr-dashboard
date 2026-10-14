@@ -73,7 +73,16 @@ export function activitySummary(task, language, now = Date.now()) {
   return { head: stalled ? `⚠ ${t(language, 'activityStalled')} · ${label}` : `${activityMarks[activity.phase]} ${label}`,
     text: tokens && typeof activity.text === 'string' ? clean(activity.text) : '', stalled };
 }
-const icons = { pending: '○', blocked: '◌', scheduled: '◷', running: '●', paused: 'Ⅱ', completed: '✓', failed: '×', cancelled: '−', skipped: '·', error: '×', interrupted: '−', lost: '?' };
+const icons = { pending: '○', blocked: '◌', scheduled: '◷', running: '⠋', paused: 'Ⅱ', completed: '✓', failed: '×', cancelled: '−', skipped: '·', error: '×', interrupted: '−', lost: '?' };
+export const spinnerFrames = Object.freeze(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
+const statusIcon = (status, frame = 0) => status === 'running' ?
+  spinnerFrames[((Number.isInteger(frame) ? frame : 0) % spinnerFrames.length + spinnerFrames.length) % spinnerFrames.length] :
+  icons[status] ?? '?';
+function modelLabel(task, columns = Infinity) {
+  const model = clean(task.model ?? '').replace(/^[^/\s]+\//u, '');
+  const suffix = task.reasoningEffort ? `:${clean(task.reasoningEffort)}` : '';
+  return fit(model, Math.max(0, columns - width(suffix))) + suffix;
+}
 const colors = { running: '36', completed: '32', failed: '31', blocked: '33', paused: '33', scheduled: '36', error: '31' };
 const accent = '36';
 const paint = (text, color, enabled, heading = false) => enabled && (color || heading) ?
@@ -98,7 +107,7 @@ export function runningTarget(state, previous) {
     (previous?.taskId ? targets.find(target => target.taskId === previous.taskId) : undefined) ?? targets[0];
 }
 
-export function graphLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], now = Date.now(), graphRanges } = {}) {
+export function graphLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], now = Date.now(), graphRanges, frame = 0 } = {}) {
   const output = [];
   const stalledNodes = new Set();
   const rows = layers(run, language);
@@ -135,7 +144,7 @@ export function graphLines(run, columns, color = true, language = 'en', { select
       const interiors = group.map(node => {
         const incoming = run.edges.filter(e => e.to === node.id).map(e => e.from);
         const task = node.state === 'running' ? tasks.find(task => task.id === node.taskId) : undefined;
-        const state = `${icons[node.state]} ${t(language, node.state)}`;
+        const state = `${statusIcon(node.state, frame)} ${t(language, node.state)}`;
         const activity = activitySummary(task, language, now);
         const head = activity ? `${state} ${activity.head}` : node.error ? `${state} · ${clean(node.error)}` : state;
         const room = boxWidth - 4 - width(head) - 1;
@@ -160,7 +169,8 @@ export function graphLines(run, columns, color = true, language = 'en', { select
 }
 
 // Wrap at word boundaries when possible, never dropping the tail of task text.
-function wrap(text, columns) {
+function wrap(text, columns, prefix = '') {
+  columns = Math.max(1, columns - width(prefix));
   const result = [];
   let line = '';
   for (const { segment } of segmenter.segment(clean(text))) {
@@ -175,7 +185,7 @@ function wrap(text, columns) {
     line += segment;
   }
   result.push(line);
-  return result;
+  return result.map((line, index) => `${index ? ' '.repeat(width(prefix)) : prefix}${line}`);
 }
 
 function elapsedTime(task, { now, connected, updatedAt }, status) {
@@ -224,12 +234,15 @@ function metricLines(task, language) {
   return lines;
 }
 
-function taskLines(task, language, timing, nodeStatus) {
+function taskLines(task, language, timing, nodeStatus, columns) {
   const value = key => task?.[key] === undefined || task[key] === null || task[key] === '' ? t(language, 'noData') : clean(task[key]);
   if (!task) return [`${t(language, 'task')}: ${t(language, 'noData')}`];
   const lines = [`${t(language, 'task')}: ${clean(task.id)}`];
   if (task.status) lines.push(`${t(language, 'taskStatus')}: ${taskStatuses.has(task.status) ? t(language, task.status) : clean(task.status)}`);
-  for (const key of ['description', ...(task.category ? ['category'] : []), 'agent', 'model', 'progress']) lines.push(`${t(language, key)}: ${value(key)}`);
+  for (const key of ['description', ...(task.category ? ['category'] : []), 'agent', 'model', 'progress']) {
+    const label = `${t(language, key)}: `;
+    lines.push(`${label}${key === 'model' && task.model ? modelLabel(task, Math.max(1, columns - 4 - width(label))) : value(key)}`);
+  }
   const activity = timing.connected ? activitySummary(task, language, timing.now) : null;
   if (activity) lines.push(`${t(language, 'activity')}: ${activity.head}${activity.text ? ` · ${activity.text}` : ''}`);
   const stats = [`${t(language, 'elapsed')}: ${elapsedTime(task, timing, task.status ?? nodeStatus) ?? t(language, 'noData')}`];
@@ -259,17 +272,22 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   for (const [key, label] of [['turns', 'compactTurns'], ['toolCalls', 'compactTools']]) {
     if (task?.[key] !== undefined && task[key] !== null) stats.push(t(language, label, { count: value(task[key]) }));
   }
-  const indent = '  '.repeat(Math.min(depth, 3));
-  const marker = depth ? '↳' : selected ? '>' : ' ';
+  const room = Math.max(1, columns - 4);
+  const indent = '  '.repeat(Math.min(depth, Math.max(0, Math.floor((room - 12) / 2))));
+  const marker = depth ? `↳ ${t(language, 'subtask')}` : selected ? '>' : ' ';
   const identity = [task?.agent, task?.category].filter(Boolean).map(clean).join('/');
+  const modelRoom = room - width(indent) - (identity ? width(identity) + 3 : 0);
+  // If the identity would crowd out model:effort, give the model its own line.
+  const metadata = task?.model && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2 ?
+    `${indent}${modelLabel(task, room - width(indent))}` :
+    `${indent}${[identity, task?.model ? modelLabel(task, modelRoom) : ''].filter(Boolean).join(' · ')}`;
   return [
-    `${indent}${marker} ${icons[status] ?? '?'} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`,
-    `${indent}${[identity, task?.model ? clean(task.model).replace(/^[^/\s]+\//u, '') : ''].filter(Boolean).join(' · ')}`,
+    `${indent}${marker} ${statusIcon(status, timing.frame)} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`,
+    metadata,
     `${indent}${task?.progress || node?.error ? clean(task?.progress || node.error) : ''}`,
     `${indent}${stats.join(' · ')}`,
     `${indent}${task?.metrics ? metricSummary(task, language) : ''}`,
   ].map((line, index) => {
-    const room = Math.max(1, columns - 4);
     const activity = index === 2 && timing.connected ? activitySummary(task, language, timing.now) : null;
     if (!activity) return fit(line, room);
     const head = `${indent}${activity.head}`;
@@ -300,8 +318,11 @@ export function completedTasks(state) {
 }
 
 function descendantLines(task, tasks, language, timing, columns) {
-  return taskDescendants(task, tasks).flatMap(({ task: child, depth }) =>
-    compactTaskLines(child, language, timing, columns, { depth }));
+  const descendants = taskDescendants(task, tasks);
+  const title = fit(`─ ${t(language, 'subtasksCount', { count: descendants.length })} `, columns - 4);
+  return descendants.length ? [title + '─'.repeat(Math.max(0, columns - 4 - width(title))),
+    ...descendants.flatMap(({ task: child, depth }) =>
+      compactTaskLines(child, language, timing, columns, { depth }))] : [];
 }
 
 function detailBox(text, columns, color, status, label) {
@@ -309,16 +330,21 @@ function detailBox(text, columns, color, status, label) {
   const border = colors[status];
   const title = label !== undefined && columns >= 7 ? `─ ${fit(label, columns - 6)} ` : '';
   return [paint(`╭${title}${'─'.repeat(Math.max(0, columns - 2 - width(title)))}╮`, border, color),
-    ...text.flatMap((line, index) => wrap(line, inner).map(part =>
-      `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color, index === 0)} ${paint('│', border, color)}`)),
+    ...text.flatMap((line, index) => {
+      const colon = line.indexOf(': ');
+      const prefix = index > 0 && colon >= 0 && width(line.slice(0, colon + 2)) <= inner - 4 ?
+        line.slice(0, colon + 2) : line.match(/^\s*/u)[0];
+      return wrap(line.slice(prefix.length), inner, prefix).map(part =>
+        `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color, index === 0)} ${paint('│', border, color)}`);
+    }),
     paint(`╰${'─'.repeat(Math.max(0, columns - 2))}╯`, border, color)];
 }
 
 function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
   const detailed = selected && verbose;
   const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded && !detailed });
-  const text = detailed ? [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${icons[node.state]} ${t(language, node.state)}`] : []),
-    ...taskLines(task, language, timing, node?.state)] : expanded ? compact : compact.slice(0, 1);
+  const text = detailed ? [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${statusIcon(node.state, timing.frame)} ${t(language, node.state)}`] : []),
+    ...taskLines(task, language, timing, node?.state, columns)] : expanded ? compact : compact.slice(0, 1);
   if (expanded || detailed) text.push(...descendantLines(task, tasks, language, timing, columns));
   return compactCompleted && !expanded && !detailed ? [paint(fit(compact[0], columns), colors[task?.status], color)] :
     detailBox(text, columns, color, node?.state ?? task?.status, node?.label ?? node?.id);
@@ -345,7 +371,7 @@ function terminalState(status) { return terminal.has(status); }
 
 export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scroll = 0, color = true, error = '', language = state?.language ?? 'en',
   selectedNodeId, selectedTaskId, view, viewState, verbose = false, revealSelection = false, notice = '', now = Date.now(), completedExpanded = false,
-  follow = true, runningNodeId, runningTaskId, offline = false } = {}) {
+  follow = true, runningNodeId, runningTaskId, offline = false, frame = 0 } = {}) {
   columns = Math.max(1, columns - 1);
   rows = Math.max(1, rows);
   const all = state?.runs ?? [];
@@ -357,7 +383,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const activeRuns = all.filter(candidate => candidate.status === 'running' || candidate.nodes.some(node => node.state === 'running'));
   const completedRuns = all.filter(candidate => !activeRuns.includes(candidate));
   const head = [paint(fit(`OMO  /  ${tasksView ? t(language, 'tasks') : 'DAG'}${switcher}`, columns), accent, color, true),
-    fit(tasksView ? tasksTitle : `${t(language, 'selectedRun', { name: run.name })} · ${t(language, 'activeRuns', { count: activeRuns.length })}`, columns)];
+    fit(tasksView ? `${tasksTitle} · ${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })}` :
+      `${t(language, 'selectedRun', { name: run.name })} · ${t(language, 'activeRuns', { count: activeRuns.length })}`, columns)];
   const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
   if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'),
     ...(state?.connected ? [] : [t(language, 'disconnected')]), '');
@@ -374,7 +401,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       if (body.length && body.at(-1) !== '') body.push('');
       const start = body.length;
       body.push(...taskCard(task, state?.tasks ?? [], columns, color, language,
-        { now, connected: state?.connected, updatedAt: state?.updatedAt },
+        { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },
         { selected: task.id === selectedTaskId, expanded, verbose, compactCompleted }));
       taskRanges[task.id] = { start, end: body.length };
     }
@@ -394,7 +421,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     body.push('');
     try {
       const ranges = Object.create(null), start = body.length;
-      body.push(...graphLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.connected ? state.tasks ?? [] : [], now, graphRanges: ranges }));
+      body.push(...graphLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.connected ? state.tasks ?? [] : [], now, graphRanges: ranges, frame }));
       for (const [id, range] of Object.entries(ranges)) graphRanges[id] = { start: start + range.start, end: start + range.end };
     }
     catch (error) { body.push(t(language, 'graphError', { error: clean(error.message) })); }
@@ -406,7 +433,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       body.push('');
       const start = body.length;
       body.push(...taskCard(state?.tasks?.find(task => task.id === node.taskId), state?.tasks ?? [], columns, color, language,
-        { now, connected: state?.connected, updatedAt: state?.updatedAt },
+        { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },
         { selected: node.id === selectedNodeId, expanded: isExpanded(viewState, run.id, node.id, node.state), verbose, node }));
       nodeRanges[node.id] = { start, end: body.length };
     }
@@ -439,7 +466,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     const node = run.nodes.find(node => node.id === runningNodeId) ??
       run.nodes.find(node => graphRanges[node.id]?.start <= start && graphRanges[node.id]?.end > start) ??
       run.nodes.find(node => node.id === selectedNodeId) ?? run.nodes[0];
-    if (node) visible[0] = fit(`${icons[node.state]} ${clean(node.label ?? node.id)}`, columns);
+    if (node) visible[0] = fit(`${statusIcon(node.state, frame)} ${clean(node.label ?? node.id)}`, columns);
   }
   const range = body.length > available ? ` ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : '';
   const live = state?.connected && !error;

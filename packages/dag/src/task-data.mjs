@@ -58,7 +58,10 @@ export function normalizeTask(raw) {
   const values = { id: raw.task_id,
     description: text(raw.description) ?? text(raw.task_summary) ?? text(raw.name),
     agent: text(raw.agent_type, 128) ?? text(raw.category, 128),
-    model: text(raw.resolved_model?.display, 256) ?? text(raw.model, 256),
+    model: text(raw.resolved_model?.model_id, 256)?.toLowerCase() ??
+      text(raw.resolved_model?.display, 256) ?? text(raw.model, 256),
+    reasoningEffort: text(raw.resolved_model?.reasoning_effort ?? raw.requested_model?.reasoning_effort ??
+      raw.effective_model?.reasoning_effort, 64),
     status: text(raw.status, 64), startedAt: iso(live?.started_at) ?? iso(raw.created_at),
     completedAt: iso(raw.terminal_at) ?? (terminal.has(raw.status) ? iso(raw.updated_at) : undefined),
     progress: terminal.has(raw.status) ? undefined : text(progress, 512) ?? text(live?.activity, 512),
@@ -80,7 +83,8 @@ export class TaskData {
   restore(tasks = []) {
     for (const raw of tasks) {
       const task = normalizeTask({ task_id: raw.id, description: raw.description, agent_type: raw.agent,
-        model: raw.model, status: raw.status, created_at: raw.startedAt, terminal_at: raw.completedAt,
+        model: raw.model, resolved_model: { reasoning_effort: raw.reasoningEffort },
+        status: raw.status, created_at: raw.startedAt, terminal_at: raw.completedAt,
         updated_at: raw.reportedAt,
         live_progress: { activity: raw.progress, turns: raw.turns, tool_calls: raw.toolCalls } });
       if (!task) continue;

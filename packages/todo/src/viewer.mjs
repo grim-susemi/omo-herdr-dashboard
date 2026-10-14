@@ -1,18 +1,20 @@
 import { watch } from 'node:fs';
-import { readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm, chmod } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { constants } from 'node:os';
 import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { EventEmitter } from 'node:events';
 import { createRoleClient } from './presence.mjs';
 import { sameSnapshotScope, validSnapshot } from './storage.mjs';
 import { captureLegacyProducer, createDashboardHerdr, createProducerCustodyServer,
   createViewerRetirementServer, readRoleState, registerRoleViewer, requestRoleClose } from './controller.mjs';
-import { isClosedPhase, renderFrame, runningTarget } from './render.mjs';
+import { isClosedPhase, renderFrame, runningTarget, STRIKE_INTERVAL_MS, STRIKE_TOTAL_FRAMES } from './render.mjs';
 import { t } from './i18n.mjs';
 
 const pathKey = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string' && pathKey(a) === pathKey(b);
+export const VIEWER_FAILURE_GRACE_MS = 2000;
 export function parseViewerArgs(args) {
   const result = { once: false };
   const fields = { '--state': 'statePath', '--close-pane': 'paneId', '--launch-token': 'launchToken' };
@@ -48,16 +50,18 @@ export function validateRoleBinding(state, options) {
   return state;
 }
 
-export async function readViewerCache(state) {
+export async function readViewerCache(state, diagnose = () => {}) {
   try {
     const cache = JSON.parse(await readFile(state.cachePath, 'utf8'));
     if (cache?.schema !== 'omo-herdr-todo/cache/1' || !validSnapshot(cache.snapshot)) {
       throw new TypeError(t(state.language, 'cacheError'));
     }
+    if (sameSnapshotScope(cache.snapshot, state)) diagnose('cache-last-known');
     return sameSnapshotScope(cache.snapshot, state)
       ? { availability: 'last-known', snapshot: cache.snapshot, error: '' }
       : { availability: 'waiting', snapshot: null, error: '' };
   } catch (error) {
+    diagnose('cache-read', error);
     return { availability: error.code === 'ENOENT' ? 'waiting' : 'error', snapshot: null,
       error: error.code === 'ENOENT' ? '' : error.message };
   }
@@ -65,7 +69,8 @@ export async function readViewerCache(state) {
 
 export async function startViewer(options, { input = process.stdin, output = process.stdout,
   interactive = Boolean(input.isTTY && output.isTTY) && !options.once,
-  clock = { setInterval, clearInterval }, watchState = watch, readState = readRoleState,
+  clock = { now: Date.now, setTimeout, clearTimeout, setInterval, clearInterval },
+  watchState = watch, readState = readRoleState, readCache = readViewerCache,
   pid = process.pid } = {}) {
   // Direct API callers use the same CLI validation.
   if (!isAbsolute(options.statePath ?? '') || !options.paneId || !options.launchToken) {
@@ -84,6 +89,80 @@ export async function startViewer(options, { input = process.stdin, output = pro
   const temporaryPrefs = `${options.statePath}.view.json.${pid}.pending`;
   let watcher, timer, disposeInput, disposeFocus, dragY, closeRetirement, closeCustody, custody, custodyKey, custodyClosure;
   let custodyWanted, custodyJobs = Promise.resolve();
+  const failures = new Map(), completionFrames = new Map();
+  let animationTimer, diagnostics = Promise.resolve();
+  const diagnosticEntries = [];
+  const diagnosticPath = resolve(dirname(options.statePath), 'todo.viewer-diagnostics.jsonl');
+  const errorCode = cause => Object.hasOwn(constants.errno, cause?.code ?? '') ||
+    ['INVALID_CACHE', 'STALE_SCOPE', 'SOURCE_ERROR', 'SyntaxError', 'TypeError', 'RangeError', 'Error'].includes(cause?.code) ? cause.code :
+    ['SyntaxError', 'TypeError', 'RangeError', 'Error'].includes(cause?.name) ? cause.name : 'NONE';
+  function diagnose(branch, cause) {
+    if (!interactive) return;
+    const entry = { time: new Date(clock.now?.() ?? Date.now()).toISOString(), branch, code: errorCode(cause) };
+    diagnosticEntries.push(entry);
+    while (diagnosticEntries.length > 200 ||
+      Buffer.byteLength(diagnosticEntries.map(value => JSON.stringify(value)).join('\n')) > 64 * 1024)
+      diagnosticEntries.shift();
+    const text = diagnosticEntries.map(value => JSON.stringify(value)).join('\n') + '\n';
+    diagnostics = diagnostics.then(async () => {
+      await writeFile(diagnosticPath, text, { mode: 0o600 });
+      await chmod(diagnosticPath, 0o600);
+      events.emit('diagnostic', entry);
+    }).catch(cause => events.emit('diagnostic-error', { code: errorCode(cause) }));
+  }
+  function recovered(channel) {
+    const pending = failures.get(channel);
+    if (pending) clock.clearTimeout(pending.timer);
+    failures.delete(channel);
+  }
+  function failed(channel, branch, cause, fallback) {
+    diagnose(branch, cause);
+    const pending = failures.get(channel);
+    if (pending) {
+      pending.fallback = fallback;
+      if (pending.expired) fallback();
+      return;
+    }
+    if (!snapshot) { fallback(); return; }
+    const entry = { fallback };
+    entry.timer = clock.setTimeout(() => {
+      if (closing || failures.get(channel) !== entry) return;
+      // Keep the expired entry until recovery; later errors remain offline.
+      entry.expired = true;
+      entry.fallback(); void draw();
+      events.emit('fallback', { channel, branch });
+    }, VIEWER_FAILURE_GRACE_MS);
+    failures.set(channel, entry);
+    events.emit('fallback-pending', { channel, branch, code: errorCode(cause), delayMs: VIEWER_FAILURE_GRACE_MS });
+  }
+  function acceptSnapshot(value) {
+    const previous = new Map((snapshot?.phases ?? []).flatMap((phase, phaseIndex) =>
+      phase.tasks.map((task, taskIndex) => [snapshot.phaseSummaries[phaseIndex].taskKeys[taskIndex], task.status])));
+    const keys = new Set();
+    for (const [phaseIndex, phase] of value.phases.entries()) for (const [taskIndex, task] of phase.tasks.entries()) {
+      const key = value.phaseSummaries[phaseIndex].taskKeys[taskIndex];
+      keys.add(key);
+      if (task.status === 'completed' && previous.has(key) && previous.get(key) !== 'completed')
+        completionFrames.set(key, 0);
+      else if (task.status !== 'completed') completionFrames.delete(key);
+    }
+    for (const key of completionFrames.keys()) if (!keys.has(key)) completionFrames.delete(key);
+    snapshot = value;
+    if (interactive && completionFrames.size && animationTimer === undefined) {
+      animationTimer = clock.setInterval(() => {
+        for (const [key, frame] of completionFrames) {
+          if (frame + 1 >= STRIKE_TOTAL_FRAMES) completionFrames.delete(key);
+          else completionFrames.set(key, frame + 1);
+        }
+        if (!completionFrames.size) { clock.clearInterval(animationTimer); animationTimer = undefined; }
+        void draw();
+      }, STRIKE_INTERVAL_MS);
+      animationTimer?.unref?.();
+    }
+    if (!completionFrames.size && animationTimer !== undefined) {
+      clock.clearInterval(animationTimer); animationTimer = undefined;
+    }
+  }
   async function disposeCustody() {
     const selected = custody;
     custody = null;
@@ -131,6 +210,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
     if (availability === 'current' || availability === 'empty') target = runningTarget(snapshot, target);
     const frame = renderFrame(snapshot, { columns: output.columns ?? 80, rows: output.rows ?? 24,
       language: state?.language, availability, error, color: interactive,
+      completionFrames,
       ...prefs, scroll, target: availability === 'current' ? target : null,
       revealTarget: prefs.follow && availability === 'current' });
     scroll = frame.scroll;
@@ -157,10 +237,15 @@ export async function startViewer(options, { input = process.stdin, output = pro
     });
     return painting;
   }
-  function retire() {
+  function retire(preserve = false) {
     generation++;
     const old = client;
-    client = null; message = null; snapshot = null; availability = 'waiting'; error = '';
+    client = null; message = null;
+    if (!preserve) {
+      snapshot = null; availability = 'waiting'; error = '';
+      for (const channel of failures.keys()) recovered(channel);
+      completionFrames.clear(); clock.clearInterval(animationTimer); animationTimer = undefined;
+    }
     old?.close();
   }
   function connect(next, epoch) {
@@ -169,29 +254,37 @@ export async function startViewer(options, { input = process.stdin, output = pro
       offer: next.presenceOffer,
       onSnapshot(value, exactMessage) {
         if (!current(epoch, source) || !validSnapshot(value) || !sameSnapshotScope(value, state)) return;
-        snapshot = value; message = exactMessage; availability = value.availability; error = '';
+        recovered('presence'); recovered('registration'); recovered('cache');
+        acceptSnapshot(value); message = exactMessage; availability = value.availability; error = '';
         events.emit('snapshot', { snapshot: value, message: exactMessage, client: source });
         void draw();
       },
       onStatus(status) {
         if (!current(epoch, source)) return;
         message = null;
-        snapshot = validSnapshot(status.snapshot) && sameSnapshotScope(status.snapshot, state) ? status.snapshot : null;
-        availability = snapshot ? 'last-known' : status.availability === 'waiting' ? 'waiting' : 'error';
-        error = status.error?.message ?? '';
+        failed('presence', 'presence-status', status.error, () => {
+          snapshot = validSnapshot(status.snapshot) && sameSnapshotScope(status.snapshot, state) ? status.snapshot : null;
+          availability = snapshot ? 'last-known' : status.availability === 'waiting' ? 'waiting' : 'error';
+          error = status.error?.message ?? '';
+        });
         void draw();
       },
     });
     client = source;
     source.events.on('failure', cause => {
       if (!current(epoch, source)) return;
-      message = null; availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+      message = null;
+      failed('presence', 'presence-failure', cause, () => {
+        availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+      });
       void draw();
     });
     source.events.on('disconnected', () => {
       if (!current(epoch, source)) return;
       message = null;
-      availability = snapshot ? 'disconnected' : error ? 'error' : 'waiting';
+      failed('presence', 'presence-disconnected', null, () => {
+        availability = snapshot ? 'disconnected' : error ? 'error' : 'waiting';
+      });
       void draw();
       events.emit('disconnected');
     });
@@ -218,7 +311,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
       JSON.stringify([state?.presenceOffer, state?.controlOffer]);
     const first = state === null;
     const reconnect = scopeChanged || offersChanged || first || invalidState;
-    if (reconnect) retire();
+    if (reconnect) retire(!scopeChanged && !first);
     invalidState = false;
     state = next;
     const epoch = generation;
@@ -228,9 +321,11 @@ export async function startViewer(options, { input = process.stdin, output = pro
       await preferences(next, epoch);
     }
     if (reconnect || !interactive) {
-      const cached = await readViewerCache(next);
+      const cached = await readCache(next, diagnose);
       if (epoch !== generation || closing) return;
-      snapshot = cached.snapshot; availability = cached.availability; error = cached.error || error;
+      const installCache = () => { snapshot = cached.snapshot; availability = cached.availability; error = cached.error || error; };
+      if (snapshot && interactive) failed('cache', 'cache-fallback', null, installCache);
+      else installCache();
     }
     if (interactive && reconnect) {
       if (next.controlOffer) {
@@ -239,10 +334,17 @@ export async function startViewer(options, { input = process.stdin, output = pro
             if (closing || epoch !== generation) return;
             events.emit('registered', { accepted, scope: next, pid });
             if (accepted) connect(next, epoch);
-            else { availability = snapshot ? 'last-known' : 'error'; error = t(next.language, 'registrationError'); void draw(); }
+            else {
+              failed('registration', 'registration-denied', null, () => {
+                availability = snapshot ? 'last-known' : 'error'; error = t(next.language, 'registrationError');
+              });
+              void draw();
+            }
           }, cause => {
             if (closing || epoch !== generation) return;
-            availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+            failed('registration', 'registration-error', cause, () => {
+              availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+            });
             events.emit('control-error', cause); void draw();
           });
       } else connect(next, epoch);
@@ -261,21 +363,24 @@ export async function startViewer(options, { input = process.stdin, output = pro
           if (selectedObservation !== observation) { dirty = true; continue; }
           if (next) {
             try { validateRoleBinding(next, options); }
-            catch (cause) { retire(); throw cause; }
+            catch (cause) { retire(true); invalidState = true; throw cause; }
             await apply(next);
+            recovered('state');
             if (selectedObservation === observation) validatedObservation = observation;
           }
           else {
-            const lastKnown = snapshot;
-            retire(); snapshot = lastKnown;
-            invalidState = true; availability = snapshot ? 'last-known' : 'waiting';
-            error = state ? 'Role state is missing.' : '';
+            validatedObservation = -1;
+            failed('state', 'state-missing', { code: 'ENOENT' }, () => {
+              retire(true); invalidState = true; availability = snapshot ? 'last-known' : 'waiting';
+              error = state ? t(state.language, 'stateMissing') : '';
+            });
           }
         } catch (cause) {
-          if (!state) throw cause;
-          const lastKnown = snapshot;
-          retire(); snapshot = lastKnown;
-          invalidState = true; availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+          if (!state) { diagnose('state-initial', cause); throw cause; }
+          validatedObservation = -1;
+          failed('state', 'state-read', cause, () => {
+            retire(true); invalidState = true; availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+          });
           events.emit('state-error', cause);
         }
         if (!closing) void draw();
@@ -318,10 +423,13 @@ export async function startViewer(options, { input = process.stdin, output = pro
       await closeCustody?.();
       await closeRetirement?.();
       watcher?.close(); clock.clearInterval(timer);
+      clock.clearInterval(animationTimer);
+      for (const channel of failures.keys()) recovered(channel);
       output.off?.('resize', resize); disposeInput?.(); disposeFocus?.();
       if (interactive) { input.setRawMode?.(false); input.pause?.(); }
       await saving;
       await painting;
+      await diagnostics;
       if (interactive) await write(`${disablePointer}\x1b[?25h\x1b[?1049l`).catch(cause => events.emit('output-error', cause));
       events.emit('closed', { manual, accepted });
       resolveClosed({ manual, accepted });
@@ -389,9 +497,12 @@ export async function startViewer(options, { input = process.stdin, output = pro
         void refresh().catch(cause => events.emit('state-error', cause));
       });
       watcher.on('error', cause => {
-        const lastKnown = snapshot;
-        retire(); snapshot = lastKnown; invalidState = true;
-        availability = snapshot ? 'last-known' : 'error'; error = cause.message; void draw();
+        validatedObservation = -1;
+        failed('state', 'state-watch', cause, () => {
+          retire(true); invalidState = true;
+          availability = snapshot ? 'last-known' : 'error'; error = cause.message;
+        });
+        void draw();
       });
       output.write(`\x1b[?1049h\x1b[?25l${enablePointer}`);
       input.setRawMode?.(true); input.resume?.();

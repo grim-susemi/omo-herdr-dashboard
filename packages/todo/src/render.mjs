@@ -20,12 +20,24 @@ import { t } from './i18n.mjs';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 // Terminal primitives: one-cell inset, semantic ANSI colors and bounded ask.
-const style = { accent: '36', phase: '35', muted: '90', completed: '90', abandoned: '90', pending: '90',
-  in_progress: '35', warning: '33', error: '31' };
-const layout = { taskInset: 3, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
-const marks = { pending: '.', in_progress: '*', completed: 'x', abandoned: '-' };
+const style = { accent: '36', phase: '35', muted: '90', completed: '90', abandoned: '90',
+  in_progress: '36', warning: '33', error: '31' };
+const layout = { taskInset: 5, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
+const marks = { pending: '[ ]', in_progress: '[•]', completed: '[✓]', abandoned: '[×]', cancelled: '[×]' };
+export const STRIKE_INTERVAL_MS = 65;
+export const STRIKE_TOTAL_FRAMES = 14;
 const paint = (text, token, enabled, heading = false) => enabled && style[token] ?
   `\x1b[${heading ? '1;' : token === 'completed' ? '9;' : ''}${style[token]}m${text}\x1b[0m` : text;
+// Two hold frames followed by twelve reveal frames, as in Pi's Todo widget.
+export function strikeRevealCount(text, frame) {
+  return frame === undefined ? undefined : Math.ceil([...text].length * Math.min(12, Math.max(0, frame - 2)) / 12);
+}
+function completedLine(text, count, color) {
+  if (!color) return text;
+  if (count === undefined) return paint(text, 'completed', true);
+  const chars = [...text], split = Math.min(chars.length, Math.max(0, count));
+  return `\x1b[90m${split ? `\x1b[9m${chars.slice(0, split).join('')}\x1b[29m` : ''}${chars.slice(split).join('')}\x1b[0m`;
+}
 export const clean = value => stripVTControlCharacters(String(value ?? ''))
   .replace(/\r\n?/g, '\n').replaceAll('\t', ' ')
   .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, '');
@@ -101,7 +113,8 @@ export function runningTarget(snapshot, previous) {
 
 export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en',
   availability = snapshot?.availability ?? 'waiting', error = '', color = true,
-  scroll = 0, askScroll = 0, revealTarget = false, target = snapshot?.target, follow = true, completedExpanded = false } = {}) {
+  scroll = 0, askScroll = 0, revealTarget = false, target = snapshot?.target, follow = true, completedExpanded = false,
+  completionFrames = new Map() } = {}) {
   // Keep the terminal's final cell free, as in the existing DAG renderer.
   // ConPTY can otherwise wrap a wide glyph before the following cursor move.
   columns = Math.max(1, Math.floor(columns) - 1);
@@ -126,10 +139,10 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     const start = bodyLines.length;
     const count = counts(phase.tasks);
     const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}`;
-    const nameRoom = columns - width(summary) - 1;
+    const nameRoom = columns - width(summary) - 2;
     const phaseStyle = isClosedPhase(phase) ? 'muted' : 'phase';
-    if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)} ${summary}`, phaseStyle, color, true));
-    else bodyLines.push(paint(fit(phase.name, columns), phaseStyle, color, true), ...wrap(summary, columns));
+    if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)}: ${summary}`, phaseStyle, color, true));
+    else bodyLines.push(paint(fit(`${phase.name}:`, columns), phaseStyle, color, true), ...wrap(summary, columns));
     const taskOccurrences = new Map();
     for (const [taskIndex, task] of (isClosedPhase(phase) && !completedExpanded ? [] : phase.tasks).entries()) {
       const taskOccurrence = taskOccurrences.get(task.content) ?? 0;
@@ -139,8 +152,18 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
       if (taskIndex && (task.status === 'in_progress' || phase.tasks[taskIndex - 1].status === 'in_progress')) bodyLines.push('');
       const taskStart = bodyLines.length;
       const prefix = `${target?.key === key ? '>' : ' '}${marks[task.status]} `;
-      for (const [index, line] of wrap(task.content, columns - layout.taskInset).entries()) {
-        bodyLines.push(paint(`${index === 0 ? prefix : ' '.repeat(layout.taskInset)}${line}`, task.status, color, task.status === 'in_progress'));
+      const wrapped = wrap(task.content, columns - layout.taskInset);
+      const strikeText = `${prefix}${wrapped.join('')}`;
+      const reveal = strikeRevealCount(strikeText, completionFrames.get(key));
+      let consumed = 0;
+      for (const [index, line] of wrapped.entries()) {
+        const inset = index === 0 ? prefix : ' '.repeat(layout.taskInset);
+        const text = `${inset}${line}`;
+        bodyLines.push(task.status === 'completed' ? completedLine(text,
+          reveal === undefined ? undefined : index === 0 ? reveal :
+            reveal <= consumed ? 0 : layout.taskInset + reveal - consumed, color) :
+          paint(text, task.status, color, task.status === 'in_progress'));
+        consumed += [...(index === 0 ? text : line)].length;
       }
       taskRanges[key] = { start: taskStart, end: bodyLines.length, phaseStart: start, status: task.status };
     }
@@ -163,7 +186,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   }
   const top = [paint(fit(head, columns), ['last-known', 'disconnected'].includes(source) ? 'warning' :
     source === 'error' ? 'error' : 'accent', color, true), paint(fit(tally(total), columns), 'muted', color)];
-  if (rows >= 12) top.push('');
+  if (rows >= 12) top.push(paint('─'.repeat(columns), 'muted', color));
   top.push(paint(fit(current, columns), target ? 'in_progress' : 'pending', color, Boolean(target)));
   const askLines = wrap(snapshot?.ask?.text ?? t(language, 'noAsk'), columns);
   const room = rows - top.length - 1 - Number(Boolean(error));

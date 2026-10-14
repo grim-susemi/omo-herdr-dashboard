@@ -38,10 +38,11 @@ function clock() {
   let now = 0, id = 0;
   const timers = new Map(), intervals = new Map();
   return { now: () => now, setTimeout(fn, ms) { const key = ++id; timers.set(key, { fn, at: now + ms }); return key; },
-    clearTimeout: key => timers.delete(key), setInterval(fn) { const key = ++id; intervals.set(key, fn); return key; },
+    clearTimeout: key => timers.delete(key), setInterval(fn, ms) { const key = ++id; intervals.set(key, { fn, ms }); return key; },
     clearInterval: key => intervals.delete(key),
     advance(ms) { now += ms; for (const [key, timer] of [...timers]) if (timer.at <= now) { timers.delete(key); timer.fn(); } },
-    repaint() { for (const fn of intervals.values()) fn(); },
+    repaint(ms) { for (const timer of intervals.values()) if (ms === undefined || ms === timer.ms) timer.fn(); },
+    intervalCount(ms) { return [...intervals.values()].filter(timer => timer.ms === ms).length; },
     get size() { return timers.size + intervals.size; } };
 }
 class Output extends EventEmitter {
@@ -339,7 +340,13 @@ test('source failure and disconnect keep only labelled same-scope last-known; re
   const viewer = await f.start(); await registered;
   if (!viewer.state.snapshot || viewer.state.availability !== 'current') await signal(viewer.events, 'snapshot');
   const failedFrame = signal(viewer.events, 'frame', value => value.text.includes('CACHED NOT LIVE'));
+  const pending = signal(viewer.events, 'fallback-pending', value => value.channel === 'presence');
+  const diagnostic = signal(viewer.events, 'diagnostic', value => value.branch === 'presence-status');
   f.presence.sourceFailed(new Error('Source read failed'), f.presence.getOwner());
+  await pending;
+  assert.equal((await diagnostic).code, 'SOURCE_ERROR');
+  assert.equal(viewer.state.availability, 'current');
+  f.time.advance(2000);
   await failedFrame;
   assert.equal(viewer.state.availability, 'last-known');
   assert.equal(viewer.state.snapshot.target.content, 'Last known');
@@ -349,6 +356,9 @@ test('source failure and disconnect keep only labelled same-scope last-known; re
   const errored = signal(viewer.events, 'state-error', cause => cause.name === 'SyntaxError');
   await fs.writeFile(f.statePath, '{');
   await errored;
+  // A new state-read failure gets its own grace, retaining the disconnected view.
+  assert.equal(viewer.state.availability, 'disconnected');
+  f.time.advance(2000);
   assert.equal(viewer.state.availability, 'last-known');
   assert.notEqual(viewer.state.availability, 'empty');
 });
@@ -496,10 +506,13 @@ test('same-scope source error, disconnect and reattach retain an active target w
   const paused = signal(viewer.events, 'preferences', value => !value.follow);
   viewer.key('k'); const saved = await paused;
   const failed = signal(viewer.events, 'frame', () => viewer.state.availability === 'last-known');
+  const pending = signal(viewer.events, 'fallback-pending', value => value.channel === 'presence');
   f.presence.sourceFailed(new Error('Owned source unavailable'), f.presence.getOwner());
+  await pending;
+  f.time.advance(2000);
   await failed;
   assert.equal(viewer.state.target.key, targetKey);
-  assert.ok(!viewer.frame.bodyLines.some(line => stripVTControlCharacters(line).startsWith('>* ')));
+  assert.ok(!viewer.frame.bodyLines.some(line => stripVTControlCharacters(line).startsWith('>[•] ')));
   const disconnected = signal(viewer.events, 'disconnected');
   await f.presence.close(); await disconnected;
   assert.equal(viewer.state.availability, 'disconnected');
@@ -534,4 +547,27 @@ test('same-scope source error, disconnect and reattach retain an active target w
   const repopulated = signal(viewer.events, 'snapshot', value => value.snapshot.sequence === 3);
   await replacement.publish({ ...projection(), ...replacement.getOwner() }); await repopulated;
   assert.equal(viewer.state.target.content, 'EARLY_RUN');
+});
+
+test('completion transition animates once and stops its 65ms timer without removing the ACK heartbeat', async t => {
+  const f = await fixture(t);
+  await f.publish('Completion fixture');
+  const ack = signal(f.presence.events, 'event', event => event.type === 'ack');
+  const viewer = await f.start(); await ack;
+  assert.equal(f.time.intervalCount(65), 0);
+  const phases = [{ name: 'Build', tasks: [{ content: 'Completion fixture', status: 'completed' },
+    { content: 'Remaining fixture', status: 'pending' }] }];
+  const publish = () => f.presence.publish({ ...projectNativeTodo([{ type: 'custom', customType: 'senpi.todo-state',
+    data: { schema: 'v2', phases } }]), ...f.presence.getOwner() });
+  const snapshot = signal(viewer.events, 'snapshot', value => value.snapshot.sequence === 2);
+  await publish(); await snapshot;
+  assert.equal(f.time.intervalCount(65), 1);
+  for (let frame = 0; frame < 14; frame++) {
+    const painted = signal(viewer.events, 'frame'); f.time.repaint(65); await painted;
+  }
+  assert.equal(f.time.intervalCount(65), 0);
+  assert.equal(f.time.intervalCount(1000), 1);
+  const repeated = signal(viewer.events, 'snapshot', value => value.snapshot.sequence === 3);
+  await publish(); await repeated;
+  assert.equal(f.time.intervalCount(65), 0);
 });

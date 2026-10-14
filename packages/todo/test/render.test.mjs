@@ -51,7 +51,7 @@ for (const [columns, rows, bodyRows] of [[80, 24, 15], [40, 16, 7], [24, 8, 2],
     for (const line of frame.lines) assert.ok(fixtureCells(line) <= columns, JSON.stringify(line));
     if (columns === 24) assert.match(frame.text, /2\/5 done:1 drop:1/);
     if (bodyRows > 0) {
-      assert.ok(frame.lines.some(line => line.includes('>* ')), 'actual target remains visible');
+      assert.ok(frame.lines.some(line => line.includes('>[•] ')), 'actual target remains visible');
       assert.ok(frame.askRows <= 2);
       assert.equal(frame.lines[frame.bodyStart], frame.bodyLines[frame.scroll]);
       assert.equal(frame.bodyStart + frame.bodyRows + 1, rows);
@@ -66,14 +66,14 @@ test('every phase shell and every actual status remain accessible by basic body 
   assert.equal(Object.keys(full.phaseRanges).length, 3);
   assert.equal(Object.keys(full.taskRanges).length, 5);
   assert.equal(Object.values(full.taskRanges).filter(range => range.status === 'in_progress').length, 2);
-  assert.equal(full.bodyLines.filter(line => line.startsWith(' * ') || line.startsWith('>* ')).length, 2);
+  assert.equal(full.bodyLines.filter(line => line.startsWith(' [•] ') || line.startsWith('>[•] ')).length, 2);
   for (const [index, phase] of snapshot.phases.entries()) {
     const range = full.phaseRanges[snapshot.phaseSummaries[index].key];
     const frame = renderFrame(snapshot, { columns: 40, rows: 16, scroll: range.start, color: false, completedExpanded: true });
     assert.ok(frame.lines.some(line => line.includes(phase.name)));
   }
   const shell = renderFrame(project([{ name: 'Empty', tasks: [] }]), { columns: 40, rows: 16, color: false });
-  assert.match(shell.text, /Empty 0\/0/);
+  assert.match(shell.text, /Empty: 0\/0/);
   assert.doesNotMatch(shell.text, /100%/);
 });
 
@@ -83,7 +83,7 @@ test('closed includes dropped; dropped never becomes completed', () => {
   ] }]);
   const frame = renderFrame(snapshot, { color: false, completedExpanded: true });
   assert.match(frame.text, /2\/2 closed done:0 drop:2/);
-  assert.match(frame.text, /Dropped 2\/2 drop:2/);
+  assert.match(frame.text, /Dropped: 2\/2 drop:2/);
   assert.equal(snapshot.target, null);
   assert.deepEqual(Object.values(frame.taskRanges).map(range => range.status), ['abandoned', 'abandoned']);
 });
@@ -96,7 +96,7 @@ test('ask has its own bounded scroll; long unspaced labels lose no content in th
   assert.equal(second.askScroll, 2);
   assert.notDeepEqual(first.lines.slice(5, first.bodyStart), second.lines.slice(5, second.bodyStart));
   const range = first.taskRanges[snapshot.target.key];
-  const body = first.bodyLines.slice(range.start, range.end).map(line => line.slice(3)).join('');
+  const body = first.bodyLines.slice(range.start, range.end).map(line => line.slice(5)).join('');
   assert.equal(body, snapshot.target.content);
   const tiny = renderFrame(snapshot, { columns: 1, rows: 1, scroll: 4, askScroll: 2 });
   assert.equal(tiny.scroll, 4);
@@ -159,8 +159,8 @@ test('fully closed nonempty phases fold task rows but keep truthful shells and c
   const folded=renderFrame(snapshot,{columns:80,rows:40,color:false});
   const expanded=renderFrame(snapshot,{columns:80,rows:40,color:false,completedExpanded:true});
   assert.doesNotMatch(folded.text,/DONE_HIDE|DROP_HIDE/);
-  assert.match(folded.text,/Closed 2\/2 drop:1/);
-  assert.match(folded.text,/Empty 0\/0/);
+  assert.match(folded.text,/Closed: 2\/2 drop:1/);
+  assert.match(folded.text,/Empty: 0\/0/);
   assert.equal(Object.keys(folded.phaseRanges).length,3);
   assert.match(expanded.text,/DONE_HIDE/);assert.match(expanded.text,/DROP_HIDE/);
   assert.ok(expanded.bodyLines.length>folded.bodyLines.length);
@@ -176,7 +176,7 @@ test('retained native target drives marker and reveal without replacing the snap
   const retained = runningTarget(snapshot, target);
   const followed = renderFrame(snapshot, { rows: 16, columns: 40, color: false, target: retained, revealTarget: true });
   assert.ok(followed.scroll > 0);
-  assert.match(followed.text, />\* NATIVE_28/);
+  assert.match(followed.text, />\[•\] NATIVE_28/);
   const paused = renderFrame(snapshot, { rows: 16, columns: 40, color: false,
     target: retained, follow: false, revealTarget: false });
   assert.equal(paused.scroll, 0);
@@ -193,7 +193,7 @@ test('reference hierarchy emphasizes active work and exposes body-relative click
   const phase = frame.phaseRanges[snapshot.phaseSummaries[1].key];
   assert.ok(frame.bodyLines[phase.start].startsWith('\x1b[1;35m'));
   const active = frame.taskRanges[snapshot.target.key];
-  assert.ok(frame.bodyLines[active.start].startsWith('\x1b[1;35m'));
+  assert.ok(frame.bodyLines[active.start].startsWith('\x1b[1;36m'));
   const done = frame.taskRanges[snapshot.phaseSummaries[0].taskKeys[0]];
   assert.ok(frame.bodyLines[done.start].startsWith('\x1b[9;90m'));
   assert.equal(frame.lines[frame.bodyStart + active.start - frame.scroll], frame.bodyLines[active.start]);

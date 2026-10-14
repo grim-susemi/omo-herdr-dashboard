@@ -13,6 +13,7 @@ export const messages = {
     invalidBinding: 'CLI and Todo role state do not match.',
     cacheError: 'Invalid derived Todo cache.',
     prefsError: 'View preferences: {error}', registrationError: 'Viewer ownership was not verified.',
+    stateMissing: 'Role state is missing.',
   },
   ko: {
     closedPhases: '닫힌 단계 ({count})', controlsNarrow: 'j/k a/z c q',
@@ -28,6 +29,7 @@ export const messages = {
     invalidBinding: 'CLI와 Todo 역할 정보가 다릅니다.',
     cacheError: 'Todo 파생 캐시가 잘못되었습니다.',
     prefsError: '화면 설정: {error}', registrationError: '뷰어 소유권을 확인하지 못했습니다.',
+    stateMissing: '역할 정보를 찾을 수 없습니다.',
   },
   'zh-cn': {
     closedPhases: '已关闭阶段 ({count})', controlsNarrow: 'j/k a/z c q',
@@ -43,6 +45,7 @@ export const messages = {
     invalidBinding: 'CLI 与 Todo 角色信息不匹配。',
     cacheError: 'Todo 派生缓存无效。',
     prefsError: '视图设置: {error}', registrationError: '无法验证查看器所有权。',
+    stateMissing: '找不到角色状态。',
   },
 };
 

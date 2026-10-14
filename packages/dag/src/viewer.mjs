@@ -65,7 +65,38 @@ function roleControl(type, state, paneId, launchToken) {
   });
 }
 
-export async function runViewer() {
+const displayClock = {
+  now: () => Date.now(), setInterval, clearInterval, setTimeout, clearTimeout,
+};
+export function createAnimation(draw, clock = displayClock) {
+  let timer, frame = 0;
+  return {
+    get frame() { return frame; },
+    update(state) {
+      const running = state?.connected && (state.tasks?.some(task => task.status === 'running') ||
+        state.runs?.some(run => run.nodes.some(node => node.state === 'running')));
+      if (running && timer === undefined) timer = clock.setInterval(() => { frame++; draw(); }, 125);
+      if (!running && timer !== undefined) { clock.clearInterval(timer); timer = undefined; }
+    },
+    stop() { if (timer !== undefined) clock.clearInterval(timer); timer = undefined; },
+  };
+}
+// Read failures are transport gaps, not authoritative task completion. A fresh
+// snapshot cancels the grace; identity and presence errors bypass it.
+export function createReadGrace(report, clock = displayClock) {
+  let timer, latest;
+  return {
+    fail(error) {
+      latest = error;
+      if (timer === undefined) timer = clock.setTimeout(() => {
+        timer = undefined; report(latest);
+      }, 2000);
+    },
+    clear() { if (timer !== undefined) clock.clearTimeout(timer); timer = undefined; latest = undefined; },
+  };
+}
+
+export async function runViewer({ clock = displayClock } = {}) {
 const file = process.argv[process.argv.indexOf('--state') + 1];
 if (!process.argv.includes('--state') || !file) throw new Error('Usage: node viewer.mjs --state PATH');
 const fixedView = process.argv.includes('--view') ? process.argv[process.argv.indexOf('--view') + 1] : undefined;
@@ -93,6 +124,8 @@ let follow = true, target, lastFrame, dragY, disposeFocus;
 let presenceClient, presenceMessage, presenceKey, controlKey, presenceNotice = '';
 let retirementServer;
 const retirementSockets = new Set();
+const animation = createAnimation(draw, clock);
+const readGrace = createReadGrace(message => { error = message; draw(); }, clock);
 function bindPresence() {
   if (!fixedView || !interactive || !launchToken || !validManaged(state)) return;
   const control = JSON.stringify(state.controlOffer);
@@ -152,6 +185,7 @@ await restorePreferences();
 const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
 function draw() {
   if (closing) return;
+  if (interactive) animation.update(state);
   if (!error) target = runningTarget(!fixedView ? state : fixedView === 'dag' ?
     { ...state, tasks: [] } : { ...state, runs: [], tasks: standaloneTasks(state) }, target);
   const running = !error && follow && state?.connected ? target : undefined;
@@ -174,7 +208,7 @@ function draw() {
     offline: Boolean(presenceKey && !presenceMessage),
     error, notice: viewError ? t(state?.language, 'viewError', { error: viewError }) : presenceNotice, completedExpanded,
     selectedNodeId: selectedNodes.get(selectedId), selectedTaskId, view, viewState, verbose, revealSelection, follow,
-    runningNodeId: running?.nodeId, runningTaskId: running?.taskId };
+    runningNodeId: running?.nodeId, runningTaskId: running?.taskId, frame: animation.frame, now: clock.now() };
   const result = fixedView ? renderFixedFrame(state, options, fixedView) : renderFrame(state, options);
   lastFrame = result;
   scroll = result.scroll;
@@ -195,9 +229,11 @@ async function refresh() {
   try {
     const next = await readJson(file);
     if (next) {
-      if (fixedView && launchToken && !validManaged(next)) throw new Error('Managed viewer launch identity changed');
+      if (fixedView && launchToken && !validManaged(next)) {
+        throw Object.assign(new Error('Managed viewer launch identity changed'), { code: 'VIEWER_IDENTITY' });
+      }
       const sessionChanged = next.sessionId !== state?.sessionId || fixedView && !sameScope(next, state);
-      state = next; error = '';
+      readGrace.clear(); state = next; error = '';
       if (sessionChanged) {
         await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0;
         selectedId = state?.runs?.[0]?.id; completedExpanded = false;
@@ -207,9 +243,13 @@ async function refresh() {
       }
       bindPresence();
     }
-    else error = t(state?.language, 'stateMissing');
-  } catch (cause) { error = cause.message; }
-  draw(); drawing = false;
+    else readGrace.fail(t(state?.language, 'stateMissing'));
+  } catch (cause) {
+    if (cause.code === 'VIEWER_IDENTITY') { readGrace.clear(); error = cause.message; }
+    else readGrace.fail(cause.message);
+  }
+  finally { drawing = false; }
+  draw();
   if (again) { again = false; void refresh(); }
 }
 if (process.argv.includes('--once') || !interactive) { draw(); process.exit(0); }
@@ -219,20 +259,21 @@ process.stdin.resume();
 process.stdin.setEncoding('utf8');
 const watcher = watch(dirname(file), (_event, name) => {
   if (name && String(name) !== basename(file)) return;
-  clearTimeout(timer); timer = setTimeout(() => { void refresh(); }, 40);
+  clock.clearTimeout(timer); timer = clock.setTimeout(() => { void refresh(); }, 40);
 });
 watcher.on('error', cause => { error = cause.message; draw(); });
 const resize = () => draw();
 process.stdout.on('resize', resize);
-// Advance only the display clock. Snapshot reads remain driven by fs.watch.
-const clock = setInterval(() => {
-  if (fixedView && presenceMessage || state?.connected && (state.tasks?.some(task => task.status === 'running') ||
-      state.runs?.some(run => run.nodes.some(node => node.state === 'running')))) draw();
-}, 1000);
+// Keep presence paint acknowledgements alive even when there is no running work.
+// Animation is a separate running-only clock; neither timer reads snapshots.
+const presenceClock = fixedView ? clock.setInterval(() => {
+  if (fixedView && presenceMessage) draw();
+}, 1000) : undefined;
 async function close(closePane = false) {
   if (closing) return;
   closing = true;
-  clearTimeout(timer); clearInterval(clock); watcher.close(); process.stdout.off('resize', resize);
+  clock.clearTimeout(timer); clock.clearInterval(presenceClock); animation.stop(); readGrace.clear();
+  watcher.close(); process.stdout.off('resize', resize);
   presenceClient?.destroy();
   disposeInput();
   disposeFocus?.();

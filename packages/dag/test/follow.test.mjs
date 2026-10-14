@@ -128,7 +128,7 @@ test('standalone follow reveals the running card without changing selection; dis
     const frame = renderFrame(state, { rows: 18, columns: 35, color: true, language, selectedTaskId: 'a', runningTaskId: 'z', now: 1000 });
     assert.ok(frame.scroll > 0 && frame.scroll <= frame.taskRanges.z.start);
     assert.ok(frame.text.includes('TASK_z'));
-    assert.ok(!frame.text.includes('> ● TASK_z'));
+    assert.ok(!frame.text.includes('> ⠋ TASK_z'));
     assert.ok(frame.text.includes(messages[language].followShortOn));
     assert.ok(frame.text.split('\n').every(line => width(line) < 35));
     const disconnected = renderFrame({ ...state, connected: false }, { rows: 80, columns: 54, color: false, language, now: 1000 });

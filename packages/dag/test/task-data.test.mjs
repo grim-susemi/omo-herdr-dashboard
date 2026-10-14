@@ -86,7 +86,7 @@ test('durable category and resolved model provide real metadata without fabricat
   const task = normalizeTask(record('st_category', { category: 'deep', model: 'opencodex/gpt-6-astra',
     resolved_model: { provider: 'opencodex', model_id: 'gpt-6-astra', display: 'gpt-6-astra (opencodex)', source: 'category' } }));
   assert.equal(task.agent, 'deep');
-  assert.equal(task.model, 'gpt-6-astra (opencodex)');
+  assert.equal(task.model, 'gpt-6-astra');
   assert.equal(normalizeTask(record('st_agent', { agent_type: 'explore', category: 'deep' })).agent, 'explore');
   assert.equal(normalizeTask(record('st_missing')).agent, undefined);
   assert.equal(normalizeTask(record('st_missing')).model, undefined);

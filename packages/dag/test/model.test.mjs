@@ -47,11 +47,11 @@ test('running cards show model liveness: phase, time since the last token, stall
   const run = normalizeRun({ run_id: 'dag', status: 'running', nodes: [
     { id: 'live', state: 'running', task_id: 'st_live' }, { id: 'done', state: 'completed', task_id: 'st_done' }], edges: [] });
   const dag = render({ connected: true, runs: [run], tasks: [live, done] }, { rows: 120, columns: 80, color: false, now });
-  assert.match(dag, /● Running ✎ now …\S*/);
+  assert.match(dag, /⠋ Running ✎ now …\S*/);
   assert.doesNotMatch(dag, /DONE_TAIL/);
   const stalled = { ...live, activity: activity('text', { text: 'LAST' }, 45000) };
   const colored = render({ connected: true, runs: [run], tasks: [stalled, done] }, { rows: 120, columns: 80, color: true, now });
-  assert.ok(colored.includes('\x1b[33m● Running ⚠ possibly stalled'));
+  assert.ok(colored.includes('\x1b[33m⠋ Running ⚠ possibly stalled'));
   for (const columns of [12, 20, 35, 54, 120]) for (const line of render({ connected: true, runs: [run], tasks: [live, done] },
     { columns, rows: 48, color: true, now, selectedNodeId: 'live' }).split('\n')) assert.ok(width(line) < columns, `${columns}: ${line}`);
   assert.equal(fitTail('abcdef', 4), '…def');
@@ -157,12 +157,12 @@ test('compact cards share five safe lines, localized counts, selected-only detai
   const card = (frame, id, kind = 'taskRanges') => frame.text.split('\n').slice((kind === 'taskRanges' ? 2 : 3) + frame[kind][id].start, (kind === 'taskRanges' ? 2 : 3) + frame[kind][id].end);
   const compact = renderFrame(state, options);
   const lines = card(compact, 'root-id');
-  assert.equal(lines.length, 12, 'five root lines and five explicit child lines plus borders');
-  assert.match(lines[1], /> ● ROOT_DESCRIPTION/);
+  assert.equal(lines.length, 13, 'five root lines, subtask divider, five child lines and borders');
+  assert.match(lines[1], /> ⠋ ROOT_DESCRIPTION/);
   assert.match(lines[2], /worker\/visual · gpt-5.4 \(high\)/);
   assert.match(lines[3], /PROGRESS_HEAD.*…/);
   assert.match(lines[4], /9m 5s · 20 turns · 65 tools/);
-  assert.match(lines[6], /↳ ✓ CHILD_DESCRIPTION/);
+  assert.match(lines[7], /↳ sub ✓ CHILD_DESCRIPTION/);
   assert.match(card(compact, 'other-id')[1], /× OTHER_DESCRIPTION/);
   assert.doesNotMatch(lines.join('\n'), /root-id|child-id|opencodex\/|PROGRESS_TAIL|2026-09-06/);
   assert.ok(!lines.join('\n').includes('\x1b'));
@@ -170,9 +170,10 @@ test('compact cards share five safe lines, localized counts, selected-only detai
   assert.match(card(korean, 'root-id')[4], /9분 5초 · 20턴 · 도구 65회/);
   const full = renderFrame(state, { ...options, verbose: true });
   const fullRoot = card(full, 'root-id').join('\n');
-  for (const token of ['root-id', 'PROGRESS_HEAD', 'PROGRESS_TAIL', '2026-09-06T00:00:00Z', 'opencodex/gpt-5.4']) assert.ok(fullRoot.includes(token), token);
+  for (const token of ['root-id', 'PROGRESS_HEAD', 'PROGRESS_TAIL', '2026-09-06T00:00:00Z', 'gpt-5.4']) assert.ok(fullRoot.includes(token), token);
+  assert.doesNotMatch(fullRoot, /opencodex\//);
   assert.equal(card(full, 'other-id').length, 7);
-  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 12);
+  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 13);
   const viewState = emptyViewState('session');
   setExpanded(viewState, TASK_SCOPE, 'root-id', false);
   const saved = structuredClone(viewState);
@@ -201,7 +202,7 @@ test('compact cards share five safe lines, localized counts, selected-only detai
   for (const columns of [8, 20, 35, 54, 80]) for (const color of [false, true]) {
     const narrow = renderFrame(state, { ...options, columns, color, selectedNodeId: 'node' });
     assert.ok(narrow.text.split('\n').every(line => width(line) < columns));
-    assert.equal(card(narrow, 'node', 'nodeRanges').length, 12);
+    assert.equal(card(narrow, 'node', 'nodeRanges').length, 13);
   }
 });
 
@@ -427,11 +428,11 @@ test('elapsed duration follows explicit descendants without borrowing the parent
     { id: 'unknown', parentTaskId: 'parent', startedAt: '2026-09-06T00:01:00Z' },
   ] };
   const frame = render(state, { now: Date.parse('2026-09-06T00:02:03Z'), color: false, rows: 100, viewState: { expanded: { '["r","a"]': true } } });
-  const interior = frame.split('\n').filter(line => line.startsWith('│')).slice(-15);
+  const interior = frame.split('\n').filter(line => line.startsWith('│')).slice(-16);
   assert.match(interior[3], /2m 3s/);
-  assert.match(interior[8], /1m 3s/);
-  assert.match(interior[13], /^│\s+│$/);
-  assert.doesNotMatch(interior[13], /1m 3s|2m 3s/);
+  assert.match(interior[9], /1m 3s/);
+  assert.match(interior[14], /^│\s+│$/);
+  assert.doesNotMatch(interior[14], /1m 3s|2m 3s/);
 });
 
 test('DAG colors use theme ANSI and not fixed light-gray indexes', () => {

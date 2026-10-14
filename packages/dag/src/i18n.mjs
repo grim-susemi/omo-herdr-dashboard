@@ -1,5 +1,6 @@
 export const messages = {
   en: {
+    subtask: 'sub', subtasksCount: 'Subtasks ({count})',
     completedTasks: 'Completed tasks ({count})',
     followShortOn: 'Follow ON', followShortOff: 'Follow OFF', liveShort: 'LIVE', offlineShort: 'OFFLINE',
     workerGroupKeys: 'j/k c Done tasks', dagGroupKeys: 'j/k ←→ c Done runs', detailCloseKeys: 'd Details q Close',
@@ -46,6 +47,7 @@ export const messages = {
     activation: 'Start a new OmO session or run /reload',
   },
   ko: {
+    subtask: '하위', subtasksCount: '하위 작업 ({count})',
     completedTasks: '완료 작업 ({count})',
     followShortOn: '추적 ON', followShortOff: '추적 OFF', liveShort: '연결', offlineShort: '오프라인',
     workerGroupKeys: 'j/k c 완료작업', dagGroupKeys: 'j/k ←→ c 완료실행', detailCloseKeys: 'd 상세 q 닫기',
@@ -92,6 +94,7 @@ export const messages = {
     activation: '새 OmO 세션 또는 /reload',
   },
   'zh-cn': {
+    subtask: '子任务', subtasksCount: '子任务（{count}）',
     completedTasks: '已完成任务（{count}）',
     followShortOn: '跟随 ON', followShortOff: '跟随 OFF', liveShort: '在线', offlineShort: '离线',
     workerGroupKeys: 'j/k c 完成任务', dagGroupKeys: 'j/k ←→ c 完成流程', detailCloseKeys: 'd 详情 q 关闭',

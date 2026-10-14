@@ -167,7 +167,7 @@ for (const view of ['dag', 'tasks']) for (const [columns, rows] of [[52, 23], [3
     const range = view === 'dag' ? frame.graphRanges.first : frame.taskRanges.st_ordinary;
     const visible = lines.slice(frame.bodyStart + Math.max(0, range.start - frame.scroll),
       frame.bodyStart + Math.min(frame.bodyRows, range.end - frame.scroll)).join('\n');
-    assert.match(visible, /●/);
+    assert.match(visible, /⠋/);
     assert.ok(lines.every(line => width(line) < columns));
     assert.doesNotMatch(frame.text, /n\/p|Space\/Enter|j\/k|Tab\/n|^f /m);
   });
