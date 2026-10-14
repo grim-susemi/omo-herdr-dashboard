@@ -36,18 +36,18 @@ test('workers viewport suppresses a border-only card edge without changing task 
   const source = {...state, runs:[], tasks:[
     {id:'active',status:'running',description:'ACTIVE',progress:'PROGRESS'},
     {id:'next',status:'pending',description:'NEXT'}]};
-  const frame = renderFixedFrame(source,{columns:80,rows:12,color:false,
+  const frame = renderFixedFrame(source,{columns:80,rows:8,color:false,
     selectedTaskId:'active'},'tasks');
-  assert.deepEqual(frame.taskRanges.active,{start:0,end:7});
-  assert.deepEqual(frame.taskRanges.next,{start:8,end:11});
+  assert.deepEqual(frame.taskRanges.active,{start:0,end:4});
+  assert.deepEqual(frame.taskRanges.next,{start:4,end:7});
   assert.equal(frame.bodyStart, 2);
   const body=frame.text.split('\n').slice(frame.bodyStart, frame.bodyStart + frame.bodyRows);
-  assert.match(body[6], /^╰/);
-  assert.equal(body[7], '');
-  assert.equal(body[8], '');
-  const colored = renderFixedFrame(source,{columns:80,rows:12,color:true,
+  assert.equal(body.length, 5);
+  assert.match(body[3], /^╰/);
+  assert.equal(body[4], '');
+  const colored = renderFixedFrame(source,{columns:80,rows:8,color:true,
     selectedTaskId:'active'},'tasks');
-  assert.equal(colored.text.split('\n')[10], '');
+  assert.equal(colored.text.split('\n')[6], '');
   const bottomOnly=renderFixedFrame(source,{columns:80,rows:7,color:false,scroll:6},'tasks');
   assert.equal(bottomOnly.text.split('\n')[2],'');
   assert.deepEqual(bottomOnly.taskRanges,frame.taskRanges);
@@ -124,7 +124,7 @@ test('completed ordinary roots shrink to unboxed summaries while manual expansio
   const expanded = renderFixedFrame(sample, { columns: 80, rows: 60, color: false,
     viewState: { expanded: { '[null,"done"]': true } } }, 'tasks');
   assert.match(expanded.text, /DETAIL_PROGRESS/);
-  assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 7);
+  assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 4);
 });
 
 test('completed group keeps canonical counts and selected hidden summary reachable', () => {

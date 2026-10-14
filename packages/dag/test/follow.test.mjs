@@ -16,7 +16,7 @@ test('execution colors emphasize unselected graph and task titles, borders and s
     assert.ok(graph[0].startsWith(`\x1b[${color}m╭`), id);
     assert.ok(graph[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
     assert.ok(graph[2].includes(`\x1b[${color}m`), id);
-    assert.ok(graph[4].startsWith(`\x1b[${color}m╰`), id);
+    assert.ok(graph[3].startsWith(`\x1b[${color}m╰`), id);
     assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
     assert.ok(card[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
     assert.ok(card.at(-1).startsWith(`\x1b[${color}m╰`), id);

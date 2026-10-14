@@ -85,8 +85,13 @@ function modelLabel(task, columns = Infinity) {
 }
 const colors = { running: '36', completed: '32', failed: '31', blocked: '33', paused: '33', scheduled: '36', error: '31' };
 const accent = '36';
+// Dim marks wrapped rows. Both marks measure one cell in width() and in a Herdr pane.
+const dim = '2', wrapMark = '┆', timeMark = '⧖';
 const paint = (text, color, enabled, heading = false) => enabled && (color || heading) ?
   `\x1b[${heading ? `1${color ? `;${color}` : ''}` : color}m${text}\x1b[0m` : text;
+// Colour a known run inside an already sized plain line without changing its width.
+const paintAt = (line, at, text, color, enabled) => enabled && line.startsWith(text, at) ?
+  `${line.slice(0, at)}${paint(text, color, enabled)}${line.slice(at + text.length)}` : line;
 const taskStatuses = new Set([...Object.keys(icons), 'error', 'interrupted', 'lost']);
 
 export function standaloneTasks(state) {
@@ -157,7 +162,9 @@ export function graphLines(run, columns, color = true, language = 'en', { select
         ];
       });
       output.push(prefix + group.map(node => paint(`╭${'─'.repeat(Math.max(0, boxWidth - 2))}╮`, colors[node.state], color)).join('  '));
-      for (let line = 0; line < 3; line++) output.push(prefix + group.map((node, i) =>
+      // The incoming row is dropped when no node of the group has dependencies to show.
+      const contentRows = interiors.some(interior => interior[2].trim()) ? 3 : 2;
+      for (let line = 0; line < contentRows; line++) output.push(prefix + group.map((node, i) =>
         `${paint('│', colors[node.state], color)} ${paint(interiors[i][line], line === 1 && stalledNodes.has(node.id) ? colors.paused : line < 2 ? colors[node.state] : undefined, color, line === 0)} ${paint('│', colors[node.state], color)}`).join('  '));
       output.push(prefix + group.map(node => paint(`╰${'─'.repeat(Math.max(0, boxWidth - 2))}╯`, colors[node.state], color)).join('  '));
       if (graphRanges) for (const node of group) graphRanges[node.id] = { start, end: output.length };
@@ -168,24 +175,31 @@ export function graphLines(run, columns, color = true, language = 'en', { select
   return output;
 }
 
+// Continuation rows keep the hanging indent; the wrap mark sits inside it when it fits.
+const wrapLead = prefix => {
+  const indent = width(prefix);
+  return `${' '.repeat(indent >= 2 ? indent - 2 : indent)}${wrapMark} `;
+};
 // Wrap at word boundaries when possible, never dropping the tail of task text.
 function wrap(text, columns, prefix = '') {
-  columns = Math.max(1, columns - width(prefix));
+  const first = Math.max(1, columns - width(prefix));
+  const rest = Math.max(1, columns - width(wrapLead(prefix)));
   const result = [];
   let line = '';
   for (const { segment } of segmenter.segment(clean(text))) {
-    if (line && width(line + segment) > columns) {
+    if (line && width(line + segment) > (result.length ? rest : first)) {
       const space = line.lastIndexOf(' ');
       if (space > 0 && segment !== ' ') {
         result.push(line.slice(0, space));
         line = line.slice(space + 1);
       } else { result.push(line); line = ''; }
-      if (line && width(line + segment) > columns) { result.push(line); line = ''; }
+      if (line && width(line + segment) > rest) { result.push(line); line = ''; }
     }
-    line += segment;
+    // A break consumes the space it happens at, so no row starts with one.
+    if (line || segment !== ' ' || !result.length) line += segment;
   }
-  result.push(line);
-  return result.map((line, index) => `${index ? ' '.repeat(width(prefix)) : prefix}${line}`);
+  if (line || !result.length) result.push(line);
+  return result.map((line, index) => `${index ? wrapLead(prefix) : prefix}${line}`);
 }
 
 function elapsedTime(task, { now, connected, updatedAt }, status) {
@@ -257,16 +271,16 @@ function taskLines(task, language, timing, nodeStatus, columns) {
   return lines;
 }
 
-function compactTaskLines(task, language, timing, columns, { selected = false, node, depth = 0, collapsed = false } = {}) {
+function compactTaskLines(task, language, timing, columns, { selected = false, node, depth = 0, collapsed = false, color = false } = {}) {
   const value = text => text === undefined || text === null || text === '' ? '-' : clean(text);
   const status = node?.state ?? task?.status;
   const duration = task ? elapsedTime(task, timing, status) : null;
   let elapsed = '';
   if (duration !== null) {
     const [hours, minutes, seconds] = duration.split(':').map(Number);
-    elapsed = [hours ? t(language, 'compactHours', { count: hours }) : '',
+    elapsed = `${timeMark} ${[hours ? t(language, 'compactHours', { count: hours }) : '',
       hours || minutes ? t(language, 'compactMinutes', { count: minutes }) : '',
-      t(language, 'compactSeconds', { count: seconds })].filter(Boolean).join(' ');
+      t(language, 'compactSeconds', { count: seconds })].filter(Boolean).join(' ')}`;
   }
   const stats = elapsed ? [elapsed] : [];
   for (const [key, label] of [['turns', 'compactTurns'], ['toolCalls', 'compactTools']]) {
@@ -275,13 +289,14 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const room = Math.max(1, columns - 4);
   const indent = '  '.repeat(Math.min(depth, Math.max(0, Math.floor((room - 12) / 2))));
   const marker = depth ? `↳ ${t(language, 'subtask')}` : selected ? '>' : ' ';
-  const identity = [task?.agent, task?.category].filter(Boolean).map(clean).join('/');
-  const modelRoom = room - width(indent) - (identity ? width(identity) + 3 : 0);
-  // If the identity would crowd out model:effort, give the model its own line.
-  const metadata = task?.model && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2 ?
-    `${indent}${modelLabel(task, room - width(indent))}` :
-    `${indent}${[identity, task?.model ? modelLabel(task, modelRoom) : ''].filter(Boolean).join(' · ')}`;
-  return [
+  const identity = [task?.agent, task?.category].map(part => clean(part).trim()).filter(Boolean).join('/');
+  const badge = identity ? `[${fit(identity, Math.max(1, room - width(indent) - 2))}]` : '';
+  const modelRoom = room - width(indent) - (badge ? width(badge) + 1 : 0);
+  // If the role badge would crowd out model:effort, the badge keeps its own row and the model follows it.
+  const modelOwnRow = Boolean(task?.model) && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2;
+  const metadata = modelOwnRow ? `${indent}${badge}` :
+    `${indent}${[badge, task?.model ? modelLabel(task, modelRoom) : ''].filter(Boolean).join(' ')}`;
+  const lines = [
     `${indent}${marker} ${statusIcon(status, timing.frame)} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`,
     metadata,
     `${indent}${task?.progress || node?.error ? clean(task?.progress || node.error) : ''}`,
@@ -294,6 +309,11 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
     const rest = room - width(head) - 3;
     return activity.text && rest >= 4 ? `${head} · ${fitTail(activity.text, rest)}` : fit(head, room);
   });
+  // Colour the badge only after sizing, and only when it survived intact.
+  lines[1] = paintAt(lines[1], indent.length, badge, accent, color && Boolean(badge));
+  if (modelOwnRow) lines.splice(2, 0, fit(`${indent}${modelLabel(task, room - width(indent))}`, room));
+  // Card height follows content: rows with nothing after the indent are dropped.
+  return lines.filter((line, index) => !index || line.trim());
 }
 
 function taskDescendants(task, tasks) {
@@ -317,12 +337,12 @@ export function completedTasks(state) {
       terminal.has(child.status) && !['failed', 'error', 'lost'].includes(child.status)));
 }
 
-function descendantLines(task, tasks, language, timing, columns) {
+function descendantLines(task, tasks, language, timing, columns, color) {
   const descendants = taskDescendants(task, tasks);
   const title = fit(`─ ${t(language, 'subtasksCount', { count: descendants.length })} `, columns - 4);
   return descendants.length ? [title + '─'.repeat(Math.max(0, columns - 4 - width(title))),
     ...descendants.flatMap(({ task: child, depth }) =>
-      compactTaskLines(child, language, timing, columns, { depth }))] : [];
+      compactTaskLines(child, language, timing, columns, { depth, color }))] : [];
 }
 
 function detailBox(text, columns, color, status, label) {
@@ -331,21 +351,26 @@ function detailBox(text, columns, color, status, label) {
   const title = label !== undefined && columns >= 7 ? `─ ${fit(label, columns - 6)} ` : '';
   return [paint(`╭${title}${'─'.repeat(Math.max(0, columns - 2 - width(title)))}╮`, border, color),
     ...text.flatMap((line, index) => {
+      // Rows coloured by compactTaskLines are already sized to the card.
+      if (line.includes('\x1b')) return [`${paint('│', border, color)} ${line}${' '.repeat(Math.max(0, inner - width(line)))} ${paint('│', border, color)}`];
       const colon = line.indexOf(': ');
       const prefix = index > 0 && colon >= 0 && width(line.slice(0, colon + 2)) <= inner - 4 ?
         line.slice(0, colon + 2) : line.match(/^\s*/u)[0];
-      return wrap(line.slice(prefix.length), inner, prefix).map(part =>
-        `${paint('│', border, color)} ${paint(fit(part, inner, true), index === 0 ? border : undefined, color, index === 0)} ${paint('│', border, color)}`);
+      return wrap(line.slice(prefix.length), inner, prefix).map((part, row) => {
+        const body = fit(part, inner, true);
+        const marked = row ? paintAt(body, wrapLead(prefix).length - 2, wrapMark, dim, color) : body;
+        return `${paint('│', border, color)} ${paint(marked, index === 0 ? border : undefined, color, index === 0)} ${paint('│', border, color)}`;
+      });
     }),
     paint(`╰${'─'.repeat(Math.max(0, columns - 2))}╯`, border, color)];
 }
 
 function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
   const detailed = selected && verbose;
-  const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded && !detailed });
+  const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded && !detailed, color });
   const text = detailed ? [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${statusIcon(node.state, timing.frame)} ${t(language, node.state)}`] : []),
     ...taskLines(task, language, timing, node?.state, columns)] : expanded ? compact : compact.slice(0, 1);
-  if (expanded || detailed) text.push(...descendantLines(task, tasks, language, timing, columns));
+  if (expanded || detailed) text.push(...descendantLines(task, tasks, language, timing, columns, color));
   return compactCompleted && !expanded && !detailed ? [paint(fit(compact[0], columns), colors[task?.status], color)] :
     detailBox(text, columns, color, node?.state ?? task?.status, node?.label ?? node?.id);
 }
@@ -398,7 +423,6 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       const expanded = typeof explicit === 'boolean' ? explicit :
         protectedParent || isExpanded(viewState, TASK_SCOPE, task.id, task.status);
       if (compactCompleted && !completedExpanded && !expanded && task.id !== selectedTaskId) continue;
-      if (body.length && body.at(-1) !== '') body.push('');
       const start = body.length;
       body.push(...taskCard(task, state?.tasks ?? [], columns, color, language,
         { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },
@@ -430,7 +454,6 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     for (const edge of run.edges) body.push(`  ${clean(edge.from)} → ${clean(edge.to)}`);
     body.push('', paint(t(language, 'details'), accent, color, true));
     for (const node of run.nodes) {
-      body.push('');
       const start = body.length;
       body.push(...taskCard(state?.tasks?.find(task => task.id === node.taskId), state?.tasks ?? [], columns, color, language,
         { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },

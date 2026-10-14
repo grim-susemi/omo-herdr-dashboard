@@ -136,13 +136,13 @@ test('real PTY compact cards expose full selected progress with d without persis
     () => viewer.send({ resize: [32, 80] }));
   assert.equal(initial.split('\n').filter(line => line.startsWith('╭')).length, 3);
   const interiors = initial.split('\n').filter(line => line.startsWith('│'));
-  assert.equal(interiors.length, 15);
-  assert.match(interiors[1], /worker\/visual · gpt-6-astra \(opencodex\)/);
+  assert.equal(interiors.length, 7);
+  assert.match(interiors[1], /\[worker\/visual\] gpt-6-astra \(opencodex\)/);
   assert.match(interiors[2], /PROGRESS_HEAD.*…/);
   assert.match(interiors[3], /9분 5초 · 20턴 · 도구 65회/);
-  assert.match(interiors[5], /× SECOND_COMPACT/);
-  assert.match(interiors[10], /\? -/);
-  assert.equal(interiors[11].replace(/[│ ]/g, ''), '');
+  assert.match(interiors[4], /× SECOND_COMPACT/);
+  assert.match(interiors[6], /\? -/);
+  assert.ok(interiors.every(line => line.replace(/[│ ]/g, '')));
   assert.doesNotMatch(initial, /a-full-id|b-full-id|c-full-id|PROGRESS_TAIL|2026-09-06|opencodex\//);
   await viewer.frame(text => text.split('\n').length === 50, () => viewer.send({ resize: [50, 80] }));
   const full = await viewer.frame(text => text.includes('PROGRESS_TAIL'), () => viewer.send({ keys: 'd' }));
@@ -173,7 +173,7 @@ test('real PTY compact cards expose full selected progress with d without persis
   await viewer.close();
   assert.deepEqual(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded, { ...expanded, '[null,"a-full-id"]': true });
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
-  console.log('Compact PTY evidence: three five-line cards including metrics, description/status, provider suffix, Korean counts, ellipsis, full progress/times, d on/off, selection reset, collapsed peek, restart without verbose persistence.');
+  console.log('Compact PTY evidence: three content-height cards including metrics, description/status, provider suffix, Korean counts, ellipsis, full progress/times, d on/off, selection reset, collapsed peek, restart without verbose persistence.');
 });
 
 test('real PTY invalid preferences show folded cards without overwriting corrupt preferences', { timeout: 15000 }, async t => {
@@ -226,7 +226,7 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   const check = async (expanded, action, verbose = false) => {
     const text = await verifiedFrame(expanded, verbose, action);
     if (!verbose) assert.equal(text.split('\n').filter(line => line.startsWith('│')).length,
-      expanded ? 5 : !dag && task.status === 'completed' ? 0 : 1);
+      expanded ? 2 : !dag && task.status === 'completed' ? 0 : 1);
     return text;
   };
   const transition = async (status, expanded, verbose = false) => {
@@ -437,7 +437,7 @@ test('real viewer PTY selects, toggles, refreshes, switches runs and persists ac
   assert.ok(!collapsed.includes('ALPHA_PROGRESS'));
   await viewer.frame(text => text.includes(`${messages.en.task}: ta`) && text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => includesRunning(text, '[+] ALPHA_DESCRIPTION') && !text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: 'd' }));
-  await viewer.frame(text => text.split('\n').length === 40, () => viewer.send({ resize: [40, 80] }));
+  await viewer.frame(text => text.split('\n').length === 35, () => viewer.send({ resize: [35, 80] }));
   state.runs[0].nodes.reverse();
   state.runs[0].nodes.find(node => node.id === 'a').taskId = 'retry';
   state.runs[0].nodes.push({ id: 'c', label: 'NEW_NODE', state: 'running', taskId: 'tc' });
