@@ -31,9 +31,23 @@ test('single extension migration backs up managed entries, preserves state, upda
     assert.equal(await readFile(join(agent, `herdr-${component}/retained.json`), 'utf8'), 'retained');
     assert.equal(JSON.parse(await readFile(join(first.integration, component, 'locale.json'))).language, 'ko');
   }
+  // Model the published layout: generation-000003 has no parent-slot module.
+  await rm(join(first.integration, 'todo/src/parent-slot.mjs'));
+  await assert.rejects(readFile(join(first.integration, 'todo/src/parent-slot.mjs')), { code: 'ENOENT' });
+  const wrapperBeforeUpgrade = await readFile(first.extension, 'utf8');
+  const pointerFile = join(agent, 'herdr-dashboard/integration/current.json');
+  const pointerBeforeUpgrade = await readFile(pointerFile, 'utf8');
+  const upgradePlan = run('--dry-run', '--lang', 'ko');
+  assert.equal(upgradePlan.backup, first.integration);
+  assert.equal(await readFile(first.extension, 'utf8'), wrapperBeforeUpgrade);
+  assert.equal(await readFile(pointerFile, 'utf8'), pointerBeforeUpgrade);
+  assert.equal((await readdir(join(agent, 'herdr-dashboard/integration'))).filter(file => file.startsWith('generation-')).length, 1);
   const next = run('--lang', 'ko');
   assert.notEqual(next.integration, first.integration);
   assert.equal(next.backup, first.integration);
+  assert.equal(await readFile(join(next.integration, 'todo/src/parent-slot.mjs'), 'utf8'),
+    await readFile(join(root, 'dist/todo/src/parent-slot.mjs'), 'utf8'));
+  await assert.rejects(readFile(join(first.integration, 'todo/src/parent-slot.mjs')), { code: 'ENOENT' });
   assert.equal(typeof (await import('../dist/extension.mjs')).default, 'function');
   const commands = new Map(), events = [];
   const previousState = Object.fromEntries(['OMO_HERDR_DAG_STATE_DIR', 'OMO_HERDR_TODO_STATE_DIR'].map(key => [key, process.env[key]]));

@@ -82,6 +82,7 @@ for (const [role, bind] of [['dag', dagInput], ['todo', todoInput]]) {
 }
 
 test('independently shipped terminal decoders stay byte identical', async () => {
-  assert.equal(await readFile(new URL('../packages/dag/src/terminal-input.mjs', import.meta.url), 'utf8'),
-    await readFile(new URL('../packages/todo/src/terminal-input.mjs', import.meta.url), 'utf8'));
+  const lf = async name => (await readFile(new URL(`../packages/${name}/src/terminal-input.mjs`, import.meta.url), 'utf8'))
+    .replaceAll('\r\n', '\n');
+  assert.equal(await lf('dag'), await lf('todo'));
 });

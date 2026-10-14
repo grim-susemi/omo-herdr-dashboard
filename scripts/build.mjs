@@ -13,7 +13,8 @@ for (const component of ['todo', 'dag']) {
 }
 for (const file of ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md']) await cp(join(root, file), join(dist, file));
 await cp(join(root, 'scripts/install.mjs'), join(dist, 'install.mjs'));
-for (const file of ['extension.mjs', 'install.mjs', 'todo/extension.mjs', 'dag/extension.mjs']) {
+for (const file of ['extension.mjs', 'install.mjs', 'todo/extension.mjs', 'dag/extension.mjs',
+  'todo/src/parent-slot.mjs', 'todo/src/terminal-input.mjs', 'dag/src/terminal-input.mjs']) {
   await readFile(join(dist, file));
   execFileSync(process.execPath, ['--check', join(dist, file)], { stdio: 'inherit' });
 }

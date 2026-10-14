@@ -96,6 +96,7 @@ async function setup(t) {
     return {};
   };
   const options = { sessionId, parentPane: 'qa:parent', socket: 'qa:socket', stateDir: directory,
+    managedStateDir: join(directory, 'uncreated-managed-state'),
     cwd: directory, taskStateDir: join(directory, 'native-source'), node: 'node', viewer: join(directory, 'viewer.mjs'),
     herdr, notify: message => warnings.push(message),
     inspectShell: async pid => [{ ProcessId: pid, ExecutablePath: 'powershell.exe',

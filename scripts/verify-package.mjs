@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,15 +25,24 @@ try {
     execFileSync(process.execPath, ['--input-type=module', '--eval',
       `await import(${JSON.stringify(pathToFileURL(join(installed, 'dist', component, 'src/viewer.mjs')).href)})`],
     { env, cwd: consumer, stdio: 'pipe' });
-    const { readdir } = await import('node:fs/promises');
-    for (const file of ['extension.mjs', ...(await readdir(join(root, 'dist', component, 'src'))).filter(file => file.endsWith('.mjs')).map(file => 'src/' + file)]) {
+    const modules = component === 'todo' ?
+      ['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => file + '.mjs') :
+      (await readdir(join(root, 'packages', component, 'src'))).filter(file => file.endsWith('.mjs'));
+    for (const file of ['extension.mjs', ...modules.map(file => 'src/' + file)]) {
       assert.equal(sha(await readFile(join(installed, 'dist', component, file))), sha(await readFile(join(root, 'dist', component, file))));
+      assert.equal(sha(await readFile(join(installed, 'dist', component, file))), sha(await readFile(join(root, 'packages', component, file))));
       runtime++;
     }
   }
   const agent = join(fixture, 'agent');
   const result = JSON.parse(execFileSync(process.execPath, [join(installed, 'bin/omo-herdr-dashboard.mjs'), 'install', '--agent-dir', agent, '--lang', 'ko'], { env, encoding: 'utf8' }));
   assert.equal(result.installed, true);
+  for (const component of ['todo', 'dag']) {
+    for (const file of (await readdir(join(installed, 'dist', component, 'src'))).filter(file => file.endsWith('.mjs'))) {
+      assert.equal(sha(await readFile(join(result.integration, component, 'src', file))),
+        sha(await readFile(join(installed, 'dist', component, 'src', file))));
+    }
+  }
   const wrapper = await readFile(result.extension, 'utf8');
   assert.match(wrapper, /omo-herdr-dashboard/);
   console.log(JSON.stringify({ pass: true, archiveFiles: pack.files.length, runtimeModules: runtime, singleExtension: true, offlineInstall: true }));

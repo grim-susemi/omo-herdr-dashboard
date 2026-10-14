@@ -46,6 +46,7 @@ test('owned stacked migration keeps pane identities, preserves input selection a
     coordinator: { inspectTodo: async () => todo }, membership: async () => {}, verify: async () => true,
     placementFocus: async () => selected,
     restorePlacementFocus: async (_created, original) => { selected = original; },
+    mutate: (...args) => FixedDagPane.prototype.mutate.call(owner, ...args),
     herdr: async (...args) => {
       if (args[0] === 'layout') return { layout };
       mutations.push(args);

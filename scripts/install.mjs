@@ -39,11 +39,14 @@ export async function install(args) {
   const previous = pointerBefore === undefined ? undefined : JSON.parse(pointerBefore).generation;
   if (previous !== undefined && (!/^generation-\d{6}$/.test(previous) || await text(join(container, previous, '.installed-by')) !== marker)) throw Error('Invalid previous generation');
   const runtime = ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'todo/extension.mjs', 'dag/extension.mjs',
-    ...['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'presence', 'storage', 'viewer', 'render', 'i18n'].map(file => `todo/src/${file}.mjs`),
-    ...['controller', 'herdr', 'i18n', 'model', 'render', 'retention', 'runtime', 'storage', 'stream-tap', 'task-data', 'view-state', 'viewer'].map(file => `dag/src/${file}.mjs`)];
-  for (const file of runtime) {
-    await readFile(join(source, file));
-    if (previous) await readFile(join(container, previous, file));
+    ...['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => `todo/src/${file}.mjs`),
+    ...['controller', 'herdr', 'i18n', 'model', 'render', 'retention', 'runtime', 'storage', 'stream-tap', 'task-data', 'terminal-input', 'view-state', 'viewer'].map(file => `dag/src/${file}.mjs`)];
+  for (const file of runtime) await readFile(join(source, file));
+  if (previous) {
+    // An owned backup needs its entrypoints, not files introduced by this upgrade.
+    for (const file of ['extension.mjs', 'todo/extension.mjs', 'dag/extension.mjs']) {
+      await readFile(join(container, previous, file));
+    }
   }
   const legacy = [];
   for (const component of ['todo', 'dag']) {
