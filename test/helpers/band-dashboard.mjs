@@ -25,8 +25,11 @@ export async function readRecord(path) {
 // events: serve the Herdr layout.updated subscription on the socket path so the
 // Todo controller's membership/geometry watcher runs for real.
 // sessionId: the conversation; restart({ sessionId }) models a conversation change.
+// generation: the install generation of the viewer paths; restart({ generation })
+// models an install-generation upgrade that relaunches the live viewers.
+// hooks.after(args): runs after every native call took effect, before its reply.
 export async function createBandDashboard({ width = 172, height = 46, managed = true, events = false,
-  sessionId = 'session' } = {}) {
+  sessionId = 'session', generation: installed = '000004' } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-band-'));
   const socketPath = join(directory, 'herdr-socket');
   const pipePath = process.platform === 'win32' ? `\\\\.\\pipe\\${socketPath}` : socketPath;
@@ -37,7 +40,8 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     ExecutablePath: 'node', CommandLine: 'node controller', CreationDate: '2026-10-14T00:00:00.000Z' };
   const panes = new Map([['parent', { shell: shellRow(100) }]]);
   let fake = createSplitTreeHerdr({ tree: 'parent', area: { x: 0, y: 0, width, height }, focused: 'parent' });
-  let serial = 0, authority = false, todo, dag, actor, server, peer, session = sessionId;
+  let serial = 0, authority = false, todo, dag, actor, server, peer, session = sessionId, generation = installed;
+  let arrangements = 0;
   const subscribed = Promise.withResolvers();
   const inspectShell = async pid => {
     if (pid === process.pid) return [producerRow];
@@ -56,6 +60,7 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     const result = await fake.herdr(...args);
     if (args[0] === 'split') panes.set(result.pane.pane_id, { shell: shellRow(2000 + ++serial) });
     if (args[0] === 'close') panes.delete(args[1]);
+    await hooks.after?.(args);
     // A native effect that happened but whose reply was lost.
     if (hooks.lose?.(args)) throw Object.assign(new Error('transport completion lost'), { code: 'transport_error' });
     return result;
@@ -85,13 +90,13 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     todo = new TodoPane({ managed, stateDir: join(directory, 'todo'), cwd: directory, herdr, inspectShell,
       environment: { HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: 'parent' },
       ctx: { sessionManager: { getSessionId: () => session, getSessionFile: () => join(directory, `${session}.jsonl`) } },
-      node: 'node', viewer: join(directory, 'generation-000004', 'todo', 'viewer.mjs'),
+      node: 'node', viewer: join(directory, `generation-${generation}`, 'todo', 'viewer.mjs'),
       // A verified viewer retirement: the viewer exits and leaves its shell.
       retireViewer: async record => { delete panes.get(record.paneId).viewer; return { manual: false }; },
       notify: message => warnings.push(message) });
     dag = new FixedDagPane({ managedAvailable: managed, stateDir: join(directory, 'dag'), cwd: directory,
       socket: socketPath, parentPane: 'parent', sessionId: session, node: 'node', herdr, inspectShell,
-      viewer: join(directory, 'generation-000004', 'dag', 'viewer.mjs'), notify: message => warnings.push(message) });
+      viewer: join(directory, `generation-${generation}`, 'dag', 'viewer.mjs'), notify: message => warnings.push(message) });
     controllers.push(todo, dag);
     todo.scopeEpoch = dag.scopeEpoch = 1;
     // Per conversation, like the real scope cache under the owner directory.
@@ -107,12 +112,12 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     todo.provider = dag.provider();
     dag.coordinator = todo.coordinator();
     // Like the production dispatcher: the authorization is the last await before the native call.
-    if (managed) todo.mutate = (role, type, target, args) => todo.perform(role, type, target, async ({ authorize }) => {
+    if (managed) todo.mutate = (role, type, target, args, effect, beforeSubmit, check) => todo.perform(role, type, target, async ({ authorize }) => {
       const decide = await authorize();
       decide();
       authority = true;
       try { return { result: await herdr(...args), effects: Promise.resolve() }; } finally { authority = false; }
-    });
+    }, check);
     todo.launchTodo = async record => (await launch(todo, record)).paneId;
     dag.launchRole = record => launch(dag, record);
     // The real start() saves each source before scheduling; discovery needs the directories.
@@ -171,20 +176,38 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     },
     // A pane that exits outside the dashboard (not a dashboard mutation).
     async exitPane(paneId) { await fake.herdr('close', paneId); panes.delete(paneId); },
+    // A process the dashboard did not start replaces whatever runs in a pane's shell.
+    foreignProcess(paneId) {
+      const pane = panes.get(paneId), pid = 9000 + ++serial;
+      pane.viewer = { ProcessId: pid, ParentProcessId: pane.shell.ProcessId, Birth: `foreign-${pid}`,
+        ExecutablePath: 'foreign', CommandLine: 'foreign', CreationDate: '2026-10-15T00:00:00.000Z' };
+    },
     // A terminal resize; modelled for the empty tab before the first split only.
     resize(area) {
       if (fake.panes().length !== 1) throw new Error('resize is modelled for an unsplit tab only');
       fake = createSplitTreeHerdr({ tree: 'parent', area: { x: 0, y: 0, ...area }, focused: 'parent' });
     },
+    // A terminal resize of any tree: the splits keep their ratios (split-tree fake setArea).
+    resizeTerminal(area) { fake.setArea({ x: 0, y: 0, ...area }); },
+    // Fixture setup, not a dashboard mutation: the same panes placed in another
+    // split tree, as an older generation or the owner may have left them.
+    arrange(tree) {
+      const next = createSplitTreeHerdr({ tree, area: fake.layout().area, focused: fake.focused(),
+        idPrefix: `arranged${++arrangements}` });
+      if (JSON.stringify(next.panes().sort()) !== JSON.stringify(fake.panes().sort()))
+        throw new Error('arrange must place exactly the current panes');
+      fake = next;
+    },
     emitLayout() { peer.write(`${JSON.stringify({ event: 'layout_updated', data: { layout: fake.layout() } })}\n`); },
     // A controller restart after an interruption: the old lease is released
     // cooperatively and fresh controllers claim the same parent slot. A new
     // sessionId makes it a conversation change that keeps the live panes.
-    async restart({ sessionId: next } = {}) {
+    async restart({ sessionId: next, generation: upgrade } = {}) {
       const releasing = actor.release();
       await actor.drain('todo', todo.lifetimeId); await actor.drain('dag', dag.lifetimeId);
       await releasing;
       if (next) session = next;
+      if (upgrade) generation = upgrade;
       await createControllers();
     },
     async dispose() {

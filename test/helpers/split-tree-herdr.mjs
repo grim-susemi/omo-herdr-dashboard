@@ -202,5 +202,8 @@ export function createSplitTreeHerdr({ tree, area = { x: 0, y: 0, width: 100, he
     if (!Object.hasOwn(verbs, args[0])) throw fail('unknown_command', `unexpected native command: ${args[0]}`);
     return verb(args);
   };
-  return { herdr, layout, calls, panes: paneIds, focused: () => focus };
+  // A terminal resize: every split keeps its stored ratio and the rectangles are
+  // recomputed (an assumption; a live resize was not measured, task-1 section 6).
+  const setArea = next => { area = Object.fromEntries(keys.map(key => [key, next[key]])); };
+  return { herdr, layout, calls, panes: paneIds, focused: () => focus, setArea };
 }

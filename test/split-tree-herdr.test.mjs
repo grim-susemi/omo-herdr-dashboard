@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FixedDagPane, isColumnDashboard } from '../packages/dag/src/controller.mjs';
+import { FixedDagPane, isBandDashboard, isColumnDashboard } from '../packages/dag/src/controller.mjs';
 import { TodoPane, authoritativePaneNotFound } from '../packages/todo/src/controller.mjs';
 import { writeJson } from '../packages/dag/src/storage.mjs';
 import { createSplitTreeHerdr } from './helpers/split-tree-herdr.mjs';
@@ -273,13 +273,16 @@ test('the fake injects where the scripted fake is injected and drives the real m
   }
   dag.claim = { ...dag.binding, lifetimeId: todo.lifetimeId, tabId: 'tab', layout: 'columns' };
   assert.equal(isColumnDashboard(fake.layout(), ids), false);
+  // Converted by todo 7 (task-7-test-mapping.md): the managed placement now ends in
+  // the band. From Todo/workers/DAG stacked, the shortest suffix of the task-1
+  // sequence suffices: move workers right of the DAG, swap them, resize the row.
   await dag.arrangeDashboard();
-  assert.deepEqual(mutations.map(args => args[0]),
-    ['split', 'swap', 'close', 'split', 'swap', 'close', 'swap', 'split', 'swap', 'close', 'swap', 'resize']);
-  assert.deepEqual(mutations.at(-1), ['resize', '--pane', 'parent', '--direction', 'left', '--amount', '0.1']);
+  assert.deepEqual(mutations.map(args => args[0]), ['split', 'swap', 'close', 'swap', 'resize']);
+  assert.deepEqual(mutations.at(-1), ['resize', '--pane', 'dag', '--direction', 'left', '--amount', String(Math.abs(0.5 - 24 / 60))]);
   assert.equal(JSON.parse(await readFile(join(dag.directory, 'placement.json'))).phase, 'COMPLETE');
   const final = fake.layout();
-  assert.equal(isColumnDashboard(final, ids), true);
-  assert.equal(rectOf(final, 'parent').width, 40);
+  assert.equal(isBandDashboard(final, ids), true);
+  assert.equal(rectOf(final, 'parent').width, 40, 'the chat keeps its width');
+  assert.deepEqual(rectOf(final, 'workers'), { x: 40, y: 14, width: 24, height: 26 });
   assert.deepEqual(fake.panes(), ['parent', 'todo', 'workers', 'dag']);
 });

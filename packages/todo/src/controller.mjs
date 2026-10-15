@@ -1141,19 +1141,22 @@ export class TodoPane {
     return () => this.provider.decideAuthority(evidence, { role, chat, claim: this.claim?.layout }) ?? undefined;
   }
   async layoutGate(role, type, target, pass) { return (await this.layoutEvidence(role, type, target, pass))(); }
-  perform(role, type, target, dispatch) {
+  perform(role, type, target, dispatch, check) {
     const pass = passes.getStore();
     // The authority (r5/r6 A1): inside the parent-slot dispatch the dispatcher
     // (a) awaits authorize(), the gathering, as its LAST await, then in one
     // synchronous run (b) calls the returned decision and (c) issues herdr. A
-    // refusal is a known no-effect wait.
+    // refusal is a known no-effect wait. A placement step brings its own
+    // conditions (todo 7 A2: selection, chat, role identities, the tree it was
+    // decided on): gathered here as well, after every actor preparation, and
+    // decided in the same synchronous run.
     const authorize = async () => {
-      let decide;
-      try { decide = await this.layoutEvidence(role, type, target, pass); }
+      let decide, step;
+      try { decide = await this.layoutEvidence(role, type, target, pass); step = await check?.(); }
       catch (error) { decide = () => `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
       return () => {
         let refusal;
-        try { refusal = decide(); }
+        try { refusal = decide() || step?.(); }
         catch (error) { refusal = `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
         if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT', noEffect: true });
       };
@@ -1388,7 +1391,7 @@ export class TodoPane {
           participants !== JSON.stringify(actor.snapshot.participants)) throw blocked('arrange source lifetime changed');
       } };
   }
-  async mutate(role, type, target, args, observedEffect, beforeSubmit) {
+  async mutate(role, type, target, args, observedEffect, beforeSubmit, check) {
     if (!this.managed) return this.herdr(...args);
     return this.perform(role, type, target, async ({ operation, authorize }) => {
       let resolve, reject;
@@ -1443,7 +1446,7 @@ export class TodoPane {
         reject(error); throw error;
       }
       finally { arrange?.close(); }
-    });
+    }, check);
   }
   registerManagedRole(role, readTarget) {
     return this.managedWrite(async actor => {
@@ -1830,7 +1833,7 @@ export class TodoPane {
       passScope: (explicit, job) => passes.run({ explicit: Boolean(explicit || passes.getStore()?.explicit) }, job),
       join: lifetime => this.managedWrite(actor => actor.join('dag', lifetime)),
       perform: (role, type, target, dispatch) => this.perform(role, type, target, dispatch),
-      mutate: (role, type, target, args, effect, beforeSubmit) => this.mutate(role, type, target, args, effect, beforeSubmit),
+      mutate: (role, type, target, args, effect, beforeSubmit, check) => this.mutate(role, type, target, args, effect, beforeSubmit, check),
       target: paneId => this.currentTarget(paneId),
       reconcileLegacy: (root, reader, viewer) => this.reconcileLegacy(root, reader, viewer),
       obsoleteLocator: record => this.managedWrite(actor =>
@@ -2277,7 +2280,17 @@ export class TodoPane {
       await this.membership(pair.workers.paneId);
       // An inherited region without a Todo keeps it closed until /dashboard.
       if (!existing && !inherited || forceCurrent('todo')) await this.ensureTodo(pair.workers, forceCurrent('todo'));
-      await provider.arrangeDashboard?.();
+      const arranged = await provider.arrangeDashboard?.();
+      // An explicit /dashboard migrated the dashboard to the band (todo 7): the
+      // Todo record takes the band claim last, after the DAG and workers records.
+      if (this.managed && arranged?.layout === 'band' && claim.layout !== 'band') {
+        this.claim = { ...claim, layout: 'band' };
+        await this.roleWrite(async () => {
+          const current = await readJson(this.recordFile);
+          if (this.recordMatches(current) && !current.manualClose && current.paneId)
+            await writeJson(this.recordFile, { ...current, layoutClaim: this.claim });
+        });
+      }
     };
     // Every mutation of this pass runs in its scope, so the gate knows whether it
     // is automatic. A gate refusal is a wait: zero mutations, one notice, no latch.

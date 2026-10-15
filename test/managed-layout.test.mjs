@@ -14,7 +14,7 @@ import { TodoPane } from '../packages/todo/src/controller.mjs';
 import { claimParentSlot } from '../packages/todo/src/parent-slot.mjs';
 import { writeJson } from '../packages/dag/src/storage.mjs';
 import { createSplitTreeHerdr } from './helpers/split-tree-herdr.mjs';
-import { createBandDashboard, readRecord } from './helpers/band-dashboard.mjs';
+import { createBandDashboard, NATIVE_MUTATIONS, readRecord } from './helpers/band-dashboard.mjs';
 
 async function fixture(t, managed) {
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-authority-'));
@@ -162,16 +162,33 @@ for (const guard of ['allowed', 'excluded-role', 'force-current', 'new-closure']
   });
 }
 
-test('managed non-column placement journals temporary closure through actor authority', async t => {
-  const f = await fixture(t, true);
+// Converted by todo 7 (task-7-test-mapping.md): an explicit managed placement now
+// re-places a columns dashboard as the band, with the same journaled temporary
+// split/swap/close moves through the coordinator; every temporary pane closes again.
+test('managed placement journals temporary closure through actor authority and re-places columns as the band', async t => {
+  const f = await bandPair(t, { direction: 'right', ratio: 0.4, first: 'parent', second: { direction: 'right', ratio: 0.5,
+    first: { direction: 'down', ratio: 0.5, first: 'todo', second: 'workers' }, second: 'dag' } });
+  for (const role of ['dag', 'workers']) {
+    const record = f.record(f.dag, role, role, { layoutClaim: f.claim('columns') });
+    await writeJson(f.dag.paneFile(role), record);
+    f.dag.records.set(role, record);
+  }
+  f.dag.claim = f.claim('columns');
+  const ids = { parent: 'parent', todo: 'todo', workers: 'workers', dag: 'dag' };
+  const chat = () => f.fake.layout().panes.find(pane => pane.pane_id === 'parent').rect;
+  assert.equal(isColumnDashboard(f.fake.layout(), ids), true);
+  assert.deepEqual(chat(), { x: 0, y: 0, width: 69, height: 46 });
   await f.dag.arrangeDashboard();
-  assert.deepEqual(f.mutations.map(call => call.args[0]),
-    ['split', 'swap', 'close', 'split', 'swap', 'close', 'swap', 'split', 'swap', 'close', 'swap']);
-  assert.ok(f.calls.filter(call => ['split', 'swap', 'close'].includes(call.args[0])).every(call => call.authority));
-  assert.deepEqual(f.calls.filter(call => call.args[0] === 'close').map(call => call.args[1]),
-    ['created-1', 'created-2', 'created-3']);
+  assert.deepEqual(f.mutations.map(args => args[0]),
+    ['split', 'swap', 'focus', 'close', 'split', 'swap', 'focus', 'focus', 'close', 'swap', 'focus', 'resize', 'resize']);
+  assert.equal(f.fake.calls.filter(args => NATIVE_MUTATIONS.includes(args[0])).length, f.mutations.length,
+    'every native mutation went through the coordinator');
+  assert.deepEqual(f.mutations.filter(args => args[0] === 'close').map(args => args[1]), ['created-1', 'created-2']);
   assert.equal(JSON.parse(await readFile(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
-  assert.equal(isColumnDashboard(f.getLayout(), { parent: 'parent', todo: 'todo', workers: 'workers', dag: 'dag' }), true);
+  assert.equal(isBandDashboard(f.fake.layout(), ids), true);
+  assert.deepEqual(chat(), { x: 0, y: 0, width: 69, height: 46 });
+  assert.deepEqual(f.fake.panes(), ['parent', 'todo', 'workers', 'dag']);
+  assert.equal(f.dag.claim.layout, 'band');
 });
 
 test('unmanaged arrangement retains reversible swap and rejects general placement', async t => {
@@ -384,7 +401,9 @@ test('registered live generation bump retires all viewers through actor and rela
     assert.notEqual(current.launchToken, record.launchToken);
     assert.equal(current.nodePath, 'node');
   }
-  assert.equal(f.calls.filter(call => ['split', 'close'].includes(call.args[0])).length, 0);
+  // Narrowed by todo 7 (task-7-test-mapping.md): an explicit /dashboard may re-place
+  // panes through journaled temporary splits; the upgrade never splits or closes a role pane.
+  assertNoRolePaneSplitOrClose(f.calls.map(call => call.args), f.records.map(({ record }) => record.paneId));
 });
 
 test('blocked controller stop closes its handle and owned pipes despite unresolved placement', async t => {
@@ -652,7 +671,8 @@ test('registered old-generation live viewers retire and relaunch all three roles
     assert.equal(record.ready, true);
     assert.equal(f.actor.snapshot.roles[role].generation, f.actor.snapshot.generation);
   }
-  assert.equal(f.calls.filter(args => ['close', 'split'].includes(args[0])).length, 0);
+  // Narrowed by todo 7 (task-7-test-mapping.md), as above.
+  assertNoRolePaneSplitOrClose(f.calls, ['todo', 'dag', 'workers'].map(role => `original-${role}`));
   assert.ok(f.actor.snapshot.operations.every(operation => operation.status === 'SETTLED'));
 });
 
@@ -1850,4 +1870,738 @@ for (const role of MATRIX_ROLES) test(`band_role_guard ${role}: while Todo is li
   assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'one pane per role');
   assert.equal(f.fake.focused(), 'parent');
   assert.equal(f.actor.record.roles[role].paneId, ids[role], 'the slot still registers the original pane');
+});
+
+// ---- Todo 7: an explicit /dashboard migrates a live columns dashboard to the band in place ----
+
+// The measured band (task-1-tree.md section 2) for a chat at 40 percent.
+const BAND_TARGET = {
+  '172x46': { parent: [0, 0, 69, 46], todo: [69, 0, 103, 16], workers: [69, 16, 41, 30], dag: [110, 16, 62, 30] },
+  '120x40': { parent: [0, 0, 48, 40], todo: [48, 0, 72, 14], workers: [48, 14, 29, 26], dag: [77, 14, 43, 26] },
+  '100x30': { parent: [0, 0, 40, 30], todo: [40, 0, 60, 11], workers: [40, 11, 24, 19], dag: [64, 11, 36, 19] },
+};
+const COLUMNS_SOURCE = {
+  '172x46': { parent: [0, 0, 69, 46], todo: [69, 0, 52, 23], workers: [69, 23, 52, 23], dag: [121, 0, 51, 46] },
+  '120x40': { parent: [0, 0, 48, 40], todo: [48, 0, 36, 20], workers: [48, 20, 36, 20], dag: [84, 0, 36, 40] },
+  '100x30': { parent: [0, 0, 40, 30], todo: [40, 0, 30, 15], workers: [40, 15, 30, 15], dag: [70, 0, 30, 30] },
+};
+const nextGeneration = generation => String(Number(generation) + 1).padStart(6, '0');
+const roleFiles = f => [f.todo.recordFile, f.dag.paneFile('workers'), f.dag.paneFile('dag')];
+const claims = async f => Promise.all(roleFiles(f).map(async file => (await readRecord(file))?.layoutClaim?.layout));
+const actorType = verb => ({ split: 'split', close: 'close' })[verb] ?? 'arrange';
+
+// G3, narrowed G2: no role pane is split off or closed and the chat is never split;
+// every split pane is a temporary placement pane that is closed again.
+function assertNoRolePaneSplitOrClose(calls, roleIds) {
+  const closes = calls.filter(args => args[0] === 'close').map(args => args[1]);
+  const splits = calls.filter(args => args[0] === 'split');
+  assert.ok(closes.every(id => !roleIds.includes(id)), 'no role pane is closed');
+  assert.ok(splits.every(args => args[args.indexOf('--pane') + 1] !== 'parent'), 'the chat is never split');
+  assert.equal(splits.length, closes.length, 'every split pane is a temporary placement pane, closed again');
+}
+// G2: no dashboard mutation targets the chat or a divider it shares (task-1 S4).
+function assertChatUntouched(calls, ids) {
+  for (const args of calls) {
+    const pane = args[0] === 'swap' ? [args[2], args[4]] : args[0] === 'close' ? [args[1]] : [args[args.indexOf('--pane') + 1]];
+    if (args[0] !== 'focus') assert.ok(!pane.includes('parent'), `the chat is never a ${args[0]} target`);
+    if (args[0] === 'resize') assert.ok(!([ids.workers, ids.todo].includes(pane[0]) &&
+      args[args.indexOf('--direction') + 1] === 'left'), 'never resize workers or Todo left (the chat divider)');
+  }
+}
+// Snapshot the chat after every native mutation took effect, then run 'also'.
+function watchPhases(f, also) {
+  const phases = [];
+  f.hooks.after = async args => {
+    if (NATIVE_MUTATIONS.includes(args[0])) {
+      const layout = f.layout();
+      phases.push({ verb: args[0], area: layout.area, root: layout.splits[0],
+        chat: layout.panes.find(pane => pane.pane_id === 'parent').rect });
+    }
+    await also?.(args);
+  };
+  return phases;
+}
+const rectArray = rect => [rect.x, rect.y, rect.width, rect.height];
+// The three viewers paint: their paint ACKs reach the production paintManaged
+// as the presence channel would report them; the actor turns READY on its own.
+async function paintAll(f, sequence) {
+  Object.assign(f.todo.presence, { getOwner: () => ({}), isReady: () => true });
+  for (const role of ['todo', 'dag', 'workers']) f.todo.paintManaged({ role, sequence });
+  await f.todo.managedIdle();
+}
+
+// Install generation 7 as it ran: the same controllers without the band
+// (provider.bandLayout absent) open Todo by splitting the chat right 0.6, the
+// DAG right of Todo and workers below Todo. The 40 percent chat of the
+// documented fixture (R/VERIFICATION.md:59) came from that generation's parent
+// resize; it is applied natively here, as fixture setup.
+async function liveColumns(t, { width = 172, height = 46, ...options } = {}) {
+  const f = await bandDashboard(t, { width, height, generation: '000007', ...options });
+  const provider = f.todo.provider, band = provider.bandLayout;
+  delete provider.bandLayout;
+  try { await f.todo.schedule(); } finally { provider.bandLayout = band; }
+  const ids = await f.ids();
+  assert.equal(isColumnDashboard(f.layout(), ids), true, 'generation 7 opened columns');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  const root = f.layout().splits[0], desired = Math.round(width * 0.4);
+  await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', String(root.ratio - desired / width));
+  assert.deepEqual(f.rects(ids), COLUMNS_SOURCE[`${width}x${height}`]);
+  return { f, ids };
+}
+// The measured migration (task-1 b2): 9 mutations and 4 focus restorations.
+async function assertMigrated(f, ids, size, { phases, from, operations }) {
+  const added = f.mutations().slice(from).map(call => call.args);
+  const [t1, t2] = added.filter(args => args[0] === 'close').map(args => args[1]);
+  const [height, region] = [Number(size.split('x')[1]), BAND_TARGET[size].todo[2]];
+  const todoRows = BAND_TARGET[size].todo[3], workersColumns = BAND_TARGET[size].workers[2];
+  assert.deepEqual(added.map(args => args[0] === 'split' ? args.slice(0, 7) : args), [
+    ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.5'],
+    ['swap', '--source-pane', ids.dag, '--target-pane', t1],
+    ['focus', '--pane', ids.dag, '--direction', 'left'],
+    ['close', t1],
+    ['split', '--pane', ids.dag, '--direction', 'right', '--ratio', '0.5'],
+    ['swap', '--source-pane', ids.workers, '--target-pane', t2],
+    ['focus', '--pane', ids.workers, '--direction', 'left'],
+    ['focus', '--pane', ids.dag, '--direction', 'left'],
+    ['close', t2],
+    ['swap', '--source-pane', ids.workers, '--target-pane', ids.dag],
+    ['focus', '--pane', ids.workers, '--direction', 'left'],
+    ['resize', '--pane', ids.todo, '--direction', 'up', '--amount', String(Math.abs(0.5 - todoRows / height))],
+    ['resize', '--pane', ids.dag, '--direction', 'left', '--amount', String(Math.abs(0.5 - workersColumns / region))],
+  ], 'the task-1 b2 sequence: amounts from the stored ratio of the split being changed');
+  assert.equal(phases.length, added.length, 'one phase snapshot per native mutation');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET[size].parent, `the chat rect is identical after ${phase.verb}`);
+  assertChatUntouched(added, ids);
+  assertActorOnly(f);
+  const settled = f.actor.snapshot.operations.filter(op => !operations.has(op.id));
+  assert.deepEqual(settled.map(op => op.type), added.map(args => actorType(args[0])), 'one actor operation per mutation');
+  assert.ok(settled.every(op => op.status === 'SETTLED'));
+  assert.deepEqual(await f.ids(), ids, 'the same pane ids');
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'no temporary pane remains');
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), BAND_TARGET[size]);
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.equal(f.fake.focused(), 'parent', 'focus ends on the chat');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band'], 'the claim becomes band after success');
+  assert.equal(f.todo.claim.layout, 'band');
+}
+
+test('band_live_columns_generation 172x46: an upgrade, /reload and scheduled passes keep generation 7 columns untouched; explicit /dashboard migrates the same panes in place', async t => {
+  const { f, ids } = await liveColumns(t);
+  const splits = JSON.stringify(f.layout().splits);
+  // The next install generation relaunches the live viewers in place (retire, then run in the same shell).
+  await f.restart({ generation: nextGeneration('000007') });
+  const n = f.mutations().length, known = new Set(f.actor.snapshot.operations.map(op => op.id));
+  await f.todo.schedule();
+  assert.deepEqual(f.actor.snapshot.operations.filter(op => !known.has(op.id)).map(op => [op.type, op.role, op.status]).sort(),
+    [['retire', 'dag', 'SETTLED'], ['retire', 'todo', 'SETTLED'], ['retire', 'workers', 'SETTLED']]);
+  for (const file of roleFiles(f)) assert.ok((await readRecord(file)).viewerPath.includes(`generation-${nextGeneration('000007')}`));
+  await paintAll(f, 1);
+  assert.equal(f.actor.snapshot.phase, 'READY', 'the slot reaches READY after the upgrade');
+  await f.restart(); // /reload
+  await f.todo.schedule();
+  await f.todo.schedule(); // scheduled reconciliation
+  await paintAll(f, 1);
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'no split, swap, close, resize, focus or run');
+  assert.deepEqual(await f.ids(), ids);
+  assert.deepEqual(f.rects(ids), COLUMNS_SOURCE['172x46']);
+  assert.equal(JSON.stringify(f.layout().splits), splits, 'the split tree is unchanged');
+  assert.equal(f.fake.focused(), 'parent', 'no automatic focus change');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.actor.snapshot.phase, 'READY');
+  assert.deepEqual(f.warnings, []);
+  const phases = watchPhases(f), from = f.mutations().length, operations = new Set(f.actor.snapshot.operations.map(op => op.id));
+  await f.todo.schedule(DASHBOARD);
+  await assertMigrated(f, ids, '172x46', { phases, from, operations });
+  assert.deepEqual(f.warnings, []);
+  await paintAll(f, 2);
+  assert.equal(f.actor.snapshot.phase, 'READY', 'fresh paints after the migration make the slot READY again');
+  const settled = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  await f.todo.schedule();
+  await f.restart();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(settled).map(head), [], 'a second /dashboard and later passes make zero mutations');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.deepEqual(f.warnings, []);
+});
+
+for (const size of ['120x40', '100x30']) test(`band_live_columns_generation ${size}: explicit /dashboard migrates the measured columns fixture to the measured band`, async t => {
+  const [width, height] = size.split('x').map(Number);
+  const { f, ids } = await liveColumns(t, { width, height });
+  const phases = watchPhases(f), from = f.mutations().length, operations = new Set(f.actor.snapshot.operations.map(op => op.id));
+  await f.todo.schedule(DASHBOARD);
+  await assertMigrated(f, ids, size, { phases, from, operations });
+  const settled = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.equal(f.mutations().length, settled, 'a second /dashboard makes zero mutations');
+  assert.deepEqual(f.warnings, []);
+});
+
+// Every source the plan names ends in the band (or an explicit wait): the same
+// panes, the chat rect identical in every phase, focus on the chat at the end.
+const SOURCES = {
+  'reversed columns': (ids, share) => ({ direction: 'right', ratio: share, first: 'parent', second: { direction: 'right', ratio: 0.5,
+    first: { direction: 'down', ratio: 0.5, first: ids.workers, second: ids.todo }, second: ids.dag } }),
+  'legacy stacked, DAG on top': (ids, share) => ({ direction: 'right', ratio: share, first: 'parent', second: { direction: 'down',
+    ratio: 0.4, first: ids.dag, second: { direction: 'down', ratio: 0.5, first: ids.workers, second: ids.todo } } }),
+  'stacked, Todo on top': (ids, share) => ({ direction: 'right', ratio: share, first: 'parent', second: { direction: 'down',
+    ratio: 0.34, first: ids.todo, second: { direction: 'down', ratio: 0.5, first: ids.workers, second: ids.dag } } }),
+  'band with workers and DAG swapped': (ids, share) => ({ direction: 'right', ratio: share, first: 'parent', second: {
+    direction: 'down', ratio: 0.35, first: ids.todo, second: { direction: 'right', ratio: 0.4, first: ids.dag, second: ids.workers } } }),
+};
+for (const [name, tree] of Object.entries(SOURCES)) test(`band_migration_sources ${name}: automatic passes wait once without mutating; /dashboard ends in the band`, async t => {
+  const { f, ids } = await liveColumns(t);
+  f.arrange(tree(ids, f.layout().splits[0].ratio));
+  const before = f.rects(ids), n = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'an automatic pass never rearranges');
+  assert.deepEqual(f.rects(ids), before);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assertChatUntouched(added, ids);
+  assertNoRolePaneSplitOrClose(added, Object.values(ids));
+  assertActorOnly(f);
+  assert.deepEqual(await f.ids(), ids);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  assert.equal(f.warnings.length, 1, 'the migration itself adds no notice');
+});
+
+// A role closed (its pane exited) and then /dashboard: the closed role reopens
+// and the dashboard ends in the band (verify-task-6.md ruling (c)).
+for (const [base, closed] of [['band', ['todo']], ['band', ['todo', 'workers']], ['band', ['todo', 'dag']], ['columns', ['todo']]])
+  test(`band_migration_sources ${base} with ${closed.join(' and ')} closed: /dashboard reopens and ends in the band`, async t => {
+    let f, ids;
+    if (base === 'band') { f = await bandDashboard(t); await f.todo.schedule(); ids = await f.ids(); }
+    else ({ f, ids } = await liveColumns(t));
+    for (const role of closed) await f.exitPane(ids[role]);
+    const n = f.mutations().length;
+    await f.todo.schedule();
+    assert.deepEqual(f.mutations().slice(n).map(head), [], 'an automatic pass reopens nothing');
+    const phases = watchPhases(f), from = f.mutations().length;
+    await f.todo.schedule(DASHBOARD);
+    const now = await f.ids(), chat = base === 'band' ? FRESH_BAND['172x46'] : BAND_TARGET['172x46'];
+    for (const role of ['todo', 'workers', 'dag']) {
+      if (closed.includes(role)) assert.notEqual(now[role], ids[role], `${role} reopened`);
+      else assert.equal(now[role], ids[role], `${role} kept`);
+    }
+    for (const phase of phases) assert.deepEqual(rectArray(phase.chat), chat.parent, 'the chat is never split again');
+    assertChatUntouched(f.mutations().slice(from).map(call => call.args), now);
+    assertActorOnly(f);
+    assert.equal(isBandDashboard(f.layout(), now), true);
+    assert.deepEqual(f.rects(now), chat);
+    assert.equal(f.fake.focused(), 'parent');
+    assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  });
+
+test('band_migration_sources inherited columns without a Todo: /dashboard opens Todo and migrates the region in place', async t => {
+  const f = await bandDashboard(t, { sessionId: 'old-conversation' });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  const old = await f.ids();
+  await f.restart({ sessionId: 'new-conversation' });
+  const n = f.mutations().length;
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'the inherited region is kept by automatic passes');
+  const phases = watchPhases(f);
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.equal(ids.workers, old.workers);
+  assert.equal(ids.dag, old.dag);
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), [0, 0, 69, 46], 'the inherited chat is never split');
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assertActorOnly(f);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_migration_resume: a migration interrupted between its moves resumes from the geometry on the next /dashboard', async t => {
+  const { f, ids } = await liveColumns(t);
+  let armed = false;
+  f.hooks.after = args => {
+    if (args[0] === 'close') armed = true;
+    else if (armed && args[0] === 'layout') { armed = false; throw Object.assign(new Error('QA interruption'), { code: 'QA_INTERRUPT' }); }
+  };
+  await assert.rejects(f.todo.schedule(DASHBOARD), /QA interruption/);
+  delete f.hooks.after;
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE', 'the first move finished');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns'], 'the claim is still columns');
+  await f.restart();
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.ok(!added.some(args => args[0] === 'split' && args[2] === ids.todo), 'the finished move is not replayed');
+  assert.equal(added.filter(args => args[0] === 'split').length, 1, 'only the second move remains');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_foreign_identity: a pane the dashboard does not own in the tab stops /dashboard before any mutation', async t => {
+  const { f, ids } = await liveColumns(t);
+  await f.fake.herdr('split', '--pane', ids.dag, '--direction', 'down', '--ratio', '0.5', '--no-focus'); // the owner's own pane
+  const before = f.rects(ids), n = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'zero mutations');
+  assert.deepEqual(f.rects(ids), before);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(await readRecord(join(f.dag.directory, 'placement.json')), null, 'no journal is written');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+
+test('band_foreign_identity: a temporary pane that gains a foreign process is never closed and the journal stays unresolved', async t => {
+  const { f, ids } = await liveColumns(t);
+  let temporary;
+  const phases = watchPhases(f, args => {
+    if (args[0] === 'split') temporary = f.layout().panes.find(pane => !Object.values(ids).includes(pane.pane_id)).pane_id;
+    if (args[0] === 'swap' && temporary) f.foreignProcess(temporary);
+  });
+  const from = f.mutations().length;
+  await assert.rejects(f.todo.schedule(DASHBOARD));
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['split', 'swap', 'focus'], 'nothing after the foreign process appeared');
+  assert.ok(f.fake.panes().includes(temporary), 'the foreign pane is never closed');
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'BLOCKED');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+});
+
+test('band_foreign_identity: a role viewer replaced by a foreign process between moves stops the migration with no further mutation', async t => {
+  const { f, ids } = await liveColumns(t);
+  const phases = watchPhases(f, args => { if (args[0] === 'close') f.foreignProcess(ids.workers); });
+  const from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['split', 'swap', 'focus', 'close'], 'only the first move');
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+
+test('band_owned_resize: under a columns claim a band-shaped region makes zero mutations; /dashboard only promotes the claim (G9)', async t => {
+  const { f, ids } = await liveColumns(t);
+  f.arrange({ direction: 'right', ratio: f.layout().splits[0].ratio, first: 'parent', second: { direction: 'down', ratio: 0.25,
+    first: ids.todo, second: { direction: 'right', ratio: 0.3, first: ids.workers, second: ids.dag } } });
+  assert.equal(isBandDashboard(f.layout(), ids), true, 'the owned panes already have the band shape');
+  const before = f.rects(ids), from = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'automatic passes leave a matching shape alone');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns'], 'an automatic pass writes no claim');
+  assert.deepEqual(f.warnings, [], 'a matching shape is not a wait');
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'no split, swap, close, focus or ratio resize (G9)');
+  assert.deepEqual(f.rects(ids), before);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band'], 'only the claim follows the shape');
+  assert.equal(f.todo.claim.layout, 'band');
+  assert.deepEqual(f.warnings, []);
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'a second /dashboard makes zero mutations');
+});
+
+// The gate reviewer's G9_MATCHING_SHAPE_COLUMNS_CLAIM reproduction (verify-task-7.md A1), as a regression.
+test('band_owned_resize G9_MATCHING_SHAPE_COLUMNS_CLAIM: a band-shaped region still claiming columns takes no ratio resize on /dashboard', async t => {
+  const f = await bandDashboard(t);
+  const provider = f.todo.provider, band = provider.bandLayout;
+  delete provider.bandLayout;
+  try { await f.todo.schedule(); } finally { provider.bandLayout = band; }
+  const ids = await f.ids(), root = f.layout().splits[0];
+  await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', String(root.ratio - 69 / 172));
+  f.arrange({ direction: 'right', ratio: f.layout().splits[0].ratio, first: 'parent', second: { direction: 'down', ratio: 0.25,
+    first: ids.todo, second: { direction: 'right', ratio: 0.3, first: ids.workers, second: ids.dag } } });
+  const before = f.rects(ids), n = f.mutations().length;
+  assert.deepEqual(before, { parent: [0, 0, 69, 46], todo: [69, 0, 103, 12], workers: [69, 12, 31, 34], dag: [100, 12, 72, 34] });
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(n).map(call => call.args), [], 'no resize of Todo or workers');
+  assert.deepEqual(f.rects(ids), before);
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  assert.deepEqual(f.warnings, []);
+});
+
+test('band_owned_resize: a band the owner resized keeps its sizes; /dashboard makes zero mutations (G9)', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const ids = await f.ids();
+  await f.fake.herdr('resize', '--pane', ids.todo, '--direction', 'down', '--amount', '0.1');
+  await f.fake.herdr('resize', '--pane', ids.workers, '--direction', 'right', '--amount', '0.1');
+  const before = f.rects(ids), n = f.mutations().length;
+  assert.notDeepEqual(before, FRESH_BAND['172x46']);
+  await f.todo.schedule(DASHBOARD);
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), []);
+  assert.deepEqual(f.rects(ids), before);
+  assert.deepEqual(f.warnings, []);
+});
+
+test('band_resize_during_effect: a terminal resize while a migration swap takes effect keeps the chat share and completes the band for the new size', async t => {
+  const { f, ids } = await liveColumns(t);
+  const share = f.layout().splits[0].ratio;
+  let once = true;
+  const phases = watchPhases(f, args => { if (args[0] === 'swap' && once) { once = false; f.resizeTerminal({ width: 160, height: 44 }); } });
+  const from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.ok(!once, 'the terminal was resized during the migration');
+  for (const phase of phases) {
+    assert.equal(phase.root.ratio, share, 'the chat keeps its share in every phase');
+    assert.deepEqual(rectArray(phase.chat), [0, 0, Math.round(Math.fround(phase.area.width * Math.fround(share))), phase.area.height]);
+  }
+  assertChatUntouched(f.mutations().slice(from).map(call => call.args), ids);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), { parent: [0, 0, 64, 44], todo: [64, 0, 96, 15], workers: [64, 15, 38, 29], dag: [102, 15, 58, 29] });
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  assert.deepEqual(f.warnings, []);
+});
+
+test('band_resize_during_effect: a shrink below the floor during the migration ends in one wait without ratios; /dashboard after enlarging promotes the claim without re-applying ratios (G9)', async t => {
+  const { f, ids } = await liveColumns(t);
+  let splits = 0;
+  watchPhases(f, args => { if (args[0] === 'split' && ++splits === 2) f.resizeTerminal({ width: 80, height: 46 }); });
+  await f.todo.schedule(DASHBOARD);
+  assert.equal(f.mutations().filter(call => call.args[0] === 'resize').length, 0, 'no ratio is applied below the floor');
+  assert.equal(isBandDashboard(f.layout(), ids), true, 'the moves completed');
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns'], 'the claim waits for success');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+  f.resizeTerminal({ width: 172, height: 46 });
+  delete f.hooks.after;
+  const from = f.mutations().length, enlarged = f.rects(ids);
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'the band shape already matches and this pass moves nothing: no ratio (G9)');
+  assert.deepEqual(f.rects(ids), enlarged);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_migration_automatic: a band whose panes were rearranged waits once on automatic passes; /dashboard restores it in place', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const ids = await f.ids();
+  f.arrange({ direction: 'right', ratio: f.layout().splits[0].ratio, first: 'parent', second: { direction: 'down', ratio: 0.35,
+    first: ids.todo, second: { direction: 'right', ratio: 0.4, first: ids.dag, second: ids.workers } } });
+  const before = f.rects(ids), n = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'an automatic pass never rearranges a band');
+  assert.deepEqual(f.rects(ids), before);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(n).map(call => call.args), [
+    ['swap', '--source-pane', ids.workers, '--target-pane', ids.dag],
+    ['focus', '--pane', ids.workers, '--direction', 'left'],
+  ], 'only the swap the band still needs; its ratios already match');
+  assertActorOnly(f);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_resize_during_effect: the owner moving the chat divider during the migration stops it before the next mutation', async t => {
+  const { f, ids } = await liveColumns(t);
+  let moved = false;
+  watchPhases(f, async args => {
+    if (args[0] === 'close' && !moved) {
+      moved = true;
+      await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'right', '--amount', '0.05'); // the owner, not the dashboard
+    }
+  });
+  const from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.ok(moved);
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]), ['split', 'swap', 'focus', 'close'], 'nothing after the chat changed');
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: the chat pane changed during placement.*\/dashboard/);
+  assert.deepEqual(await f.ids(), ids);
+});
+
+// The gate reviewer's PRODUCTION_DISPATCH_FOCUS_CHANGED_AFTER_GUARD reproduction (verify-task-7.md A2),
+// through the production TodoPane.prototype.mutate: the owner moves focus inside the actor's custody
+// callback, after the migration guard accepted the step and before the native split.
+test('band_dispatch_authorization: a focus change inside the custody callback refuses the temporary split at the final authorization; the journal stays resumable', async t => {
+  const f = await bandDashboard(t);
+  const provider = f.todo.provider, band = provider.bandLayout;
+  delete provider.bandLayout;
+  try { await f.todo.schedule(); } finally { provider.bandLayout = band; }
+  const ids = await f.ids(), root = f.layout().splits[0];
+  await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', String(root.ratio - 69 / 172));
+  const journalPath = join(f.dag.directory, 'placement.json'), journal = await readRecord(journalPath);
+  const fixtureMutate = f.todo.mutate, custody = f.todo.invalidateCustodyEffect;
+  delete f.todo.mutate;
+  assert.equal(f.todo.mutate, TodoPane.prototype.mutate, 'the production dispatcher');
+  const n = f.mutations().length;
+  let atChange;
+  f.todo.invalidateCustodyEffect = async operation => {
+    await custody.call(f.todo, operation);
+    if (!atChange && operation.type === 'split') {
+      await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); // the owner
+      atChange = { focus: f.fake.focused(), added: f.mutations().length - n, journal: (await readRecord(journalPath))?.phase };
+    }
+  };
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(atChange, { focus: ids.todo, added: 0, journal: 'PREPARED' }, 'focus moved after the guard, before the split');
+  assert.deepEqual(f.mutations().slice(n).map(call => call.args), [], 'the temporary split is never issued');
+  assert.deepEqual(await readRecord(journalPath), journal, 'the journal is back to its previous state');
+  const [refused] = f.actor.snapshot.operations.slice(-1);
+  assert.deepEqual([refused.type, refused.status], ['split', 'SETTLED'], 'a known no-effect refusal');
+  assert.equal(f.todo.effectObservations.has(refused.id), false, 'no pending effect observation');
+  assert.equal(f.actor.blocked, false);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: input selection changed during placement.*\/dashboard/);
+  assert.equal(f.fake.focused(), ids.todo, 'the owner keeps the focus they chose');
+  assert.deepEqual(await f.ids(), ids);
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'no temporary pane');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  // The owner selects the chat again and repeats /dashboard: the migration resumes from the geometry.
+  f.todo.invalidateCustodyEffect = custody;
+  f.todo.mutate = fixtureMutate;
+  await f.fake.herdr('focus', '--pane', ids.todo, '--direction', 'left');
+  assert.equal(f.fake.focused(), 'parent');
+  await f.todo.schedule(DASHBOARD);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.equal((await readRecord(journalPath)).phase, 'COMPLETE');
+  assert.deepEqual(await f.ids(), ids);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_dispatch_authorization: a focus change inside the custody callback of a ratio resize refuses it; the settled moves stay and the next /dashboard moves nothing (G9)', async t => {
+  const { f, ids } = await liveColumns(t);
+  const custody = f.todo.invalidateCustodyEffect, from = f.mutations().length;
+  let changed = false;
+  f.todo.invalidateCustodyEffect = async operation => {
+    await custody.call(f.todo, operation);
+    if (!changed && operation.type === 'arrange' && f.mutations().length - from === 11) { // the first ratio resize
+      changed = true;
+      await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); // the owner
+    }
+  };
+  await f.todo.schedule(DASHBOARD);
+  assert.ok(changed);
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]),
+    ['split', 'swap', 'focus', 'close', 'split', 'swap', 'focus', 'focus', 'close', 'swap', 'focus'], 'the moves, no resize');
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  const [refused] = f.actor.snapshot.operations.slice(-1);
+  assert.deepEqual([refused.type, refused.status], ['arrange', 'SETTLED'], 'a known no-effect refusal');
+  assert.equal(f.actor.blocked, false);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns'], 'the claim waits for success');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: input selection changed during placement.*\/dashboard/);
+  f.todo.invalidateCustodyEffect = custody;
+  await f.fake.herdr('focus', '--pane', ids.todo, '--direction', 'left');
+  assert.equal(f.fake.focused(), 'parent');
+  const moved = f.mutations().length, banded = f.rects(ids);
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(moved).map(head), [], 'a matching shape makes zero mutations');
+  assert.deepEqual(f.rects(ids), banded);
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_dispatch_authorization: a focus change inside the custody callback of a move\'s swap refuses the swap; the temporary placement stays unresolved like a failed guard (todo 8)', async t => {
+  const { f, ids } = await liveColumns(t);
+  const custody = f.todo.invalidateCustodyEffect, from = f.mutations().length;
+  let changed = false;
+  f.todo.invalidateCustodyEffect = async operation => {
+    await custody.call(f.todo, operation);
+    if (!changed && operation.type === 'arrange' && f.mutations().length - from === 1) { // the first move's swap
+      changed = true;
+      await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); // the owner
+    }
+  };
+  await assert.rejects(f.todo.schedule(DASHBOARD), /input selection changed during placement/);
+  assert.ok(changed);
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]), ['split'], 'no swap, close or focus after the change');
+  const journal = await readRecord(join(f.dag.directory, 'placement.json'));
+  assert.equal(journal.phase, 'BLOCKED');
+  assert.ok(f.fake.panes().includes(journal.temporary.paneId), 'the temporary pane is left for journal recovery');
+  const [refused] = f.actor.snapshot.operations.slice(-1);
+  assert.deepEqual([refused.type, refused.status], ['arrange', 'SETTLED'], 'a known no-effect refusal');
+  assert.equal(f.actor.blocked, false);
+  assert.ok(f.todo.recoveryBlocked, 'an unresolved placement latches, as a failed guard does');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.deepEqual(rectArray(f.layout().panes.find(pane => pane.pane_id === 'parent').rect), COLUMNS_SOURCE['172x46'].parent);
+});
+
+// The gate reviewer's PRODUCTION_OWNER_SWAPS_ROW_BEFORE_GUARD_GATHER reproduction (verify-task-7-r2.md A3),
+// through the production TodoPane.prototype.mutate: after the moves and the Todo resize, the owner swaps
+// the lower row inside the row resize's guard, before any of its geometry reads. The resize was computed
+// on the band, where DAG left moves the row divider; on the swapped row it would move the chat's (G2).
+test('band_dispatch_authorization A3 PRODUCTION_OWNER_SWAPS_ROW_BEFORE_GUARD_GATHER: a row resize computed on the band is refused once the owner swapped the row; the chat keeps its rect', async t => {
+  const f = await bandDashboard(t, { events: true });
+  const provider = f.todo.provider, band = provider.bandLayout;
+  delete provider.bandLayout;
+  try { await f.todo.schedule(); } finally { provider.bandLayout = band; }
+  const ids = await f.ids(), root = f.layout().splits[0];
+  await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', String(root.ratio - 69 / 172));
+  const fixtureMutate = f.todo.mutate, placementFocus = f.dag.placementFocus.bind(f.dag), n = f.mutations().length;
+  let atChange, productionDispatch = false;
+  f.dag.placementFocus = async (...args) => {
+    const selected = await placementFocus(...args);
+    if (!atChange && f.mutations().length - n === 12) { // the moves and the Todo resize settled: the row resize's guard
+      await f.fake.herdr('swap', '--source-pane', ids.workers, '--target-pane', ids.dag); // the owner
+      await f.fake.herdr('focus', '--pane', ids.workers, '--direction', 'left');
+      await f.fake.herdr('focus', '--pane', ids.dag, '--direction', 'left');
+      atChange = { rects: f.rects(ids), focus: f.fake.focused() };
+      delete f.todo.mutate;
+      productionDispatch = f.todo.mutate === TodoPane.prototype.mutate;
+    }
+    return selected;
+  };
+  const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+  assert.deepEqual(atChange, { rects: { parent: [0, 0, 69, 46], todo: [69, 0, 103, 16], workers: [121, 16, 51, 30],
+    dag: [69, 16, 52, 30] }, focus: 'parent' }, 'the owner swapped the row after the Todo resize');
+  assert.ok(productionDispatch, 'the production dispatcher');
+  assert.deepEqual(f.mutations().slice(n + 12).map(head), [], 'the resize computed on the band is never issued');
+  assert.deepEqual(f.rects(ids), atChange.rects, 'the chat keeps [0, 0, 69, 46]');
+  assert.equal(failure, undefined, 'a wait, not a failure');
+  const [refused] = f.actor.snapshot.operations.slice(-1);
+  assert.deepEqual([refused.type, refused.status], ['arrange', 'SETTLED'], 'a known no-effect refusal');
+  assert.equal(f.todo.effectObservations.has(refused.id), false, 'no pending effect observation');
+  assert.equal(f.actor.blocked, false);
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns'], 'the claim waits for success');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.deepEqual(await f.ids(), ids);
+  // /dashboard again re-plans from the owner's row: one swap back, then the row ratio.
+  f.todo.mutate = fixtureMutate;
+  const resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(resumed).map(call => call.args[0]), ['swap', 'focus', 'resize']);
+  assertChatUntouched(f.mutations().slice(n).map(call => call.args), ids);
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+// A3, the same class for the planned moves: their targets and directions were decided on the tree read
+// before the first move. The owner swaps two dashboard panes before that move's guard reads the tree.
+test('band_dispatch_authorization A3: a planned move decided on the columns tree is never issued once the owner swapped two dashboard panes; /dashboard re-plans from their geometry', async t => {
+  const { f, ids } = await liveColumns(t);
+  const placementFocus = f.dag.placementFocus.bind(f.dag), from = f.mutations().length;
+  const journalPath = join(f.dag.directory, 'placement.json'), journal = await readRecord(journalPath);
+  let reads = 0, atChange;
+  f.dag.placementFocus = async (...args) => {
+    const selected = await placementFocus(...args);
+    if (++reads === 2) { // the first move's guard; the first read was the preflight
+      await f.fake.herdr('swap', '--source-pane', ids.workers, '--target-pane', ids.dag); // the owner
+      await f.fake.herdr('focus', '--pane', ids.workers, '--direction', 'left');
+      await f.fake.herdr('focus', '--pane', f.fake.focused(), '--direction', 'left');
+      atChange = { mutations: f.mutations().length - from, rects: f.rects(ids), focus: f.fake.focused() };
+    }
+    return selected;
+  };
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(atChange, { mutations: 0, rects: { parent: [0, 0, 69, 46], todo: [69, 0, 52, 23], workers: [121, 0, 51, 46],
+    dag: [69, 23, 52, 23] }, focus: 'parent' }, 'the owner swapped workers and the DAG before the first move');
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'no split on a tree the plan was not decided on');
+  assert.deepEqual(f.rects(ids), atChange.rects);
+  assert.deepEqual(await readRecord(journalPath), journal, 'no journal write');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.deepEqual(await f.ids(), ids);
+  // /dashboard again: the b2 suffix that the owner's arrangement still needs (move workers, swap).
+  const resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.equal(f.mutations().slice(resumed).filter(call => call.args[0] === 'split').length, 1, 'only the workers move');
+  assertChatUntouched(f.mutations().slice(from).map(call => call.args), ids);
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal((await readRecord(journalPath)).phase, 'COMPLETE');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+// A3, the same class for the row resize's own reading: the owner swaps the lower row right after the
+// Todo resize took effect, before the row is read. DAG left is the row divider only in the band.
+test('band_dispatch_authorization A3: the owner swapping the lower row before it is read stops the migration before the row resize; the chat keeps its rect', async t => {
+  const { f, ids } = await liveColumns(t);
+  const from = f.mutations().length;
+  let atChange;
+  watchPhases(f, async args => {
+    if (!atChange && args[0] === 'resize' && args[2] === ids.todo) {
+      await f.fake.herdr('swap', '--source-pane', ids.workers, '--target-pane', ids.dag); // the owner
+      await f.fake.herdr('focus', '--pane', ids.workers, '--direction', 'left');
+      await f.fake.herdr('focus', '--pane', ids.dag, '--direction', 'left');
+      atChange = { rects: f.rects(ids), focus: f.fake.focused() };
+    }
+  });
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(atChange, { rects: { parent: [0, 0, 69, 46], todo: [69, 0, 103, 16], workers: [121, 16, 51, 30],
+    dag: [69, 16, 52, 30] }, focus: 'parent' }, 'the owner swapped the row as the Todo resize took effect');
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]),
+    ['split', 'swap', 'focus', 'close', 'split', 'swap', 'focus', 'focus', 'close', 'swap', 'focus', 'resize'], 'nothing after the Todo resize');
+  assert.deepEqual(f.rects(ids), atChange.rects, 'the chat keeps [0, 0, 69, 46]');
+  assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'COMPLETE');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.deepEqual(await f.ids(), ids);
+});
+
+test('band unmanaged columns: an explicit /dashboard never enters the band path', async t => {
+  const f = await bandDashboard(t, { managed: false });
+  await f.todo.schedule();
+  const ids = await f.ids(), before = f.rects(ids), n = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'a matching unmanaged columns dashboard is left alone');
+  assert.deepEqual(f.rects(ids), before);
+  f.arrange({ direction: 'right', ratio: f.layout().splits[0].ratio, first: 'parent', second: { direction: 'right', ratio: 0.5,
+    first: { direction: 'down', ratio: 0.5, first: ids.workers, second: ids.todo }, second: ids.dag } });
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(n).map(call => call.args[0]), ['swap', 'focus'], 'only the reversible swap');
+  assert.equal(isColumnDashboard(f.layout(), ids), true);
+  assert.equal(isBandDashboard(f.layout(), ids), false);
+  assert.equal(await f.claimLayout(), 'columns');
 });

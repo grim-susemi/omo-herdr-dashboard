@@ -92,6 +92,117 @@ const bandWaiting = 'layout-waiting: the dashboard needs a larger terminal (work
 const unverifiedRegion = 'layout-waiting: an open dashboard pane cannot be verified in this tab; close it, then run /dashboard';
 const claimWaiting = 'layout-waiting: the open dashboard panes have no single recorded layout; close them, then run /dashboard';
 const closedWaiting = 'layout-waiting: the dashboard panes were closed; run /dashboard to reopen them';
+const unplaceable = 'layout-waiting: the dashboard panes cannot be re-placed from this arrangement; close them, then run /dashboard';
+const foreignWaiting = 'layout-waiting: this tab holds a pane the dashboard does not own; close it, then run /dashboard';
+
+const sameRect = (a, b) => ['x', 'y', 'width', 'height'].every(key => a?.[key] === b?.[key]);
+// The same native tree, focus aside: tab, area, every pane rect and every split.
+function sameLayout(a, b) {
+  const shape = value => JSON.stringify([value.tab_id, value.area,
+    (value.panes ?? []).map(pane => JSON.stringify([pane?.pane_id, pane?.rect])).sort(),
+    (value.splits ?? []).map(split => JSON.stringify([split?.direction, split?.ratio, split?.rect])).sort()]);
+  return Boolean(a && b) && shape(a) === shape(b);
+}
+// A split's two child rectangles, rounded like Herdr (task-1 S2).
+function childRects(rect, direction, ratio) {
+  const axis = direction === 'right' ? 'width' : 'height', coordinate = direction === 'right' ? 'x' : 'y';
+  const size = Math.round(Math.fround(rect[axis] * Math.fround(ratio)));
+  return [{ ...rect, [axis]: size }, { ...rect, [coordinate]: rect[coordinate] + size, [axis]: rect[axis] - size }];
+}
+const leavesOf = node => node.pane ? [node.pane] : [...leavesOf(node.first), ...leavesOf(node.second)];
+const placeTree = (node, rect, out = new Map()) => {
+  if (node.pane) return out.set(node.pane, rect);
+  const [first, second] = childRects(rect, node.direction, node.ratio);
+  placeTree(node.first, first, out);
+  return placeTree(node.second, second, out);
+};
+const mapLeaves = (node, leaf) => node.pane ? leaf(node)
+  : { ...node, first: mapLeaves(node.first, leaf), second: mapLeaves(node.second, leaf) };
+const dropLeaf = (node, id) => node.pane ? node : node.first.pane === id ? node.second : node.second.pane === id
+  ? node.first : { ...node, first: dropLeaf(node.first, id), second: dropLeaf(node.second, id) };
+const swapLeaves = (node, a, b) => mapLeaves(node, leaf => leaf.pane === a ? { pane: b } : leaf.pane === b ? { pane: a } : leaf);
+// The journaled temporary pane's leaf in a simulated tree.
+const temporaryLeaf = '\u0000temporary';
+// The same split tree: every direction, stored ratio (float32) and leaf, in order.
+// Rects aside: a terminal resize keeps every ratio and moves no pane between leaves.
+const sameTree = (a, b) => Boolean(a && b) && (a.pane || b.pane ? a.pane === b.pane : a.direction === b.direction &&
+  Math.fround(a.ratio) === Math.fround(b.ratio) && sameTree(a.first, b.first) && sameTree(a.second, b.second));
+
+// The native split tree behind a layout reply: { pane } leaves and { direction,
+// ratio, first, second } splits, every split and pane used exactly once; else null.
+function splitTree(layout) {
+  const { panes, splits, area } = layout ?? {};
+  const valid = rect => rect && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(rect[key])) &&
+    rect.width > 0 && rect.height > 0;
+  if (!Array.isArray(panes) || !Array.isArray(splits) || splits.length !== panes.length - 1 || !valid(area) ||
+    !panes.every(pane => typeof pane?.pane_id === 'string' && valid(pane.rect))) return null;
+  const used = new Set();
+  const build = rect => {
+    const leaves = panes.filter(pane => sameRect(pane.rect, rect));
+    const nodes = splits.filter(split => !used.has(split) && sameRect(split?.rect, rect));
+    if (leaves.length + nodes.length !== 1) return null;
+    if (leaves.length) return { pane: leaves[0].pane_id };
+    const [split] = nodes;
+    used.add(split);
+    if (!['right', 'down'].includes(split.direction) || !(split.ratio > 0 && split.ratio < 1)) return null;
+    const [a, b] = childRects(split.rect, split.direction, split.ratio);
+    const first = build(a), second = first && build(b);
+    return second ? { direction: split.direction, ratio: split.ratio, first, second } : null;
+  };
+  const root = build(area);
+  return root && used.size === splits.length && leavesOf(root).length === panes.length ? root : null;
+}
+
+// The task-1 migration b2 (move the DAG below Todo, move workers right of the
+// DAG, swap them), or its shortest suffix that already ends in the band, so an
+// interrupted migration resumes from its geometry. The chat must be the root's
+// left child and the region beside it exactly the three role panes. Every phase
+// is simulated on the split tree before the first journal write: the chat keeps
+// its rect, no pane collapses below one cell, and each focus restoration (left,
+// at most three steps, like restorePlacementFocus) passes role panes only.
+function planBandMigration(layout, ids) {
+  const tree = splitTree(layout), roles = [ids.todo, ids.workers, ids.dag].sort().join('\n');
+  if (!tree || tree.direction !== 'right' || tree.first.pane !== ids.parent || tree.second.pane ||
+    leavesOf(tree.second).sort().join('\n') !== roles) return { waiting: unplaceable };
+  const area = layout.area, chat = placeTree(tree, area).get(ids.parent);
+  if (!bandSizes({ width: area.width - chat.width, height: area.height }).fits) return { waiting: bandWaiting };
+  const temporary = temporaryLeaf;
+  const safe = (node, swapped) => {
+    const rects = placeTree(node, area);
+    if (!sameRect(rects.get(ids.parent), chat) || [...rects.values()].some(rect => rect.width < 1 || rect.height < 1))
+      return false;
+    const reaches = (id, steps) => {
+      if (id === ids.parent) return true;
+      const from = rects.get(id);
+      const left = [...rects].filter(([other, rect]) => other !== id && rect.x + rect.width === from.x &&
+        Math.min(rect.y + rect.height, from.y + from.height) > Math.max(rect.y, from.y)).map(([other]) => other);
+      return steps > 0 && left.length > 0 && left.every(other => other !== temporary && reaches(other, steps - 1));
+    };
+    return swapped === undefined || reaches(swapped, 3);
+  };
+  const steps = [['move', ids.dag, ids.todo, 'down'], ['move', ids.workers, ids.dag, 'right'], ['swap', ids.workers, ids.dag]];
+  for (let start = steps.length; start >= 0; start--) {
+    const plan = steps.slice(start), trees = [];
+    let node = tree, ok = true;
+    for (const [kind, id, target, direction] of plan) {
+      // The tree each guard of this step must find (A3): the step's arguments
+      // were decided on these, before, between and after its mutations.
+      const phases = [node];
+      if (kind === 'swap') { node = swapLeaves(node, id, target); ok = safe(node, id); }
+      else {
+        node = mapLeaves(node, leaf => leaf.pane === target ? { direction, ratio: 0.5, first: leaf, second: { pane: temporary } } : leaf);
+        ok = safe(node); phases.push(node);
+        node = swapLeaves(node, id, temporary); ok &&= safe(node, id); phases.push(node);
+        node = dropLeaf(node, temporary); ok &&= safe(node);
+      }
+      trees.push([...phases, node]);
+      if (!ok) break;
+    }
+    const panes = [...placeTree(node, area)].map(([pane_id, rect]) => ({ pane_id, rect }));
+    if (ok && isBandDashboard({ area, panes }, ids)) return { plan, trees, share: tree.ratio };
+  }
+  return { waiting: unplaceable };
+}
 
 // Whether a parent's dashboard region is new, inherited or unverifiable: a
 // whitelist over each role's evidence, so a combination it does not name waits.
@@ -734,12 +845,12 @@ export class FixedDagPane extends DagPane {
     }
     return actual;
   }
-  async mutate(role, type, paneId, args, effect) {
+  async mutate(role, type, paneId, args, effect, check) {
     if (!this.managedAvailable) return this.herdr(...args);
     if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
     const record = await readJson(this.paneFile(role));
     const target = record?.paneId === paneId ? await this.nativeTarget(record) : await this.coordinator.target(paneId);
-    return this.coordinator.mutate(role, type, target, args, effect);
+    return this.coordinator.mutate(role, type, target, args, effect, undefined, check);
   }
   async handleControl(message, socket) {
     if (this.stopped && !(this.managedAvailable && message?.type === 'register' && this.pendingLaunches.has(message.launchToken)) ||
@@ -1317,9 +1428,14 @@ export class FixedDagPane extends DagPane {
       throw error;
     } finally { this.pendingLaunches.delete(launchToken); this.launchRegistrations.delete(launchToken); abort.abort(); }
   }
+  // Managed (todo 7): the band is the only target. An explicit /dashboard re-places
+  // the SAME panes into it with the journaled split/swap/close moves of task 1;
+  // an automatic pass never does (owner decision 2026-10-15). Unmanaged
+  // dashboards keep their columns arrangement exactly as before.
   arrangeDashboard() {
     return this.enqueue(async () => {
-      if (this.stopped || this.claim?.layout !== 'columns') return;
+      const claimed = this.claim?.layout;
+      if (this.stopped || claimed !== 'columns' && !(claimed === 'band' && this.managedAvailable)) return;
       const pair = await this.inspectPair(), todo = await this.coordinator?.inspectTodo?.();
       if (!pair.dag || !pair.workers || !todo) return;
       const tabId = this.claim.tabId;
@@ -1328,20 +1444,85 @@ export class FixedDagPane extends DagPane {
       const ids = { parent: this.parentPane, todo: todo.paneId, workers: pair.workers.paneId, dag: pair.dag.paneId };
       const geometry = async () => (await this.herdr('layout', '--pane', this.parentPane))?.layout;
       const layout = await geometry();
-      if (isColumnDashboard(layout, ids)) return;
+      // A matching shape is left as it is (G9): the band under a band claim, judged
+      // within the owned panes' own rectangle so a pane the owner opened elsewhere
+      // in the tab does not make a correct band look wrong; and unmanaged columns
+      // under a columns claim.
+      const owned = layout?.panes?.filter(pane => Object.values(ids).includes(pane?.pane_id)) ?? [];
+      const edges = owned.map(({ rect }) => [rect?.x, rect?.y, rect?.x + rect?.width, rect?.y + rect?.height]);
+      const [left, top] = [0, 1].map(index => Math.min(...edges.map(edge => edge[index])));
+      const [right, bottom] = [2, 3].map(index => Math.max(...edges.map(edge => edge[index])));
+      const ownedArea = { x: left, y: top, width: right - left, height: bottom - top };
+      const ownedBand = owned.length === 4 && isBandDashboard({ area: ownedArea, panes: owned }, ids);
+      if (claimed === 'band' ? ownedBand : !this.managedAvailable && isColumnDashboard(layout, ids)) return;
       // The single mutation gate, asked before the placement journal or any move:
-      // an automatic pass never rearranges (r4).
+      // an automatic pass never rearranges (r4) and keeps a live columns
+      // dashboard, or owned panes already in the band shape (G9), exactly as
+      // they are, without a notice.
       const refusal = await this.coordinator?.gate?.('dag', 'arrange', { paneId: this.parentPane });
-      if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT' });
+      if (refusal) {
+        if (claimed === 'columns' && (isColumnDashboard(layout, ids) || ownedBand)) return;
+        throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT' });
+      }
+      // Managed preflight before the first journal write. Its refusals mutate
+      // nothing, so they are waits, not recovery blocks (IS-10, G4).
+      // Every wait names the owner's action (todo 15).
+      const wait = message => Object.assign(new Error(/\/dashboard|enlarge this terminal/.test(message) ? message
+        : `${message}; run /dashboard to continue`), { code: 'LAYOUT_WAIT' });
+      const preflight = async job => {
+        try { return await job(); }
+        catch (error) {
+          throw this.managedAvailable && !error?.code && /^layout-waiting: /.test(error?.message ?? '') ? wait(error.message) : error;
+        }
+      };
+      const placementPath = () => join(this.directory, 'placement.json');
+      // The claim becomes 'band' only after the band shape is verified: the DAG
+      // and workers records here, the Todo record last by its controller. File
+      // writes only, never a native mutation.
+      const promote = async () => {
+        const claim = { ...this.claim, layout: 'band' };
+        await this.roleWrite(async () => {
+          for (const role of ['dag', 'workers']) {
+            const current = await readJson(this.paneFile(role));
+            if (!this.recordMatches(current, role) || current.paneId !== ids[role] || current.manualClose) continue;
+            const next = { ...current, layoutClaim: claim };
+            this.records.set(role, next);
+            await writeJson(this.paneFile(role), next);
+          }
+        });
+        this.claim = claim;
+        await writeJson(join(this.directory, 'layout.json'), claim);
+        this.status = 'current';
+        return { layout: 'band' };
+      };
+      if (this.managedAvailable) {
+        const previous = await readJson(placementPath());
+        if (previous && previous.phase !== 'COMPLETE') {
+          this.status = 'BLOCKED';
+          throw blocked('unresolved owned temporary placement');
+        }
+        // G9: the owned panes already have the band shape under a columns claim
+        // (the owner arranged them, or a migration stopped after its moves).
+        // Nothing moves and no ratio is re-applied; only the claim follows.
+        if (ownedBand) return promote();
+      }
       // Moving a pane collapses its old branch. A foreign pane must never be
       // resized as an incidental result of that collapse.
       if (layout?.tab_id !== tabId || layout.panes?.length !== 4 ||
         layout.panes.some(pane => !Object.values(ids).includes(pane.pane_id)))
-        throw new Error('layout-waiting: dashboard region contains unowned panes');
-      for (const id of Object.values(ids)) await this.membership(id);
-      const selected = await this.placementFocus(tabId, todo.paneId);
-      let temporaryPaneId;
-      const guard = async () => {
+        throw this.managedAvailable ? wait(foreignWaiting) : new Error('layout-waiting: dashboard region contains unowned panes');
+      await preflight(async () => { for (const id of Object.values(ids)) await this.membership(id); });
+      const selected = await preflight(() => this.placementFocus(tabId, todo.paneId));
+      let temporaryPaneId, share;
+      // G2: the chat stays the root's left child with the same stored ratio. A
+      // terminal resize rescales its rect; only a dashboard mutation could change it.
+      const chatKept = current => {
+        const roots = current?.splits?.filter(split => sameRect(split?.rect, current.area)) ?? [];
+        const chat = current?.panes?.filter(pane => pane.pane_id === this.parentPane);
+        return roots.length === 1 && roots[0].direction === 'right' && chat?.length === 1 &&
+          Math.fround(roots[0].ratio) === Math.fround(share) && sameRect(childRects(current.area, 'right', roots[0].ratio)[0], chat[0].rect);
+      };
+      const guard = async expected => {
         if (this.stopped || await this.placementFocus(tabId, todo.paneId) !== selected)
           throw new Error('layout-waiting: input selection changed during placement');
         if (!await this.verify(pair.dag) || !await this.verify(pair.workers) ||
@@ -1351,9 +1532,36 @@ export class FixedDagPane extends DagPane {
         if (current?.tab_id !== tabId || current.panes?.length !== owned.length ||
           current.panes.some(pane => !owned.includes(pane.pane_id)))
           throw new Error('layout-waiting: dashboard region contains unowned panes');
+        if (share !== undefined && !chatKept(current)) throw new Error('layout-waiting: the chat pane changed during placement');
+        // A3: a planned step's arguments were decided on the planned tree. The tree
+        // found here must be that one (the temporary pane in its planned leaf); the
+        // step's final authorization then requires exactly this tree again.
+        if (expected && !sameTree(splitTree(current),
+          mapLeaves(expected, leaf => leaf.pane === temporaryLeaf ? { pane: temporaryPaneId } : leaf)))
+          throw new Error('layout-waiting: the dashboard panes changed during placement');
+        return current;
       };
-      const move = async (id, target, direction) => {
-        await guard();
+      // A2: the same conditions again inside the actor's final authorization,
+      // after every asynchronous preparation (custody, journal, target reads):
+      // every await here, then a synchronous decision over that snapshot. The
+      // native tree must still be the one the step was decided on.
+      const stepCheck = expected => async () => {
+        const settled = job => job().then(value => ({ value }), error => ({ error }));
+        const focus = await settled(() => this.placementFocus(tabId, todo.paneId));
+        const dag = await settled(() => this.verify(pair.dag)), workers = await settled(() => this.verify(pair.workers));
+        const owner = await settled(() => this.coordinator.inspectTodo());
+        const current = await settled(geometry);
+        return () => {
+          const failed = [focus, dag, workers, owner, current].find(item => item.error)?.error;
+          if (this.stopped || failed) return `layout-waiting: the placement could not be verified (${failed?.message ?? 'stopped'})`;
+          if (focus.value !== selected) return 'layout-waiting: input selection changed during placement';
+          if (!dag.value || !workers.value || owner.value?.paneId !== todo.paneId) return 'layout-waiting: dashboard owner changed during placement';
+          if (!chatKept(current.value)) return 'layout-waiting: the chat pane changed during placement';
+          if (!sameLayout(current.value, expected)) return 'layout-waiting: the dashboard panes changed during placement';
+        };
+      };
+      const move = async (id, target, direction, phases) => {
+        const accepted = await guard(phases[0]);
         if (!this.managedAvailable) {
           await this.mutate('dag', 'arrange', id, ['move', id, '--tab', tabId, '--target-pane', target, '--split', direction, '--no-focus']);
           await guard();
@@ -1386,21 +1594,21 @@ export class FixedDagPane extends DagPane {
             JSON.stringify(await this.coordinator.target(target)) !== JSON.stringify(anchor))
             throw blocked('placement native source or anchor changed');
         };
-        const closeTemporary = async () => {
+        const closeTemporary = async expected => {
           // target() accepts an unregistered temporary shell only when its exact
           // native membership is current and it has no foreground child.
           const current = await this.coordinator.target(temporary.paneId);
           if (JSON.stringify(current) !== JSON.stringify(temporary))
             throw blocked('temporary native shell changed');
           await saveJournal('CLOSE_PREPARED');
-          await this.coordinator.mutate('dag', 'close', temporary, ['close', temporary.paneId]);
+          await this.coordinator.mutate('dag', 'close', temporary, ['close', temporary.paneId], undefined, undefined, stepCheck(expected));
           temporary = undefined;
           temporaryPaneId = undefined;
         };
         await identities(); await saveJournal(stage);
         try {
           const created = await this.mutate('dag', 'split', target,
-            ['split', '--pane', target, '--direction', direction, '--ratio', '0.5', '--cwd', this.cwd, '--no-focus']);
+            ['split', '--pane', target, '--direction', direction, '--ratio', '0.5', '--cwd', this.cwd, '--no-focus'], undefined, stepCheck(accepted));
           if (!created?.pane?.pane_id) throw blocked('temporary split has no native receipt');
           temporaryPaneId = created.pane.pane_id;
           journal.createdPaneId = temporaryPaneId;
@@ -1408,16 +1616,23 @@ export class FixedDagPane extends DagPane {
           await saveJournal('SPLIT_APPLIED');
           temporary = await this.coordinator.target(created.pane.pane_id);
           stage = 'SPLIT_SETTLED'; await saveJournal(stage);
-          await guard(); await identities();
+          const swapping = await guard(phases[1]); await identities();
           await saveJournal('SWAP_PREPARED');
           await this.mutate('dag', 'arrange', id,
-            ['swap', '--source-pane', id, '--target-pane', temporary.paneId]);
+            ['swap', '--source-pane', id, '--target-pane', temporary.paneId], undefined, stepCheck(swapping));
           stage = 'SWAP_SETTLED'; await saveJournal(stage);
           await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
-          await guard(); await identities();
-          await closeTemporary();
+          const closing = await guard(phases[2]); await identities();
+          await closeTemporary(closing);
           stage = 'COMPLETE'; await saveJournal(stage);
         } catch (error) {
+          // Refused at the final authorization before the temporary split was
+          // issued (A2): no native effect and nothing to resolve. The journal
+          // returns to its previous state, so the next /dashboard resumes.
+          if (error?.code === 'LAYOUT_WAIT' && error.noEffect === true && stage === 'PREPARED' && !temporaryPaneId) {
+            await this.roleWrite(() => previous ? writeJson(journalPath, previous) : rm(journalPath, { force: true }));
+            throw error;
+          }
           this.status = 'BLOCKED';
           journal.failedStage = stage;
           journal.error = { code: error.code, message: error.message };
@@ -1427,31 +1642,94 @@ export class FixedDagPane extends DagPane {
           // settled temporary split can be closed only through the current
           // capability and the same independently verified empty-shell identity.
           if (temporary && !actor.blocked && actor.leaseHeld && !actor.draining) {
-            try { await guard(); await identities(); await closeTemporary(); journal.cleanup = 'exact-empty-shell-closed'; }
+            try { const current = await guard(); await identities(); await closeTemporary(current); journal.cleanup = 'exact-empty-shell-closed'; }
             catch (cleanupError) { journal.cleanupError = { code: cleanupError.code, message: cleanupError.message }; }
           }
           await saveJournal('BLOCKED');
-          throw error;
+          // A refusal after the temporary pane exists had no effect either, but
+          // the placement is unresolved: like a failed guard, it is not a wait.
+          throw error?.code === 'LAYOUT_WAIT' ? new Error(error.message) : error;
         }
-        await guard();
+        await guard(phases[3]);
       };
-      const swap = async (id, target) => {
-        await guard();
-        await this.mutate('dag', 'arrange', id, ['swap', '--source-pane', id, '--target-pane', target]);
+      const swap = async (id, target, phases) => {
+        const accepted = await guard(phases?.[0]);
+        await this.mutate('dag', 'arrange', id, ['swap', '--source-pane', id, '--target-pane', target], undefined, stepCheck(accepted));
         await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
-        await guard();
+        await guard(phases?.[1]);
       };
       if (this.managedAvailable) {
-        await move(ids.dag, ids.parent, 'right');
-        await move(ids.workers, ids.dag, 'right');
-        await swap(ids.workers, ids.dag);
-        await move(ids.todo, ids.workers, 'down');
-        await swap(ids.todo, ids.workers);
-      } else {
-        if (!isColumnDashboard(layout, { ...ids, todo: ids.workers, workers: ids.todo }))
-          throw new Error('layout-waiting: use /dashboard to rebuild the owned column layout');
-        await swap(ids.todo, ids.workers);
+        // The owner typed /dashboard in the chat: the migration starts and ends there (IS-8).
+        if (selected !== this.parentPane) throw wait('layout-waiting: select the chat pane in this tab, then run /dashboard');
+        const planned = planBandMigration(layout, ids);
+        if (planned.waiting) { this.status = 'layout-waiting'; throw wait(planned.waiting); }
+        share = planned.share;
+        const rect = (value, id) => value?.panes?.find(pane => pane.pane_id === id)?.rect;
+        const splitOf = (value, direction, area) => {
+          const found = value?.splits?.filter(split => split?.direction === direction && sameRect(split.rect, area));
+          return found?.length === 1 ? found[0] : null;
+        };
+        // Task-1 resize rules: the amount comes from the stored ratio of the split
+        // being changed. Todo moves the band divider up or down; the DAG (left) or
+        // workers (right) the row divider. Never workers or Todo left: that is the
+        // chat's divider (S4).
+        // A3: pane, direction and amount are read from `basis`, a band with the chat
+        // kept, where they can only move a dashboard divider. The resize is authorized
+        // against that exact tree, never a later one: on a changed row DAG left would
+        // be the chat's divider.
+        const resize = async (basis, paneId, direction, split, cells, length, expected) => {
+          if (!split) throw new Error('layout-waiting: dashboard band split unavailable');
+          await guard();
+          await this.mutate('dag', 'arrange', paneId, ['resize', '--pane', paneId, '--direction', direction,
+            '--amount', String(Math.abs(split.ratio - cells / length))], { paneId, rect: expected }, stepCheck(basis));
+        };
+        try {
+          for (const [index, [kind, id, target, direction]] of planned.plan.entries())
+            await (kind === 'move' ? move(id, target, direction, planned.trees[index]) : swap(id, target, planned.trees[index]));
+          const placed = await geometry();
+          if (!isBandDashboard(placed, ids) || !chatKept(placed)) throw new Error('layout-waiting: dashboard band placement mismatch');
+          // G9: ratios belong only to a pass that created or moved panes.
+          if (planned.plan.length) {
+            const chat = rect(placed, ids.parent);
+            const region = { x: chat.x + chat.width, y: placed.area.y, width: placed.area.width - chat.width, height: placed.area.height };
+            const sizes = bandSizes(region);
+            // The terminal may have shrunk since the preflight: the shape stays, the ratios wait.
+            if (!sizes.fits) throw wait(bandWaiting);
+            const todoRect = rect(placed, ids.todo);
+            if (todoRect.height !== sizes.todoRows) await resize(placed, ids.todo, todoRect.height > sizes.todoRows ? 'up' : 'down',
+              splitOf(placed, 'down', region), sizes.todoRows, region.height, { ...todoRect, height: sizes.todoRows });
+            const banded = await geometry(), row = { ...region, y: region.y + sizes.todoRows, height: sizes.lowerRows };
+            if (!isBandDashboard(banded, ids) || !chatKept(banded)) throw new Error('layout-waiting: the dashboard panes changed during placement');
+            const workersRect = rect(banded, ids.workers), dagRect = rect(banded, ids.dag), rowSplit = splitOf(banded, 'right', row);
+            if (workersRect.width > sizes.workersColumns) await resize(banded, ids.dag, 'left', rowSplit, sizes.workersColumns, row.width,
+              { ...dagRect, x: row.x + sizes.workersColumns, width: row.width - sizes.workersColumns });
+            else if (workersRect.width < sizes.workersColumns) await resize(banded, ids.workers, 'right', rowSplit, sizes.workersColumns,
+              row.width, { ...workersRect, width: sizes.workersColumns });
+            const final = await geometry();
+            if (!isBandDashboard(final, ids) || !chatKept(final) || rect(final, ids.todo).height !== sizes.todoRows ||
+              rect(final, ids.workers).width !== sizes.workersColumns) throw new Error('layout-waiting: dashboard band resize mismatch');
+          }
+          await guard();
+        } catch (error) {
+          // A stop that leaves no unresolved temporary placement made no unknown
+          // change: the panes are where the last settled step put them, so it is a
+          // wait and the next /dashboard resumes from that geometry.
+          const phase = await readJson(placementPath()).then(journal => journal?.phase, () => 'UNREADABLE');
+          // A2: a refusal at the final authorization is such a stop.
+          if (error?.code === 'LAYOUT_WAIT' && error.noEffect === true && (!phase || phase === 'COMPLETE')) {
+            this.status = 'layout-waiting';
+            throw wait(error.message);
+          }
+          if (error?.code === 'LAYOUT_WAIT') this.status = 'layout-waiting';
+          if (error?.code || !/^layout-waiting: /.test(error?.message ?? '') || phase && phase !== 'COMPLETE') throw error;
+          this.status = 'layout-waiting';
+          throw wait(error.message);
+        }
+        return promote();
       }
+      if (!isColumnDashboard(layout, { ...ids, todo: ids.workers, workers: ids.todo }))
+        throw new Error('layout-waiting: use /dashboard to rebuild the owned column layout');
+      await swap(ids.todo, ids.workers);
       const placed = await geometry();
       if (!isColumnDashboard(placed, ids)) throw new Error('layout-waiting: dashboard column placement mismatch');
       const parent = placed.panes.find(pane => pane.pane_id === ids.parent).rect;
@@ -1512,7 +1790,22 @@ export class FixedDagPane extends DagPane {
       await this.verifyInputPane(next, anchor, tabId);
       const fresh = ((await this.herdr('list'))?.panes ?? []).filter(pane => pane.focused);
       if (fresh.length !== 1 || fresh[0].pane_id !== source || fresh[0].tab_id !== tabId) return;
-      await this.mutate('dag', 'arrange', source, ['focus', '--pane', source, '--direction', direction]);
+      // A2: at the final authorization the step's pane still has the focus and
+      // the tree is the one this direction was read from.
+      const pane = source;
+      const check = async () => {
+        const settled = job => job().then(value => ({ value }), error => ({ error }));
+        const list = await settled(() => this.herdr('list')), current = await settled(() => this.herdr('layout', '--pane', pane));
+        return () => {
+          const failed = list.error ?? current.error;
+          if (failed) return `layout-waiting: the placement could not be verified (${failed.message})`;
+          const focused = (list.value?.panes ?? []).filter(value => value.focused);
+          if (focused.length !== 1 || focused[0].pane_id !== pane || focused[0].tab_id !== tabId)
+            return 'layout-waiting: input selection changed during placement';
+          if (!sameLayout(current.value?.layout, layout)) return 'layout-waiting: the dashboard panes changed during placement';
+        };
+      };
+      await this.mutate('dag', 'arrange', source, ['focus', '--pane', source, '--direction', direction], undefined, check);
       source = next;
     }
   }
