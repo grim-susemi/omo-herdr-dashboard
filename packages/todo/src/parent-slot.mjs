@@ -429,6 +429,13 @@ class ParentSlot {
         await this.settle(operation.id, 'SETTLED');
         return dispatched.result;
       } catch (error) {
+        // The dispatcher refused at its final authorization, before invoking the
+        // native command: a known no-effect wait. The operation settles without
+        // effect (never UNKNOWN) and the actor stays usable (no latch).
+        if (error?.code === 'LAYOUT_WAIT' && error.noEffect === true) {
+          await this.settle(operation.id, 'SETTLED');
+          throw error;
+        }
         this.blocked = true;
         await this.settle(operation.id, 'UNKNOWN', 'BLOCKED');
         await this.diagnose('dispatch', fail('EFFECT_UNKNOWN'), operation);

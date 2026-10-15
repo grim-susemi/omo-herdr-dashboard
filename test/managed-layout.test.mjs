@@ -3,14 +3,18 @@ import { test } from 'node:test';
 import net from 'node:net';
 import { once, EventEmitter } from 'node:events';
 import * as filesystem from 'node:fs/promises';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtemp, readFile, rm, rename } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FixedDagPane, isColumnDashboard } from '../packages/dag/src/controller.mjs';
+import { FixedDagPane, isBandDashboard, isColumnDashboard } from '../packages/dag/src/controller.mjs';
 import { TodoPane } from '../packages/todo/src/controller.mjs';
 import { claimParentSlot } from '../packages/todo/src/parent-slot.mjs';
 import { writeJson } from '../packages/dag/src/storage.mjs';
+import { createSplitTreeHerdr } from './helpers/split-tree-herdr.mjs';
+import { createBandDashboard, readRecord } from './helpers/band-dashboard.mjs';
 
 async function fixture(t, managed) {
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-authority-'));
@@ -762,4 +766,1088 @@ test('unmanaged old-generation record cannot borrow registered actor retirement 
   assert.equal(f.todo.status, 'layout-waiting');
   assert.deepEqual(f.retirements, []);
   assert.equal(f.calls.filter(args => ['close', 'split', 'run'].includes(args[0])).length, 0);
+});
+
+// Band layout for new managed dashboards, on the calibrated split-tree fake.
+// Expected rects follow the measured split rule (task-1 S2): first child =
+// round(fround(length * fround(ratio))). Fresh managed creation splits the chat
+// once at chatShare 0.5 (derived, not measured natively), Todo keeps the top
+// 0.35 and workers the left 0.4 of the row below it:
+//   172x46 -> chat 86, Todo 86x16, workers 34x30, DAG 52x30
+//   120x40 -> chat 60, Todo 60x14, workers 24x26, DAG 36x26
+//   100x30 -> dashboard 50 wide, workers 20 < 24 columns: layout-waiting
+const FRESH_BAND = {
+  '172x46': { parent: [0, 0, 86, 46], todo: [86, 0, 86, 16], workers: [86, 16, 34, 30], dag: [120, 16, 52, 30] },
+  '120x40': { parent: [0, 0, 60, 40], todo: [60, 0, 60, 14], workers: [60, 14, 24, 26], dag: [84, 14, 36, 26] },
+};
+const DASHBOARD = { forceRoles: ['todo', 'dag', 'workers'] };
+const PARENT_SLOT_TYPES = ['split', 'run', 'close', 'arrange', 'retire'];
+const head = call => call.args.slice(0, 7);
+async function bandDashboard(t, options) {
+  const f = await createBandDashboard(options);
+  t.after(f.dispose);
+  return f;
+}
+function assertActorOnly(f) {
+  assert.ok(f.mutations().every(call => call.authority), 'every native mutation runs inside actor dispatch');
+  assert.ok(f.actor.snapshot.operations.every(op => PARENT_SLOT_TYPES.includes(op.type)));
+}
+
+for (const size of Object.keys(FRESH_BAND)) test(`band_from_parent ${size}: fresh managed creation splits the chat once and ends as the band`, async t => {
+  const [width, height] = size.split('x').map(Number);
+  const f = await bandDashboard(t, { width, height });
+  await f.todo.schedule();
+  const ids = await f.ids();
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND[size]);
+  assert.deepEqual(f.mutations().map(head), [
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5'],
+    ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.35'],
+    ['split', '--pane', ids.workers, '--direction', 'right', '--ratio', '0.4'],
+  ]);
+  assertActorOnly(f);
+  assert.deepEqual(f.actor.snapshot.operations.map(op => [op.type, op.role, op.status]),
+    [['split', 'todo', 'SETTLED'], ['split', 'workers', 'SETTLED'], ['split', 'dag', 'SETTLED']]);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(await f.claimLayout(), 'band');
+  await f.todo.schedule();
+  assert.equal(f.mutations().length, 3, 'a matching band makes no further mutation');
+  assert.deepEqual(f.warnings, []);
+});
+
+for (const [role, moment] of [['todo', 'before'], ['todo', 'after'], ['workers', 'before'], ['workers', 'after'],
+  ['dag', 'before'], ['dag', 'after']]) test(`band_resume_each_receipt_stage: interrupted ${moment} the ${role} viewer launch, a restarted controller completes the band`, async t => {
+  const f = await bandDashboard(t);
+  f.hooks.launch = async (launched, at) => {
+    if (launched === role && at === moment) throw Object.assign(new Error('QA interruption'), { code: 'QA_INTERRUPT' });
+  };
+  await assert.rejects(f.todo.schedule(), /QA interruption/);
+  const before = await f.ids();
+  delete f.hooks.launch;
+  await f.restart();
+  await f.todo.schedule();
+  const ids = await f.ids();
+  for (const key of Object.keys(before)) if (before[key]) assert.equal(ids[key], before[key], `${key} pane survives`);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+  const splits = f.mutations().filter(call => call.args[0] === 'split');
+  assert.equal(splits.length, 3, 'no split is replayed');
+  assert.equal(splits.filter(call => call.args[2] === 'parent').length, 1, 'the chat is split once');
+  assertActorOnly(f);
+  assert.ok(f.actor.snapshot.operations.every(op => op.status === 'SETTLED'));
+  assert.equal(await f.claimLayout(), 'band');
+  assert.equal(f.fake.focused(), 'parent');
+});
+
+test('band_reopen_missing_role: a closed workers pane reopens by splitting the live DAG right and swapping workers left', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const before = await f.ids();
+  await f.exitPane(before.workers);
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  assert.equal(f.mutations().length, count, 'an automatic pass never reopens a closed role');
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.notEqual(ids.workers, before.workers);
+  assert.equal(ids.todo, before.todo);
+  assert.equal(ids.dag, before.dag);
+  const added = f.mutations().slice(count);
+  assert.deepEqual(head(added[0]), ['split', '--pane', before.dag, '--direction', 'right', '--ratio', '0.4']);
+  assert.deepEqual(added[1].args, ['swap', '--source-pane', ids.workers, '--target-pane', before.dag]);
+  assert.ok(added.length > 2 && added.slice(2).every(call => call.args[0] === 'focus'), 'only focus restoration follows the swap');
+  assertActorOnly(f);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+});
+
+test('band_reopen_missing_role: a closed DAG reopens right of the live workers without a swap', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const before = await f.ids();
+  await f.exitPane(before.dag);
+  const count = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.notEqual(ids.dag, before.dag);
+  assert.equal(ids.workers, before.workers);
+  assert.deepEqual(f.mutations().slice(count).map(head),
+    [['split', '--pane', before.workers, '--direction', 'right', '--ratio', '0.4']]);
+  assertActorOnly(f);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+});
+
+test('band_reopen_missing_role: after every role pane is gone, /dashboard reopens the band like a fresh one', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const before = await f.ids();
+  for (const role of ['todo', 'workers', 'dag']) await f.exitPane(before[role]);
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  assert.equal(f.mutations().length, count, 'an automatic pass never reopens a closed dashboard');
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.deepEqual(f.mutations().slice(count).map(head), [
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5'],
+    ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.35'],
+    ['split', '--pane', ids.workers, '--direction', 'right', '--ratio', '0.4'],
+  ]);
+  assertActorOnly(f);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+});
+
+async function bandPair(t, tree) {
+  const directory = await mkdtemp(join(tmpdir(), 'dashboard-band-pair-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const fake = createSplitTreeHerdr({ tree, area: { x: 0, y: 0, width: 172, height: 46 }, focused: 'parent' });
+  const mutations = [];
+  const todo = new TodoPane({ managed: true, stateDir: directory, cwd: directory, herdr: fake.herdr,
+    environment: { HERDR_SOCKET_PATH: 'qa:socket', HERDR_PANE_ID: 'parent' },
+    ctx: { sessionManager: { getSessionId: () => 'session' } }, viewer: join(directory, 'todo-viewer.mjs') });
+  todo.scopeEpoch = 1;
+  const dag = new FixedDagPane({ managedAvailable: true, stateDir: directory, cwd: directory, herdr: fake.herdr,
+    socket: 'qa:socket', parentPane: 'parent', sessionId: 'session', node: 'node', viewer: join(directory, 'dag-viewer.mjs'),
+    inspectShell: async pid => [{ ProcessId: pid, Birth: 'shell-birth', CreationDate: 'shell-date',
+      ExecutablePath: 'shell', CommandLine: 'shell' }] });
+  const actor = { snapshot: { ownerNonce: 'owner', generation: 1, operations: [], closures: [] }, leaseHeld: true };
+  const target = async paneId => ({ paneId, tabId: 'tab', shell: { pid: 100, birth: 'shell-birth' } });
+  const todoCoordinator = todo.coordinator();
+  dag.coordinator = { actor, lifetimeId: todo.lifetimeId,
+    inspectTodo: todoCoordinator.inspectTodo, closeTodoForLayout: todoCoordinator.closeTodoForLayout,
+    assertCurrent() {}, join: async () => {}, registerRole: async () => {}, reconcileLegacy: async () => {}, target,
+    mutate: async (role, type, nativeTarget, args) => { mutations.push(args); return fake.herdr(...args); } };
+  dag.managedActor = actor;
+  dag.nativeTarget = record => target(record.paneId);
+  dag.preflightRecovery = async () => {};
+  dag.save = async () => {};
+  dag.verify = todo.verify = async record => record?.ready && fake.panes().includes(record.paneId) ? { pid: 200 } : null;
+  dag.launchRole = async record => {
+    const ready = { ...record, ready: true, processId: 200 };
+    dag.records.set(record.role, ready);
+    await writeJson(dag.paneFile(record.role), ready);
+    await writeJson(dag.roleFile(record.role), dag.roleState(ready));
+    return ready;
+  };
+  const record = (owner, role, paneId, extra = {}) => ({ schema: 'omo-herdr-dashboard/pane/1', ...owner.binding,
+    role, paneId, tabId: 'tab', scopeEpoch: 1, launchToken: `${role}-launch`,
+    statePath: role === 'todo' ? owner.stateFile : owner.roleFile(role), viewerPath: owner.viewer, nodePath: 'node',
+    ready: true, processId: 200, ...extra });
+  await writeJson(todo.recordFile, record(todo, 'todo', 'todo'));
+  const claim = layout => ({ ...dag.binding, lifetimeId: todo.lifetimeId, tabId: 'tab', ...(layout ? { layout } : {}) });
+  return { fake, todo, dag, actor, mutations, record, claim };
+}
+const todoAlone = { direction: 'right', ratio: 0.5, first: 'parent', second: 'todo' };
+
+for (const layout of ['band', 'columns']) test(`band_reopen_missing_role: a manually closed DAG ${layout === 'band' ? 'no longer prevents workers from opening in the band' : 'still stops the columns pair'}`, async t => {
+  const f = await bandPair(t, todoAlone);
+  await writeJson(f.dag.paneFile('dag'), f.record(f.dag, 'dag', 'closed-dag', { manualClose: true, ready: false }));
+  const pair = await f.dag.openPair({ claim: f.claim(layout) });
+  assert.equal(pair.dag, undefined);
+  if (layout === 'columns') {
+    assert.deepEqual(f.mutations, []);
+    assert.equal(pair.workers, undefined);
+    return;
+  }
+  assert.deepEqual(f.mutations.map(args => args.slice(0, 7)), [['split', '--pane', 'todo', '--direction', 'down', '--ratio', '0.35']]);
+  const rect = id => f.fake.layout().panes.find(pane => pane.pane_id === id).rect;
+  assert.deepEqual(rect('todo'), { x: 86, y: 0, width: 86, height: 16 });
+  assert.deepEqual(rect(pair.workers.paneId), { x: 86, y: 16, width: 86, height: 30 });
+});
+
+test('a band claim with legacy records never enters the legacy stacked branch', async t => {
+  const f = await bandPair(t, { direction: 'right', ratio: 0.5, first: 'parent',
+    second: { direction: 'down', ratio: 0.35, first: 'todo', second: 'workers' } });
+  const legacy = { layoutClaim: f.claim() }; // a pre-columns claim: no layout field
+  await writeJson(f.dag.paneFile('workers'), f.record(f.dag, 'workers', 'workers', legacy));
+  await writeJson(f.dag.paneFile('dag'), f.record(f.dag, 'dag', 'gone-dag', { ...legacy, manualClose: true, ready: false }));
+  await writeJson(f.dag.legacyRecordFile, { paneId: 'legacy-dag', sessionId: 'session' });
+  f.actor.snapshot.closures.push({ role: 'dag', paneId: 'gone-dag', sessionId: 'session', reason: 'pane_not_found' });
+  const pair = await f.dag.openPair({ force: true, forceRoles: ['dag'], claim: f.claim('band') });
+  assert.deepEqual(f.mutations.map(args => args.slice(0, 7)), [['split', '--pane', 'workers', '--direction', 'right', '--ratio', '0.4']]);
+  assert.equal(f.fake.calls.filter(args => ['resize', 'swap', 'move'].includes(args[0])).length, 0);
+  const ids = { parent: 'parent', todo: 'todo', workers: 'workers', dag: pair.dag.paneId };
+  assert.equal(isBandDashboard(f.fake.layout(), ids), true);
+  assert.deepEqual(f.fake.layout().panes.find(pane => pane.pane_id === ids.dag).rect, { x: 120, y: 16, width: 52, height: 30 });
+});
+
+test('an unknown layout claim is refused before any mutation instead of using the legacy stacked branch', async t => {
+  const f = await bandPair(t, todoAlone);
+  await assert.rejects(f.dag.openPair({ claim: f.claim('rows') }), error => /^layout-waiting: /.test(error.message));
+  assert.deepEqual(f.mutations, []);
+  assert.deepEqual(f.fake.panes(), ['parent', 'todo']);
+});
+
+test('band_dashboard_widths_40_80_99_100_200: the 24-column workers floor refuses only the 40-column dashboard', async t => {
+  // chatShare 0.5: a terminal 2d columns wide opens a dashboard area d columns wide.
+  // Workers = round(fround(d * fround(0.4))); readableWorkersColumns 40 is reporting only.
+  const workersAt = { 80: 32, 99: 40, 100: 40, 200: 80 };
+  for (const d of [40, 80, 99, 100, 200]) {
+    const f = await bandDashboard(t, { width: 2 * d, height: 46 });
+    await f.todo.schedule();
+    if (d === 40) {
+      assert.equal(f.mutations().length, 0, 'workers would be 16 columns');
+      assert.equal(f.todo.status, 'layout-waiting');
+      assert.equal(f.warnings.length, 1);
+      assert.match(f.warnings[0], /^layout-waiting: /);
+      continue;
+    }
+    const ids = await f.ids(), workers = workersAt[d];
+    assert.equal(isBandDashboard(f.layout(), ids), true, `dashboard ${d}`);
+    assert.deepEqual(f.rects(ids), { parent: [0, 0, d, 46], todo: [d, 0, d, 16],
+      workers: [d, 16, workers, 30], dag: [d + workers, 16, d - workers, 30] }, `dashboard ${d}`);
+    assert.deepEqual(f.warnings, [], `dashboard ${d}`);
+  }
+});
+
+for (const [width, height] of [[100, 30], [172, 21]]) test(`band below the minimum at ${width}x${height}: layout-waiting, zero mutations, one notify`, async t => {
+  const f = await bandDashboard(t, { width, height });
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'size waiting is not a recovery block');
+  assert.equal(f.mutations().length, 0);
+  assert.deepEqual(f.actor.snapshot.operations, []);
+  assert.equal(await readRecord(f.todo.recordFile), null);
+  assert.equal(await readRecord(join(f.dag.directory, 'placement.json')), null);
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: /);
+  await f.todo.schedule(DASHBOARD);
+  assert.equal(f.mutations().length, 0);
+  assert.equal(f.warnings.length, 2, 'an explicit /dashboard always answers');
+  assert.match(f.warnings[1], /^layout-waiting: /);
+});
+
+test('band_height_resize_retry: a short terminal waits once, and a geometry-only enlargement opens the band', async t => {
+  const f = await bandDashboard(t, { width: 172, height: 21, events: true });
+  await f.todo.schedule();
+  assert.equal(f.mutations().length, 0);
+  assert.equal(f.todo.status, 'layout-waiting');
+  await bounded(f.subscribed);
+  const schedule = f.todo.schedule.bind(f.todo);
+  let next = Promise.withResolvers();
+  f.todo.schedule = options => { const pass = schedule(options); next.resolve(pass); return pass; };
+  const retried = async () => {
+    const pass = await bounded(next.promise);
+    next = Promise.withResolvers();
+    await bounded(pass);
+  };
+  f.resize({ width: 150, height: 21 });
+  f.emitLayout();
+  await retried();
+  assert.equal(f.mutations().length, 0, 'still too short: nothing is created');
+  assert.equal(f.warnings.length, 1, 'the same wait is not announced again');
+  f.resize({ width: 172, height: 22 });
+  f.emitLayout();
+  await retried();
+  const ids = await f.ids();
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), { parent: [0, 0, 86, 22], todo: [86, 0, 86, 8], workers: [86, 8, 34, 14], dag: [120, 8, 52, 14] });
+  assertActorOnly(f);
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: /);
+});
+
+test('band_unknown_split_no_replay: a workers split whose receipt was lost is never replayed', async t => {
+  const f = await bandDashboard(t);
+  f.hooks.lose = args => args[0] === 'split' && args[args.indexOf('--direction') + 1] === 'down';
+  await assert.rejects(f.todo.schedule(), { code: 'EFFECT_UNKNOWN' });
+  delete f.hooks.lose;
+  const splits = () => f.mutations().filter(call => call.args[0] === 'split').length;
+  assert.equal(splits(), 2);
+  const unknown = f.actor.snapshot.operations.filter(op => op.status === 'UNKNOWN');
+  assert.deepEqual(unknown.map(op => [op.type, op.role]), [['split', 'workers']]);
+  await assert.rejects(f.todo.schedule());
+  await assert.rejects(f.todo.schedule(DASHBOARD));
+  assert.equal(splits(), 2, 'no split is replayed after an unknown effect');
+  assert.equal(f.mutations().filter(call => call.args[0] === 'close').length, 0);
+  assert.equal(f.actor.snapshot.operations.find(op => op.id === unknown[0].id).status, 'UNKNOWN');
+  assert.equal(f.fake.panes().length, 3, 'the unconfirmed pane is left for recovery, never raw-closed');
+});
+
+test('band unmanaged regression: fresh unmanaged creation keeps its columns order, claim and geometry', async t => {
+  const f = await bandDashboard(t, { managed: false });
+  await f.todo.schedule();
+  const ids = await f.ids();
+  assert.deepEqual(f.mutations().map(call => call.args[0] === 'split' ? head(call) : call.args), [
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.4'],
+    ['split', '--pane', ids.dag, '--direction', 'right', '--ratio', '0.5'],
+    ['swap', '--source-pane', ids.workers, '--target-pane', ids.dag],
+    ['focus', '--pane', ids.workers, '--direction', 'left'],
+    ['split', '--pane', ids.workers, '--direction', 'down', '--ratio', '0.5'],
+    ['swap', '--source-pane', ids.todo, '--target-pane', ids.workers],
+    ['focus', '--pane', ids.todo, '--direction', 'left'],
+  ]);
+  assert.equal(isColumnDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), { parent: [0, 0, 69, 46], todo: [69, 0, 52, 23], workers: [69, 23, 52, 23], dag: [121, 0, 51, 46] });
+  assert.equal(await f.claimLayout(), 'columns');
+  assert.equal(f.fake.focused(), 'parent');
+});
+
+// A conversation change keeps the parent's live role panes. The new
+// conversation has no Todo record of its own, yet its dashboard region is not
+// new: it keeps the layout its role records were created with, and no automatic
+// pass splits or resizes its chat (G2). The old conversation's Todo is absent:
+// a columns pair opened without one, or a band whose Todo was closed.
+for (const [layout, width, chat] of [['columns', 400, 160], ['columns', 172, 69], ['band', 400, 200], ['band', 172, 86]])
+  test(`band_session_transition ${layout} ${width}x46: an inherited region without a Todo record keeps its chat and its ${layout} claim`, async t => {
+    const f = await bandDashboard(t, { width, sessionId: 'old-conversation' });
+    if (layout === 'columns') {
+      await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+    } else {
+      await f.todo.schedule();
+      await f.exitPane((await f.ids()).todo);
+    }
+    const before = { ...await f.ids(), todo: undefined }, rects = f.rects(before);
+    assert.deepEqual(rects.parent, [0, 0, chat, 46]);
+    await f.restart({ sessionId: 'new-conversation' });
+    const count = f.mutations().length, operations = f.actor.snapshot.operations.map(op => op.id);
+    await f.todo.schedule();
+    await f.todo.schedule();
+    const ids = await f.ids();
+    assert.deepEqual(ids, before, 'the same workers and DAG panes, no Todo pane');
+    assert.deepEqual(f.rects(ids), rects, 'the chat and both role panes keep their rects');
+    assert.deepEqual(f.mutations().slice(count).map(head), [], 'no split, swap, resize or close: the chat is never split');
+    assert.equal(f.todo.claim.layout, layout);
+    for (const role of ['workers', 'dag'])
+      assert.equal((await readRecord(f.dag.paneFile(role))).layoutClaim?.layout, layout, `${role} keeps its claim`);
+    assert.deepEqual(f.actor.snapshot.operations.filter(op => !operations.includes(op.id))
+      .map(op => [op.type, op.role, op.status]).sort(), [['retire', 'dag', 'SETTLED'], ['retire', 'workers', 'SETTLED']],
+    'the inherited viewers are only relaunched in place');
+    assert.deepEqual(f.warnings, []);
+  });
+
+test('band_session_transition: inherited role records with mixed layout claims wait without any mutation', async t => {
+  const f = await bandDashboard(t, { width: 400, sessionId: 'old-conversation' });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  const file = f.dag.paneFile('dag'), record = await readRecord(file);
+  await writeJson(file, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'band' } });
+  const rects = f.rects(await f.ids());
+  await f.restart({ sessionId: 'new-conversation' });
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(count).map(head), []);
+  assert.deepEqual(f.rects(await f.ids()), rects);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'an undetermined layout is a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: /);
+  assert.ok(f.warnings[0].includes('/dashboard'));
+});
+
+// Fresh creation needs a provably empty region (G2): no owned role pane may have
+// a row in the native list. A row that does not place the pane in the parent's
+// tab is no proof of absence, so the pass waits once and mutates nothing.
+// 'missing tab identity' is the exact case of the second gate review.
+const unverifiableRows = {
+  'missing tab identity': (rows, owned) => rows.map(row => owned.has(row.pane_id) ? { ...row, tab_id: undefined } : row),
+  'duplicate rows': (rows, owned) => rows.flatMap(row => owned.has(row.pane_id)
+    ? [{ ...row, tab_id: 'other-tab' }, { ...row, tab_id: 'other-tab' }] : [row]),
+  'unreadable pane identity': (rows, owned) => rows.map(row => owned.has(row.pane_id) ? { ...row, pane_id: undefined } : row),
+  'another tab': (rows, owned) => rows.map(row => owned.has(row.pane_id) ? { ...row, tab_id: 'other-tab' } : row),
+};
+for (const [name, rows] of Object.entries(unverifiableRows)) test(`band_unverified_region ${name}: live role panes without a provable tab membership wait without splitting the chat`, async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  const ids = await f.ids(), rects = f.rects(ids), owned = new Set([ids.workers, ids.dag]), herdr = f.fake.herdr;
+  assert.deepEqual(rects.parent, [0, 0, 160, 46]);
+  f.fake.herdr = async (...args) => {
+    const result = await herdr(...args);
+    return args[0] === 'list' ? { ...result, panes: rows(result.panes, owned) } : result;
+  };
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(count).map(head), [], 'no split, swap, resize or close: the chat is never split');
+  assert.deepEqual(f.rects(ids), rects, 'the chat and both role panes keep their rects');
+  assert.equal(await readRecord(f.todo.recordFile), null, 'no Todo is created');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'an unverifiable region is a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: /);
+  assert.ok(f.warnings[0].includes('/dashboard'));
+});
+
+test('band_unverified_region: inherited role records with an unknown layout claim wait without any mutation', async t => {
+  const f = await bandDashboard(t, { width: 400, sessionId: 'old-conversation' });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  for (const role of ['workers', 'dag']) {
+    const file = f.dag.paneFile(role), record = await readRecord(file);
+    await writeJson(file, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'rows' } });
+  }
+  const rects = f.rects(await f.ids());
+  await f.restart({ sessionId: 'new-conversation' });
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.equal(f.todo.binding.sessionId, 'new-conversation');
+  assert.deepEqual(f.mutations().slice(count).map(head), []);
+  assert.deepEqual(f.rects(await f.ids()), rects);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'an undetermined layout is a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: /);
+});
+
+// Only owned role panes decide: unrelated panes in the tab, readable or not,
+// leave the region empty, and the band opens inside the chat's own rectangle.
+for (const tabless of [false, true]) test(`band_foreign_panes${tabless ? ' without a tab identity' : ''}: a tab holding only unrelated panes still gets the fresh band`, async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  // A pane opened outside the dashboard, not through the controllers.
+  const foreign = (await f.fake.herdr('split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5', '--no-focus')).pane.pane_id;
+  if (tabless) {
+    const herdr = f.fake.herdr;
+    f.fake.herdr = async (...args) => {
+      const result = await herdr(...args);
+      return args[0] === 'list'
+        ? { ...result, panes: result.panes.map(row => row.pane_id === foreign ? { ...row, tab_id: undefined } : row) } : result;
+    };
+  }
+  await f.todo.schedule();
+  const ids = await f.ids();
+  assert.deepEqual(f.rects({ ...ids, foreign }), { parent: [0, 0, 100, 46], todo: [100, 0, 100, 16],
+    workers: [100, 16, 40, 30], dag: [140, 16, 60, 30], foreign: [200, 0, 200, 46] });
+  assert.deepEqual(f.mutations().map(head), [
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5'],
+    ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.35'],
+    ['split', '--pane', ids.workers, '--direction', 'right', '--ratio', '0.4'],
+  ]);
+  assertActorOnly(f);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(await f.claimLayout(), 'band');
+  assert.deepEqual(f.warnings, []);
+});
+
+// FRESH also needs a fully readable list: a row without a pane id could be an
+// owned role pane whose record and registration are gone, so it proves nothing.
+test('band_foreign_panes with an unreadable row: a list row without a pane id is no proof of an empty region, so the band waits', async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  const foreign = (await f.fake.herdr('split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5', '--no-focus')).pane.pane_id;
+  const herdr = f.fake.herdr;
+  f.fake.herdr = async (...args) => {
+    const result = await herdr(...args);
+    return args[0] === 'list'
+      ? { ...result, panes: result.panes.map(row => row.pane_id === foreign ? { ...row, pane_id: undefined } : row) } : result;
+  };
+  const rects = f.rects({ parent: 'parent', foreign });
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().map(head), [], 'no split: the chat is never split');
+  assert.deepEqual(f.rects({ parent: 'parent', foreign }), rects);
+  assert.equal(await readRecord(f.todo.recordFile), null, 'no Todo is created');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+
+// Attempt 4 (verify-task-6-r3.md B1): an inherited region is decided by a whitelist.
+// Each role's evidence comes from its pane record, its parent-slot registration
+// and the native list rows of every pane either one names. Only a role that is
+// consistent in all three, or one with no signal in any source, lets a
+// conversation change go on; every other combination waits before any mutation.
+const MATRIX_ROLES = ['workers', 'dag'];
+const MATRIX_STATES = ['absent-everywhere', 'consistent', 'record-missing', 'record-malformed', 'slot-missing',
+  'slot-pane-id-mismatch', 'list-missing', 'list-no-tab', 'list-other-tab', 'list-duplicate'];
+// The whitelist oracle, written from the plan rather than from the controller.
+// todo: the claim of a live, consistent Todo (attempt 5), else undefined.
+function whitelistOutcome(states, claims, todo) {
+  const signalled = MATRIX_ROLES.filter(role => states[role] !== 'absent-everywhere');
+  if (!signalled.length && !todo) return 'FRESH';
+  const layouts = new Set([...signalled.map(role => claims[role]), ...todo ? [todo] : []]);
+  return signalled.every(role => states[role] === 'consistent') && layouts.size === 1 &&
+    ['band', 'columns'].includes([...layouts][0]) ? 'INHERITED' : 'WAIT';
+}
+// The region decision as the Todo controller consumes it: null opens fresh, a
+// layout keeps the inherited region, anything else waits.
+const regionOutcome = region => region === null ? 'FRESH' : region?.layout ? 'INHERITED' : 'WAIT';
+const matrixRows = {
+  'list-missing': (rows, id) => rows.filter(row => row.pane_id !== id),
+  'list-no-tab': (rows, id) => rows.map(row => row.pane_id === id ? { ...row, tab_id: undefined } : row),
+  'list-other-tab': (rows, id) => rows.map(row => row.pane_id === id ? { ...row, tab_id: 'other-tab' } : row),
+  'list-duplicate': (rows, id) => rows.flatMap(row => row.pane_id === id ? [row, { ...row }] : [row]),
+};
+// Attempt 5 (verify-task-6-r4.md B1): a record file that exists but holds no
+// record (false, null, 0, '', {}, [] or nothing) is a malformed signal, never absence.
+const recordTexts = { 'record-false': 'false', 'record-null': 'null', 'record-zero': '0', 'record-empty-string': '""',
+  'record-empty-object': '{}', 'record-array': '[]', 'record-empty-file': '' };
+const FALSY_STATES = Object.keys(recordTexts);
+const hideRegistration = (roles, role, id) => { if (roles[role]?.paneId === id) delete roles[role]; };
+const matrixSlot = {
+  'absent-everywhere': hideRegistration,
+  'slot-missing': hideRegistration,
+  'slot-pane-id-mismatch': (roles, role, id) => { if (roles[role]?.paneId === id) roles[role].paneId = 'stale-pane'; },
+};
+// One conversation change at 400x46, shaped like the verify-task-6-r3.md
+// reproduction: the old conversation leaves a workers/DAG pair (columns, or a
+// band whose Todo was closed), each role's evidence is altered, and restart({
+// sessionId }) hands the parent slot to a new conversation without a Todo record.
+// The slot registration is altered in the view the controllers read; the actor's
+// stored slot is never edited. With 'after' the evidence changes only once the
+// new conversation has adopted the region, so its next automatic passes decide.
+// Attempt 5 options: base 'todo-band' keeps a live band Todo (todo: its claim);
+// transition 'none' alters the evidence of the running conversation instead of
+// changing conversation, 'session' then restarts the same conversation (r4 B2); a state may combine parts with '+'.
+async function whitelistCell(t, { states, claims, base = 'columns', after = false, transition = 'conversation', todo,
+  expected = whitelistOutcome(states, claims, todo) }) {
+  const f = await createBandDashboard({ width: 400, sessionId: 'old-conversation' });
+  const parts = role => states[role].split('+');
+  try {
+    if (base === 'band') { await f.todo.schedule(); await f.exitPane((await f.ids()).todo); }
+    else if (base === 'todo-band') await f.todo.schedule();
+    else await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+    const old = await f.ids();
+    const recorded = base === 'todo-band' ? 'band' : base;
+    for (const role of MATRIX_ROLES) if (claims[role] !== recorded) {
+      const file = f.dag.paneFile(role), record = await readRecord(file);
+      await writeJson(file, { ...record, layoutClaim: { ...record.layoutClaim, layout: claims[role] } });
+    }
+    if (todo && todo !== 'band') {
+      const record = await readRecord(f.todo.recordFile);
+      await writeJson(f.todo.recordFile, { ...record, layoutClaim: { ...record.layoutClaim, layout: todo } });
+    }
+    const alter = async () => {
+      for (const role of MATRIX_ROLES) for (const state of parts(role)) {
+        if (state === 'absent-everywhere') { await f.exitPane(old[role]); await rm(f.dag.roleFile(role), { force: true }); }
+        if (state === 'closed') await f.exitPane(old[role]);
+        if (['absent-everywhere', 'record-missing'].includes(state)) await rm(f.dag.paneFile(role), { force: true });
+        if (state === 'record-malformed')
+          await writeJson(f.dag.paneFile(role), { schema: 'omo-herdr-dashboard/pane/1', role, paneId: old[role] });
+        if (state in recordTexts) await filesystem.writeFile(f.dag.paneFile(role), recordTexts[state]);
+      }
+      const herdr = f.fake.herdr;
+      f.fake.herdr = async (...args) => {
+        const result = await herdr(...args);
+        if (args[0] !== 'list') return result;
+        let rows = result.panes;
+        for (const role of MATRIX_ROLES) for (const state of parts(role)) rows = matrixRows[state]?.(rows, old[role]) ?? rows;
+        return { ...result, panes: rows };
+      };
+    };
+    if (transition === 'none') await alter();
+    else if (transition === 'session') { await alter(); await f.restart(); }
+    else {
+      if (!after) await alter();
+      await f.restart({ sessionId: 'new-conversation' });
+      assert.equal(f.todo.binding.sessionId, 'new-conversation');
+    }
+    if (after) {
+      await f.todo.schedule();
+      assert.equal(regionOutcome(await f.dag.ownedRegion()), 'INHERITED', 'the new conversation adopted the region');
+      await alter();
+    }
+    const actor = f.actor, snapshot = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(actor), 'snapshot').get;
+    Object.defineProperty(actor, 'snapshot', { configurable: true, get() {
+      const value = snapshot.call(this);
+      for (const role of MATRIX_ROLES) for (const state of parts(role)) matrixSlot[state]?.(value.roles, role, old[role]);
+      return value;
+    } });
+    const decisions = [], ownedRegion = f.dag.ownedRegion.bind(f.dag);
+    f.dag.ownedRegion = async (...args) => { const region = await ownedRegion(...args); decisions.push(region); return region; };
+    const before = { chat: f.rects({ parent: 'parent' }).parent, focus: f.fake.focused(), panes: new Set(f.fake.panes()),
+      mutations: f.mutations().length, warnings: f.warnings.length };
+    const errors = [];
+    for (let pass = 0; pass < 2; pass++) await f.todo.schedule().catch(error => errors.push(error.message));
+    const added = f.mutations().slice(before.mutations).map(head), live = new Set(f.fake.panes());
+    const notices = f.warnings.slice(before.warnings);
+    // No decision: refused earlier (the pass threw) or never consulted (it did not).
+    const outcome = decisions.length ? regionOutcome(decisions[0]) : errors.length ? 'WAIT' : 'UNDECIDED';
+    t.diagnostic(JSON.stringify({ expected, outcome, decided: decisions.length > 0, added: added.length,
+      status: f.todo.status, latch: Boolean(f.todo.recoveryBlocked), notices: notices.length, errors }));
+    assert.equal(outcome, expected, 'the outcome class follows the whitelist');
+    assert.equal(f.fake.focused(), before.focus, 'input focus is unchanged');
+    if (expected === 'FRESH') {
+      assert.equal(todo, undefined);
+      const ids = await f.ids();
+      assert.deepEqual(before.chat, [0, 0, 400, 46]);
+      assert.deepEqual(f.rects({ parent: 'parent' }).parent, [0, 0, 200, 46], 'first creation splits the chat once');
+      assert.deepEqual(added, [
+        ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5'],
+        ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.35'],
+        ['split', '--pane', ids.workers, '--direction', 'right', '--ratio', '0.4'],
+      ]);
+    } else assert.deepEqual(f.rects({ parent: 'parent' }).parent, before.chat, 'the chat rect is unchanged');
+    for (const role of MATRIX_ROLES) {
+      const recorded = (await readRecord(f.dag.paneFile(role)).catch(() => undefined))?.paneId, registered = actor.record.roles[role]?.paneId;
+      const panes = new Set([old[role], recorded, registered].filter(id => id && live.has(id)));
+      assert.ok(panes.size <= 1, `at most one live ${role} pane: ${[...panes]}`);
+      if (live.has(old[role])) assert.ok(![recorded, registered].some(id => id && !before.panes.has(id)),
+        `${role} is not registered to a new pane while its old pane lives`);
+    }
+    assert.ok(notices.length <= 1, 'at most one automatic notice');
+    if (expected === 'WAIT') {
+      assert.deepEqual(added, [], 'a wait makes zero mutations');
+      if (decisions.length) {
+        assert.equal(f.todo.status, 'layout-waiting');
+        assert.ok(!f.todo.recoveryBlocked, 'a region wait is not a recovery block');
+        assert.equal(notices.length, 1, 'one notice across two automatic passes');
+        assert.match(notices[0], /^layout-waiting: .*\/dashboard/);
+      }
+    }
+    if (expected === 'INHERITED') {
+      const layout = todo ?? [...new Set(MATRIX_ROLES.filter(role => states[role] === 'consistent').map(role => claims[role]))][0];
+      if (!layout) throw new Error('an INHERITED cell needs a consistent role');
+      assert.equal(regionOutcome(decisions.at(-1)), 'INHERITED');
+      assert.equal(f.todo.claim.layout, layout, 'the inherited claim is kept');
+      assert.ok(added.every(args => args[0] === 'split' && args[2] !== 'parent'),
+        'only a role with no signal anywhere is reopened, by a split beside the chat');
+      if (!todo) assert.equal(await readRecord(f.todo.recordFile), null, 'the inherited Todo stays absent until /dashboard');
+      else assert.equal((await f.ids()).todo, old.todo, 'the live Todo stays');
+    }
+  } finally { await f.dispose(); }
+}
+const COLUMNS = { workers: 'columns', dag: 'columns' }, BAND = { workers: 'band', dag: 'band' };
+const crossProduct = (claims, base, after) => MATRIX_STATES.flatMap(workers => MATRIX_STATES.map(dag =>
+  ({ name: `workers ${workers} x dag ${dag}`, states: { workers, dag }, claims, base, after })));
+for (const [label, cells] of [
+  ['columns pair', crossProduct(COLUMNS, 'columns', false)],
+  ['band without Todo', crossProduct(BAND, 'band', false)],
+  ['columns pair, evidence changed after adoption', crossProduct(COLUMNS, 'columns', true)],
+]) test(`band_whitelist_matrix ${label}: a conversation change at 400x46 over every workers x DAG evidence state`,
+  { concurrency: 8 }, async t => {
+    await Promise.all(cells.map(cell => t.test(`band_whitelist_matrix ${label}: ${cell.name}`, c => whitelistCell(c, cell))));
+  });
+test('band_whitelist_matrix claims: only one band or columns claim across the consistent roles is inherited', { concurrency: 8 }, async t => {
+  const both = { workers: 'consistent', dag: 'consistent' };
+  const cells = [
+    [both, BAND, 'band'], [both, COLUMNS, 'columns'],
+    [both, { workers: 'columns', dag: 'band' }, 'columns'], [both, { workers: 'band', dag: 'columns' }, 'columns'],
+    [both, { workers: 'rows', dag: 'rows' }, 'columns'], [both, { workers: 'columns', dag: 'rows' }, 'columns'],
+    [{ workers: 'consistent', dag: 'absent-everywhere' }, BAND, 'band'],
+    [{ workers: 'absent-everywhere', dag: 'consistent' }, BAND, 'band'],
+    [{ workers: 'consistent', dag: 'absent-everywhere' }, { workers: 'rows', dag: 'columns' }, 'columns'],
+    [{ workers: 'absent-everywhere', dag: 'consistent' }, { workers: 'columns', dag: 'rows' }, 'columns'],
+  ];
+  await Promise.all(cells.map(([states, claims, base]) => t.test(
+    `band_whitelist_matrix claims: workers ${states.workers}/${claims.workers} x dag ${states.dag}/${claims.dag}`,
+    c => whitelistCell(c, { states, claims, base }))));
+});
+
+// A closed role: its pane really exited, its record and slot registration stay.
+// Closed in the old conversation, it leaves only a registration naming a gone pane
+// (records live per conversation), so it is like a role with no signal. Closed
+// after the new conversation adopted the region, its record is this conversation's:
+// an automatic pass then never opens a fresh dashboard over it (only /dashboard).
+test('band_whitelist_matrix closed roles: a closed role counts as no signal, but never lets an automatic pass reopen a closed dashboard', { concurrency: 8 }, async t => {
+  const cells = [
+    [{ workers: 'closed', dag: 'consistent' }, false, 'INHERITED'],
+    [{ workers: 'consistent', dag: 'closed' }, false, 'INHERITED'],
+    [{ workers: 'closed', dag: 'closed' }, false, 'FRESH'],
+    [{ workers: 'closed', dag: 'record-missing' }, false, 'WAIT'],
+    [{ workers: 'closed', dag: 'consistent' }, true, 'INHERITED'],
+    [{ workers: 'consistent', dag: 'closed' }, true, 'INHERITED'],
+    [{ workers: 'closed', dag: 'closed' }, true, 'WAIT'],
+    [{ workers: 'closed', dag: 'list-no-tab' }, true, 'WAIT'],
+  ];
+  await Promise.all(cells.map(([states, after, expected]) => t.test(
+    `band_whitelist_matrix closed roles${after ? ', closed after adoption' : ''}: workers ${states.workers} x dag ${states.dag}`,
+    c => whitelistCell(c, { states, claims: COLUMNS, after, expected }))));
+});
+test('band_whitelist closed dashboard: after the adopted workers and DAG panes close, an automatic pass waits and /dashboard reopens the band', async t => {
+  const f = await bandDashboard(t, { width: 400, sessionId: 'old-conversation' });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  const old = await f.ids();
+  await f.restart({ sessionId: 'new-conversation' });
+  await f.todo.schedule();
+  for (const role of MATRIX_ROLES) await f.exitPane(old[role]);
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(count).map(head), [], 'an automatic pass never reopens a closed dashboard');
+  assert.equal(await readRecord(f.todo.recordFile), null, 'no Todo is created');
+  assert.deepEqual(f.rects({ parent: 'parent' }).parent, [0, 0, 400, 46]);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.deepEqual(f.mutations().slice(count).map(head), [
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5'],
+    ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.35'],
+    ['split', '--pane', ids.workers, '--direction', 'right', '--ratio', '0.4'],
+  ], '/dashboard reopens the band like a fresh one');
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), { parent: [0, 0, 200, 46], todo: [200, 0, 200, 16], workers: [200, 16, 80, 30], dag: [280, 16, 120, 30] });
+  assertActorOnly(f);
+  assert.equal(f.fake.focused(), 'parent');
+});
+
+// Attempt 5 (verify-task-6-r4.md): the same whitelist with a live Todo, and with
+// record files that exist but hold no record. A live Todo is one more role in the
+// decision; it is consulted on every managed pass, Todo live or not (B2).
+const BAND_TODO = { base: 'todo-band', transition: 'none', todo: 'band' };
+test('band_whitelist_matrix live Todo: evidence of a live band changes, then two automatic passes, over every workers x DAG state',
+  { concurrency: 8 }, async t => {
+    await Promise.all(crossProduct(BAND, 'todo-band', false).map(cell => t.test(
+      `band_whitelist_matrix live Todo: ${cell.name}`, c => whitelistCell(c, { ...cell, ...BAND_TODO }))));
+  });
+test('band_whitelist_matrix live Todo claims: the Todo claim must agree with every consistent role', { concurrency: 8 }, async t => {
+  const both = { workers: 'consistent', dag: 'consistent' };
+  const cells = [
+    ['band', BAND], ['columns', BAND], ['columns', { workers: 'band', dag: 'rows' }], ['band', COLUMNS],
+    ['band', { workers: 'band', dag: 'columns' }], ['rows', BAND], ['columns', COLUMNS],
+    ['columns', { workers: 'columns', dag: 'band' }],
+  ];
+  await Promise.all(cells.map(([todo, claims]) => t.test(
+    `band_whitelist_matrix live Todo claims: todo ${todo} x workers ${claims.workers} x dag ${claims.dag}`,
+    c => whitelistCell(c, { states: both, claims, ...BAND_TODO, transition: 'session', todo }))));
+});
+test('band_whitelist_matrix falsy records: a record file that exists but holds no record always waits', { concurrency: 8 }, async t => {
+  const cells = [];
+  for (const value of FALSY_STATES) {
+    cells.push([`same conversation, both ${value}+slot-missing`, { workers: `${value}+slot-missing`, dag: `${value}+slot-missing` },
+      { transition: 'none' }]);
+    cells.push([`same conversation, both ${value}`, { workers: value, dag: value }, { transition: 'none' }]);
+    cells.push([`same conversation, workers ${value}+slot-missing, dag consistent`,
+      { workers: `${value}+slot-missing`, dag: 'consistent' }, { transition: 'none' }]);
+    cells.push([`conversation change, both ${value}`, { workers: value, dag: value }, {}]);
+    cells.push([`live Todo, both ${value}+slot-missing`, { workers: `${value}+slot-missing`, dag: `${value}+slot-missing` },
+      BAND_TODO]);
+    cells.push([`live Todo, workers ${value}, dag consistent`, { workers: value, dag: 'consistent' }, BAND_TODO]);
+  }
+  await Promise.all(cells.map(([name, states, options]) => t.test(`band_whitelist_matrix falsy records: ${name}`,
+    c => whitelistCell(c, { states, claims: options.todo ? BAND : COLUMNS, ...options }))));
+});
+
+// The four verify-task-6-r4.md reproductions, unchanged, as assertions.
+const columnsClaim = f => ({ ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' });
+for (const value of ['false', 'null', '0', '""']) test(`band_whitelist r4-B1 FALSY_RECORDS_WITH_LIVE_REGION ${value}: present records holding ${value} wait; the chat is never split`, async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  await f.dag.openPair({ force: true, claim: columnsClaim(f) });
+  const old = await f.ids(), before = f.rects(old);
+  const files = new Set([f.dag.paneFile('workers'), f.dag.paneFile('dag')]), read = fs.promises.readFile;
+  fs.promises.readFile = async (path, ...rest) => files.has(String(path)) ? value : read(path, ...rest);
+  syncBuiltinESMExports();
+  t.after(() => { fs.promises.readFile = read; syncBuiltinESMExports(); });
+  const get = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(f.actor), 'snapshot').get;
+  Object.defineProperty(f.actor, 'snapshot', { get() { const s = get.call(this); delete s.roles.workers; delete s.roles.dag; return s; } });
+  const region = await f.dag.ownedRegion(), n = f.mutations().length;
+  assert.notEqual(region, null, 'a present record is a signal, not absence');
+  assert.equal(region.layout, undefined);
+  assert.match(region.waiting, /^layout-waiting: /);
+  let error;
+  try { await f.todo.schedule(); } catch (caught) { error = caught.message; }
+  assert.equal(error, undefined, 'a wait, not a throw');
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'no split: the chat is never halved');
+  assert.deepEqual(f.rects(old), before);
+  assert.equal(f.fake.panes().length, 3);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+test('band_whitelist r4-B2 THREE_WAY_CLAIMS: a live Todo with columns/band/rows claims waits; no automatic rearrangement', async t => {
+  const f = await bandDashboard(t, { width: 172 });
+  await f.todo.schedule();
+  const ids = await f.ids();
+  for (const [role, layout] of [['todo', 'columns'], ['workers', 'band'], ['dag', 'rows']]) {
+    const file = role === 'todo' ? f.todo.recordFile : f.dag.paneFile(role), record = await readRecord(file);
+    await writeJson(file, { ...record, layoutClaim: { ...record.layoutClaim, layout } });
+  }
+  await f.restart();
+  const before = f.rects(ids), n = f.mutations().length;
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'no split, swap, close, resize or focus');
+  assert.deepEqual(f.rects(ids), before, 'chat [0,0,86,46] and every role rect unchanged');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+test('band_whitelist r4-B3 TOCTOU: an owned region that arrives after the FRESH decision stops the chat split', async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  const query = f.dag.ownedRegion.bind(f.dag);
+  let armed = true, old, before, n;
+  f.dag.ownedRegion = async o => {
+    const decision = await query(o);
+    if (armed) {
+      armed = false;
+      await f.dag.openPair({ force: true, claim: columnsClaim(f) });
+      old = await f.ids(); before = f.rects(old); n = f.mutations().length;
+    }
+    return decision;
+  };
+  await f.todo.schedule();
+  assert.deepEqual(before.parent, [0, 0, 160, 46]);
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'the stale FRESH decision splits nothing');
+  assert.deepEqual(f.rects(old), before, 'chat [0,0,160,46] and the arrived pair unchanged');
+  assert.equal((await f.ids()).todo, undefined, 'no Todo pane');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+test('band_whitelist TOCTOU live Todo: evidence that changes after the decision stops the reopening split', async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  await f.todo.schedule();
+  const ids = await f.ids();
+  await f.exitPane(ids.dag);
+  await rm(f.dag.paneFile('dag'), { force: true });
+  await rm(f.dag.roleFile('dag'), { force: true });
+  const get = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(f.actor), 'snapshot').get;
+  Object.defineProperty(f.actor, 'snapshot', { get() {
+    const s = get.call(this); if (s.roles.dag?.paneId === ids.dag) delete s.roles.dag; return s; } });
+  const query = f.dag.ownedRegion.bind(f.dag);
+  let armed = true;
+  f.dag.ownedRegion = async o => {
+    const decision = await query(o);
+    if (armed) {
+      armed = false;
+      const record = await readRecord(f.todo.recordFile);
+      await writeJson(f.todo.recordFile, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'columns' } });
+    }
+    return decision;
+  };
+  const before = f.rects({ parent: 'parent', todo: ids.todo, workers: ids.workers }), n = f.mutations().length;
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'the DAG is not reopened on the stale decision');
+  assert.deepEqual(f.rects({ parent: 'parent', todo: ids.todo, workers: ids.workers }), before);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+test('band_whitelist TOCTOU explicit: a role record lost after the decision does not split a registered live role again', async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  await f.todo.schedule();
+  const ids = await f.ids(), query = f.dag.ownedRegion.bind(f.dag);
+  let armed = true;
+  f.dag.ownedRegion = async o => {
+    const decision = await query(o);
+    if (armed) { armed = false; await rm(f.dag.paneFile('dag'), { force: true }); }
+    return decision;
+  };
+  const n = f.mutations().length;
+  await f.todo.schedule(DASHBOARD).catch(() => {});
+  assert.deepEqual(f.mutations().slice(n).map(head).filter(args => args[0] === 'split'), [], 'no second DAG pane');
+  assert.equal(f.fake.panes().length, 4);
+  assert.ok(f.fake.panes().includes(ids.dag), 'the registered DAG pane stays');
+});
+for (const explicit of [true, false]) test(`band_whitelist r4-B4 REAL_UNDERSIZE_WAIT${explicit ? '' : ' automatic'}: a minimum refusal while reopening makes no mutation and creates no Todo`, async t => {
+  const f = await bandDashboard(t, { width: 172 });
+  await f.todo.schedule();
+  const ids = await f.ids();
+  await f.exitPane(ids.todo);
+  await f.exitPane(ids.dag);
+  await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'right', '--amount', '0.3');
+  const before = f.rects(ids), n = f.mutations().length;
+  assert.deepEqual([before.parent, before.workers], [[0, 0, 138, 46], [138, 0, 34, 46]]);
+  await f.todo.schedule(explicit ? DASHBOARD : undefined);
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'zero mutations below the floor');
+  assert.deepEqual(f.rects(ids), before);
+  assert.deepEqual(f.fake.panes().sort(), ['parent', ids.workers].sort(), 'no Todo pane is created');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+});
+
+// Attempt 6 (verify-task-6-r5.md): the authority is the dispatcher's last await
+// before the native command, inside the parent-slot dispatch. Evidence or size that
+// changes after the controller gate, inside the actor, still stops the mutation.
+const failedOperations = f => f.actor.snapshot.operations.filter(op => op.status !== 'SETTLED');
+test('band_whitelist r5-A1 RESUME_CHANGED_AFTER_GATE: evidence changed inside the parent-slot dispatch stops the split', async t => {
+  const f = await bandDashboard(t, { width: 400 });
+  f.hooks.launch = async (role, moment) => {
+    if (role === 'workers' && moment === 'after') throw Object.assign(new Error('QA interruption'), { code: 'QA_INTERRUPT' });
+  };
+  await f.todo.schedule().catch(() => {});
+  delete f.hooks.launch;
+  await f.restart();
+  const ids = await f.ids(), before = f.rects(ids), n = f.mutations().length, w = f.warnings.length;
+  const original = f.todo.invalidateCustodyEffect.bind(f.todo);
+  let region;
+  f.todo.invalidateCustodyEffect = async operation => {
+    await original(operation);
+    if (operation.type === 'split' && operation.role === 'dag') {
+      const record = await readRecord(f.todo.recordFile);
+      await writeJson(f.todo.recordFile, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'columns' } });
+      region = await f.dag.ownedRegion();
+    }
+  };
+  await f.todo.schedule();
+  assert.match(region?.waiting ?? '', /^layout-waiting: /, 'the region is WAIT immediately before the native split');
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'no DAG split');
+  assert.deepEqual(f.rects(ids), before, 'workers keeps [200,16,200,30]');
+  assert.equal((await f.ids()).dag, undefined);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.actor.blocked, false, 'the actor is not latched');
+  assert.deepEqual(failedOperations(f), [], 'the refused split settled without effect, never UNKNOWN');
+  const notices = f.warnings.slice(w);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /^layout-waiting: .*\/dashboard/);
+});
+for (const seam of ['preflight', 'dispatch']) test(`band_whitelist r5-A2 SIZE_CHANGED_AFTER_${seam.toUpperCase()}: a geometry-only shrink to 80x46 stops the first chat split; enlarging creates the band`, async t => {
+  const f = await bandDashboard(t, { width: 172, height: 46 });
+  let once = true, atResize;
+  const shrink = () => { once = false; f.resize({ width: 80, height: 46 }); atResize = f.mutations().length; };
+  if (seam === 'preflight') {
+    const preflight = f.dag.bandPreflight.bind(f.dag);
+    f.dag.bandPreflight = async () => {
+      const result = await preflight();
+      if (once) { assert.equal(result, null, 'the preflight passed at 172x46'); shrink(); }
+      return result;
+    };
+  } else {
+    const original = f.todo.invalidateCustodyEffect.bind(f.todo);
+    f.todo.invalidateCustodyEffect = async operation => {
+      await original(operation);
+      if (once && operation.type === 'split' && operation.role === 'todo') shrink();
+    };
+  }
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.equal(atResize, 0, 'the shrink came before any mutation');
+  assert.deepEqual(f.mutations().map(head), [], 'zero mutations below the floor');
+  assert.deepEqual(f.rects({ parent: 'parent' }).parent, [0, 0, 80, 46]);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.actor.blocked, false, 'the actor is not latched');
+  assert.deepEqual(failedOperations(f), [], 'no UNKNOWN operation');
+  assert.equal(f.warnings.length, 1, 'one notice across both passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+  f.resize({ width: 172, height: 46 });
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().filter(call => call.args[0] === 'split').length, 3, 'the band is created once the terminal is large enough');
+  assert.equal(f.todo.status, 'current');
+});
+
+// Attempt 7 (verify-task-6-r6.md): the final authorization gathers all evidence
+// and the current geometry first, then decides and issues herdr in one
+// synchronous run. Both tests drive the PRODUCTION TodoPane.mutate dispatcher.
+async function interruptedAfterWorkers(t) {
+  const f = await bandDashboard(t, { width: 400 });
+  f.hooks.launch = async (role, moment) => {
+    if (role === 'workers' && moment === 'after') throw Object.assign(new Error('QA interruption'), { code: 'QA_INTERRUPT' });
+  };
+  await f.todo.schedule().catch(() => {});
+  delete f.hooks.launch;
+  await f.restart();
+  delete f.todo.mutate; // the production prototype dispatcher, not the fixture's
+  return f;
+}
+const assertDispatchWait = async (f, { ids, before, n, w }) => {
+  assert.deepEqual(f.mutations().slice(n).map(head), [], 'no DAG split');
+  assert.deepEqual(f.rects(ids), before, 'workers keeps [200,16,200,30]');
+  assert.equal((await f.ids()).dag, undefined);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.actor.blocked, false, 'the actor is not latched');
+  assert.deepEqual(f.actor.snapshot.operations.filter(op => op.status !== 'SETTLED'), [], 'never UNKNOWN');
+  assert.deepEqual([...f.todo.effectObservations.values()].filter(entry => !entry.settled), [],
+    'no unsettled effect observation is left by the refused operation');
+  const notices = f.warnings.slice(w);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /^layout-waiting: .*\/dashboard/);
+};
+test('band_whitelist r6-A1 CLAIM_CHANGED_INSIDE_FINAL_LAYOUT_READ: a claim written while the final authorization reads the layout stops the split', async t => {
+  const f = await interruptedAfterWorkers(t);
+  const ids = await f.ids(), before = f.rects(ids), n = f.mutations().length, w = f.warnings.length;
+  let armed = false, changed = false, atChange;
+  const custody = f.todo.invalidateCustodyEffect.bind(f.todo);
+  f.todo.invalidateCustodyEffect = async op => { await custody(op); if (op.type === 'split' && op.role === 'dag') armed = true; };
+  const native = f.fake.herdr;
+  f.fake.herdr = async (...args) => {
+    const result = await native(...args);
+    if (armed && !changed && args[0] === 'layout') {
+      changed = true;
+      const record = await readRecord(f.todo.recordFile);
+      await writeJson(f.todo.recordFile, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'columns' } });
+      atChange = { region: await f.dag.ownedRegion(), mutations: f.mutations().length - n };
+    }
+    return result;
+  };
+  await f.todo.schedule();
+  assert.ok(changed, 'the claim changed inside the final layout read');
+  assert.match(atChange.region?.waiting ?? '', /^layout-waiting: /);
+  assert.equal(atChange.mutations, 0);
+  await assertDispatchWait(f, { ids, before, n, w });
+});
+test('band_whitelist r6-C PRODUCTION_DISPATCH_REFUSAL: a no-effect refusal in the production dispatcher leaves no unsettled effect observation', async t => {
+  const f = await interruptedAfterWorkers(t);
+  const ids = await f.ids(), before = f.rects(ids), n = f.mutations().length, w = f.warnings.length;
+  const custody = f.todo.invalidateCustodyEffect.bind(f.todo);
+  f.todo.invalidateCustodyEffect = async op => {
+    await custody(op);
+    if (op.type === 'split' && op.role === 'dag') {
+      const record = await readRecord(f.todo.recordFile);
+      await writeJson(f.todo.recordFile, { ...record, layoutClaim: { ...record.layoutClaim, layout: 'columns' } });
+    }
+  };
+  await f.todo.schedule();
+  await assertDispatchWait(f, { ids, before, n, w });
+});
+
+// Report one old role record as ENOENT at the filesystem read boundary, exactly
+// like the verify-task-6-r3.md reproduction; everything else stays intact.
+function hideRecord(t, file) {
+  const read = fs.promises.readFile;
+  fs.promises.readFile = async (path, ...rest) => {
+    if (String(path) === file) throw Object.assign(new Error('fixture old role record absent'), { code: 'ENOENT' });
+    return read(path, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.promises.readFile = read; syncBuiltinESMExports(); });
+}
+
+// verify-task-6-r3.md B1, LIVE_SLOT_MISSING_RECORD_TRANSITION: the old role's
+// pane, slot registration and viewer live on, only its record is unreadable.
+for (const role of MATRIX_ROLES) test(`band_whitelist B1 LIVE_SLOT_MISSING_RECORD_TRANSITION ${role}: a live registered ${role} pane without its record waits; no split, swap or focus change`, async t => {
+  const f = await bandDashboard(t, { width: 400, sessionId: 'old-conversation' });
+  await f.dag.openPair({ force: true, claim: { ...f.todo.binding, tabId: 'tab', lifetimeId: f.todo.lifetimeId, layout: 'columns' } });
+  const oldIds = await f.ids(), before = f.rects(oldIds), file = f.dag.paneFile(role), old = await readRecord(file);
+  hideRecord(t, file);
+  await f.restart({ sessionId: 'new-conversation' });
+  assert.equal(f.todo.binding.sessionId, 'new-conversation');
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(count).map(head), [], 'no split, swap or focus');
+  assert.deepEqual(f.rects(oldIds), before, 'the chat and both role panes keep their rects');
+  assert.deepEqual(f.fake.panes().sort(), [oldIds.workers, oldIds.dag, 'parent'].sort(), 'one pane per role');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.actor.record.roles[role].paneId, oldIds[role], 'the slot still registers the original pane');
+  assert.ok((await f.dag.inspectShell(old.creationProcessId)).some(row => row.ProcessId === old.processId),
+    'the original viewer is untouched');
+  assert.equal(await readRecord(f.todo.recordFile), null, 'no Todo is created');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1, 'one notice across two automatic passes');
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+});
+
+// Defense in depth: with the Todo live the region decision never runs, so
+// ensureRole itself refuses to split or swap for a role whose slot registration
+// still names a live pane, whatever its record says, on automatic and explicit passes.
+for (const role of MATRIX_ROLES) test(`band_role_guard ${role}: while Todo is live, a registered live ${role} pane whose record is missing is never split, swapped or duplicated`, async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const ids = await f.ids(), rects = f.rects(ids);
+  assert.deepEqual(rects, FRESH_BAND['172x46']);
+  hideRecord(t, f.dag.paneFile(role));
+  const count = f.mutations().length;
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(count).map(head), [], 'an automatic pass makes no mutation');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  await f.todo.schedule(DASHBOARD).catch(() => {});
+  assert.deepEqual(f.mutations().slice(count).map(head), [], 'an explicit /dashboard makes no mutation either');
+  assert.deepEqual(f.rects(ids), rects);
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'one pane per role');
+  assert.equal(f.fake.focused(), 'parent');
+  assert.equal(f.actor.record.roles[role].paneId, ids[role], 'the slot still registers the original pane');
 });

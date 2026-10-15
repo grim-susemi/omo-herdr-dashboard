@@ -3,7 +3,7 @@ import net from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter, once } from 'node:events';
-import { readdir, realpath, stat } from 'node:fs/promises';
+import { readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -67,6 +67,72 @@ export function isBandDashboard(layout, ids) {
     todo.height + workers.height === area.height;
 }
 
+// Cell sizes of the band inside a dashboard region, rounded like a Herdr split
+// (first child = round(fround(length * fround(ratio))), task-1 S2). `fits` is the
+// hard floor; `readable` is reporting only and never a refusal reason.
+export function bandSizes({ width, height }) {
+  const first = (length, ratio) => Math.round(Math.fround(length * Math.fround(ratio)));
+  const todoRows = first(height, BAND_LAYOUT.todoHeight), workersColumns = first(width, BAND_LAYOUT.workersWidth);
+  const lowerRows = height - todoRows;
+  return { todoRows, lowerRows, workersColumns, dagColumns: width - workersColumns,
+    fits: workersColumns >= BAND_LAYOUT.minWorkersColumns && todoRows >= BAND_LAYOUT.minTodoRows &&
+      lowerRows >= BAND_LAYOUT.minLowerRows,
+    readable: workersColumns >= BAND_LAYOUT.readableWorkersColumns };
+}
+
+// The dashboard region a fresh band opens by splitting the chat once at chatShare.
+export function freshBandRegion(parent) {
+  const chat = Math.round(Math.fround(parent.width * Math.fround(BAND_LAYOUT.chatShare)));
+  return { x: parent.x + chat, y: parent.y, width: parent.width - chat, height: parent.height };
+}
+
+const bandWaiting = 'layout-waiting: the dashboard needs a larger terminal (workers >= ' +
+  `${BAND_LAYOUT.minWorkersColumns} columns, Todo >= ${BAND_LAYOUT.minTodoRows} rows, lower row >= ` +
+  `${BAND_LAYOUT.minLowerRows} rows); enlarge this terminal`;
+const unverifiedRegion = 'layout-waiting: an open dashboard pane cannot be verified in this tab; close it, then run /dashboard';
+const claimWaiting = 'layout-waiting: the open dashboard panes have no single recorded layout; close them, then run /dashboard';
+const closedWaiting = 'layout-waiting: the dashboard panes were closed; run /dashboard to reopen them';
+
+// Whether a parent's dashboard region is new, inherited or unverifiable: a
+// whitelist over each role's evidence, so a combination it does not name waits.
+// Per role: its pane record ({ state: 'absent' | 'unreadable' | 'malformed' |
+// 'valid', paneId, tabId, manualClose, layout }), the pane its parent-slot
+// registration names (null without a pane id) and a Map from every pane either
+// names to the tab ids of its list rows and whether it is authoritatively gone.
+// A role is
+// - silent: no record naming a pane, and no registration or one whose pane is gone;
+// - closed: a valid record whose pane, like any registered one, is gone;
+// - consistent: a valid open record in the parent's tab, registered with the same
+//   pane (or with no registration at all while its launch is still pending, so an
+//   interrupted creation resumes), which has exactly one list row, in the parent's tab;
+// - otherwise unverified.
+// FRESH (null) needs a readable list, the parent's tab and only silent roles, or
+// closed ones on an explicit /dashboard: an automatic pass never reopens a
+// dashboard this conversation's owner closed. INHERITED ({ layout }) needs
+// consistent roles sharing one 'band' or 'columns' claim, the rest silent or
+// closed. Everything else is WAIT ({ waiting }), never a throw: a throw latches
+// recovery (IS-10, G4).
+export function decideRegion({ tabId, readable, roles, explicit = false }) {
+  if (!readable || !tabId) return { waiting: unverifiedRegion };
+  const layouts = new Set();
+  let closed = false;
+  for (const { record, registered, panes } of Object.values(roles)) {
+    const named = [record.paneId, registered].filter(id => id !== undefined);
+    if (['absent', 'valid'].includes(record.state) && named.every(id => panes.get(id).gone)) {
+      closed ||= record.paneId !== undefined;
+      continue;
+    }
+    const rows = panes.get(record.paneId)?.rows;
+    if (record.state !== 'valid' || record.manualClose || record.tabId !== tabId ||
+      registered !== record.paneId && !(registered === undefined && record.pending) ||
+      rows?.length !== 1 || rows[0] !== tabId) return { waiting: unverifiedRegion };
+    layouts.add(record.layout);
+  }
+  if (!layouts.size) return closed && !explicit ? { waiting: closedWaiting } : null;
+  const [layout] = layouts;
+  return layouts.size === 1 && ['band', 'columns'].includes(layout) ? { layout } : { waiting: claimWaiting };
+}
+
 export function dagTitle(sessionId) {
   return `DAG · ${sessionId.slice(0, 8)}`;
 }
@@ -105,6 +171,7 @@ export class DagPane {
   enqueue(job, { force = false } = {}) {
     const result = this.queue.then(job);
     this.queue = result.then(() => { this.lastWarning = undefined; }, error => {
+      if (error?.code === 'LAYOUT_WAIT') return; // The Todo pass gives a gate wait its one notice.
       const message = `DAG pane: ${error.message}`;
       const repeat = message === this.lastWarning;
       this.lastWarning = message;
@@ -526,6 +593,11 @@ export class FixedDagPane extends DagPane {
       },
       idle: async () => { await this.queue; await this.roleTail; },
       openPair: options => this.openPair(options),
+      bandLayout: BAND_LAYOUT,
+      bandPreflight: () => this.bandPreflight(),
+      authorityEvidence: () => this.authorityEvidence(),
+      decideAuthority: (evidence, intent) => this.decideAuthority(evidence, intent),
+      ownedRegion: options => this.ownedRegion(options),
       preflightRecovery: () => this.preflightRecovery(),
       replaceRetained: entries => this.replaceRetained(entries),
       arrangeDashboard: () => this.arrangeDashboard(),
@@ -769,7 +841,7 @@ export class FixedDagPane extends DagPane {
       if (typeof this.node === 'function') this.node = await this.node();
       const record = { ...retained.record, ...this.binding, scopeEpoch: this.scopeEpoch,
         statePath: this.roleFile(role), viewerPath: this.viewer, nodePath: this.node, launchToken: randomBytes(24).toString('hex'),
-        prepared: true, ready: false, manualClose: false, layoutClaim: this.claim };
+        prepared: true, ready: false, manualClose: false, layoutClaim: this.claim ?? retained.record.layoutClaim };
       delete record.processId; delete record.viewerBirth;
       await this.coordinator.retireRetainedRole(retained, () => this.roleWrite(async () => {
         this.records.set(role, record);
@@ -779,9 +851,14 @@ export class FixedDagPane extends DagPane {
       await this.launchRole(record);
     }
   }
-  openPair({ force = false, forceRoles, forceCurrent = () => true, offers, claim } = {}) {
+  // A forced pair is explicit; otherwise it inherits the Todo pass it runs in.
+  openPair(options = {}) {
+    const scope = this.coordinator?.passScope;
+    return scope ? scope(options.force, () => this.openPairScoped(options)) : this.openPairScoped(options);
+  }
+  openPairScoped({ force = false, forceRoles, forceCurrent = () => true, offers, claim } = {}) {
     const closureVersions = new Map(this.closureVersions);
-    return this.enqueue(async () => {
+    return this.enqueue(() => this.reportRefusal(async () => {
       if (this.stopped) return {};
       if (this.managedAvailable) {
         if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
@@ -825,6 +902,7 @@ export class FixedDagPane extends DagPane {
       let existing = await this.inspectPair();
       const forceRole = role => force && (forceRoles === undefined || forceRoles.includes(role)) && forceCurrent(role) &&
         (closureVersions.get(role) ?? 0) === (this.closureVersions.get(role) ?? 0);
+      if (this.claim.layout === 'band') return this.openBand(todo, existing, parent.tabId, forceRole);
       if (this.claim.layout === 'columns') {
         const layout = (await this.herdr('layout', '--pane', this.parentPane))?.layout;
         const ids = todo && existing.dag && existing.workers &&
@@ -856,6 +934,9 @@ export class FixedDagPane extends DagPane {
         this.status = workers ? 'current' : 'layout-waiting';
         return { dag, workers };
       }
+      // Only a claim without a layout (a DAG pane with no Todo owner) may use the
+      // legacy stacked placement below; a band or unknown claim never does.
+      if (this.claim.layout !== undefined) throw new Error('layout-waiting: unknown dashboard layout claim');
       if (!existing.dag && existing.workers && todo) {
         // Closing the top DAG collapses the right-hand tree to workers/Todo
         // at 50/50. Restore their owned boundary before inserting the DAG.
@@ -896,7 +977,147 @@ export class FixedDagPane extends DagPane {
         todo ? '0.5' : '0.4', parent.tabId, () => forceRole('workers'), todo?.paneId);
       this.status = workers ? 'current' : 'layout-waiting';
       return { dag, workers };
-    }, { force });
+    }), { force });
+  }
+  // A role creation ensureRole refused reaches the Todo controller as a wait.
+  async reportRefusal(job) {
+    this.refusal = undefined;
+    const pair = await job();
+    return this.refusal ? { ...pair, waiting: pair?.waiting ?? this.refusal } : pair;
+  }
+  // Fresh band: Todo opens by splitting the chat at chatShare. Refuse before that
+  // first mutation when the band it would open is below the floor.
+  async bandPreflight() {
+    const layout = (await this.herdr('layout', '--pane', this.parentPane))?.layout;
+    const parents = layout?.panes?.filter(pane => pane.pane_id === this.parentPane);
+    if (parents?.length !== 1) throw new Error('layout-waiting: missing or ambiguous owned anchor');
+    return bandSizes(freshBandRegion(parents[0].rect)).fits ? null : bandWaiting;
+  }
+  // The final authorization's evidence (r6 A1), phase (a): every await. The
+  // current geometry is read first and the region evidence last, so a change
+  // made while the geometry is read is seen. decideAuthority is phase (b).
+  async authorityEvidence() {
+    const panes = await this.herdr('layout', '--pane', this.parentPane).then(result => result?.layout?.panes, () => undefined); const region = await this.regionEvidence({ explicit: false });
+    return { panes, region };
+  }
+  // Phase (b): synchronous, over that one snapshot; refusal text or null. FRESH
+  // allows only Todo's chat split, within the 118x22 fresh minimum; INHERITED
+  // (the pass claim) a role split, within the band floors of the owned region.
+  decideAuthority({ panes, region }, { role, chat, claim }) {
+    const changed = 'layout-waiting: the dashboard panes changed during this pass; run /dashboard';
+    const decision = region.input ? decideRegion(region.input) : { waiting: region.waiting };
+    const rows = Array.isArray(panes) ? panes : [];
+    if (chat) {
+      if (role !== 'todo' || decision !== null) return decision?.waiting ?? changed;
+      if (claim !== 'band') return null;
+      const parent = rows.filter(pane => pane?.pane_id === this.parentPane);
+      if (parent.length !== 1) return unverifiedRegion;
+      return bandSizes(freshBandRegion(parent[0].rect)).fits ? null : bandWaiting;
+    }
+    if (!decision?.layout || decision.layout !== claim) return decision?.waiting ?? changed;
+    if (decision.layout !== 'band') return null;
+    const ids = Object.values(region.input.roles).map(entry => entry.record.paneId).filter(id => typeof id === 'string' && id);
+    const rects = rows.filter(pane => ids.includes(pane?.pane_id)).map(pane => pane.rect);
+    if (!rects.length) return bandWaiting;
+    const x = Math.min(...rects.map(rect => rect.x)), y = Math.min(...rects.map(rect => rect.y));
+    const width = Math.max(...rects.map(rect => rect.x + rect.width)) - x;
+    const height = Math.max(...rects.map(rect => rect.y + rect.height)) - y;
+    return bandSizes({ width, height }).fits ? null : bandWaiting;
+  }
+  // The dashboard region this parent already has, decided by decideRegion from
+  // every source per role: the Todo/workers/DAG pane records, the parent slot's
+  // registrations and the native list. A record without a layout claims columns.
+  // A role pane is never the chat pane. Presence, not value, is the signal
+  // (attempt 5, verify-task-6-r4.md B1): a record file that exists or a
+  // registration that exists is a signal whatever it holds; only ENOENT, or no
+  // registration key, is absence. Unreadable registrations wait.
+  async recordEvidence(path, matches) {
+    let value;
+    try { value = JSON.parse(await readFile(path, 'utf8')); }
+    catch (error) { return { state: error?.code === 'ENOENT' ? 'absent' : 'unreadable' }; }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return { state: 'malformed' };
+    const claim = value.layoutClaim;
+    return matches(value) && (value.paneId === undefined ||
+      typeof value.paneId === 'string' && value.paneId && value.paneId !== this.parentPane) &&
+      (claim === undefined || claim !== null && typeof claim === 'object' && !Array.isArray(claim))
+      ? { state: 'valid', paneId: value.paneId, tabId: value.tabId, manualClose: value.manualClose === true,
+        layout: claim?.layout ?? 'columns', pending: value.ready !== true }
+      : { state: 'malformed', paneId: typeof value.paneId === 'string' && value.paneId ? value.paneId : undefined };
+  }
+  async ownedRegion(options) {
+    const evidence = await this.regionEvidence(options);
+    return evidence.input ? decideRegion(evidence.input) : evidence;
+  }
+  // The gathering half of ownedRegion: { input } for decideRegion, or { waiting }.
+  async regionEvidence({ explicit = false } = {}) {
+    const panes = await this.herdr('list').then(result => result?.panes, () => undefined);
+    const readable = Array.isArray(panes) && panes.every(pane => typeof pane?.pane_id === 'string' && pane.pane_id);
+    const listed = id => Array.isArray(panes) ? panes.filter(pane => pane?.pane_id === id) : [];
+    const parents = listed(this.parentPane);
+    // An unmanaged dashboard has no parent slot, so it has no registration.
+    let registrations = this.managedAvailable ? undefined : {};
+    if (this.managedAvailable) try { registrations = this.coordinator.actor.snapshot.roles; } catch {}
+    if (registrations === null || typeof registrations !== 'object') return { waiting: unverifiedRegion };
+    const todoRecord = this.coordinator.todoRecord;
+    const roles = {};
+    for (const role of ['todo', 'workers', 'dag']) {
+      // Todo's record comes from the Todo controller; a coordinator without one
+      // (no Todo controller) contributes its registration only.
+      const record = role !== 'todo' ? await this.recordEvidence(this.paneFile(role), value => this.recordMatches(value, role))
+        : todoRecord ? await this.recordEvidence(todoRecord.path, todoRecord.matches) : { state: 'absent' };
+      // A registration without a usable pane id names nothing that can be gone.
+      const registered = !Object.hasOwn(registrations, role) ? undefined
+        : typeof registrations[role]?.paneId === 'string' && registrations[role].paneId ? registrations[role].paneId : null;
+      roles[role] = { record, registered, panes: new Map() };
+      for (const id of new Set([record.paneId, registered].filter(id => id !== undefined))) roles[role].panes.set(id, {
+        rows: listed(id).map(pane => pane.tab_id),
+        gone: await this.paneGone(id, readable ? panes : null) });
+    }
+    return { input: { tabId: parents.length === 1 ? parents[0].tab_id : undefined, readable, roles, explicit } };
+  }
+  // Authoritative absence: a fully readable list has no row for the pane and
+  // Herdr answers pane_not_found for it.
+  async paneGone(id, panes) {
+    if (typeof id !== 'string' || !id || id === this.parentPane) return false;
+    if (panes === undefined) panes = await this.herdr('list').then(result => result?.panes, () => undefined);
+    if (!Array.isArray(panes) || panes.some(pane => typeof pane?.pane_id !== 'string' || !pane.pane_id ||
+      pane.pane_id === id)) return false;
+    try { await this.herdr('get', id); return false; }
+    catch (error) { return authoritativePaneNotFound(error); }
+  }
+  // Band: Todo spans the top, workers (left) and DAG (right) share the row below.
+  // Live roles are only re-verified. A missing role is split from a live
+  // neighbour: workers below Todo, or left of a live DAG by split and swap; DAG
+  // right of workers. Closure stays per role, so a closed DAG never stops workers.
+  async openBand(todo, existing, tabId, forceRole) {
+    const todoHeight = String(BAND_LAYOUT.todoHeight), workersWidth = String(BAND_LAYOUT.workersWidth);
+    const live = {};
+    for (const role of ['workers', 'dag']) if (existing[role]) {
+      live[role] = await this.ensureRole(role, existing[role].paneId, 'right', workersWidth, tabId, () => forceRole(role));
+      if (!live[role]) { this.status = 'layout-waiting'; return live; }
+    }
+    const records = { workers: await readJson(this.paneFile('workers')), dag: await readJson(this.paneFile('dag')) };
+    const needed = role => !live[role] && (forceRole(role) || !records[role]?.manualClose);
+    if (needed('workers') || needed('dag')) {
+      // Measure the owned region before the first mutation of this pass.
+      const owned = [todo?.paneId, records.workers?.paneId, records.dag?.paneId].filter(Boolean);
+      const rects = ((await this.herdr('layout', '--pane', this.parentPane))?.layout?.panes ?? [])
+        .filter(pane => owned.includes(pane.pane_id)).map(pane => pane.rect);
+      if (rects.length) {
+        const x = Math.min(...rects.map(rect => rect.x)), y = Math.min(...rects.map(rect => rect.y));
+        const width = Math.max(...rects.map(rect => rect.x + rect.width)) - x;
+        const height = Math.max(...rects.map(rect => rect.y + rect.height)) - y;
+        if (!bandSizes({ width, height }).fits) { this.status = 'layout-waiting'; return { ...live, waiting: bandWaiting }; }
+      }
+    }
+    let { workers, dag } = live;
+    if (!workers && dag) workers = await this.ensureRole('workers', dag.paneId, 'right', workersWidth, tabId,
+      () => forceRole('workers'), dag.paneId);
+    else if (!workers && todo) workers = await this.ensureRole('workers', todo.paneId, 'down', todoHeight, tabId,
+      () => forceRole('workers'));
+    if (!dag && workers) dag = await this.ensureRole('dag', workers.paneId, 'right', workersWidth, tabId, () => forceRole('dag'));
+    this.status = workers ? 'current' : 'layout-waiting';
+    return { dag, workers };
   }
   async ensureRole(role, anchor, direction, ratio, tabId, force, beforePane) {
     if (force()) await this.roleTail;
@@ -989,6 +1210,16 @@ export class FixedDagPane extends DagPane {
         await this.roleWrite(() => writeJson(this.paneFile(role), record)); return;
       }
     } else if (record?.attempted && !force()) return;
+    // Defense in depth (verify-task-6-r3.md B1): a missing or closed record is no
+    // permission to create a role while the parent slot still registers a pane for
+    // it that is not authoritatively gone, and an automatic pass never swaps,
+    // because a swap selects the new pane (G2, IS-8). Both refusals wait, unmutated.
+    if (this.managedAvailable) {
+      const registration = this.coordinator?.actor?.snapshot.roles?.[role];
+      const refusal = registration && !await this.paneGone(registration.paneId) ? unverifiedRegion
+        : beforePane && !force() ? `layout-waiting: the ${role} pane is closed; run /dashboard to reopen it` : null;
+      if (refusal) { this.refusal = refusal; this.status = 'layout-waiting'; return; }
+    }
     await this.membership(anchor);
     const focusBefore = beforePane ? await this.placementFocus(tabId, beforePane) : null;
     if (typeof this.node === 'function') this.node = await this.node();
@@ -996,16 +1227,26 @@ export class FixedDagPane extends DagPane {
     record = { schema: 'omo-herdr-dashboard/pane/1', ...this.binding, scopeEpoch: this.scopeEpoch,
       role, tabId, statePath: this.roleFile(role), viewerPath: this.viewer, launchToken,
       nodePath: this.node, layoutClaim: this.claim, attempted: true, ready: false, manualClose: false };
+    let previous;
     const prepared = await this.roleWrite(async () => {
       const current = await readJson(this.paneFile(role));
       if (current?.manualClose && !force()) return false;
+      previous = await readFile(this.paneFile(role), 'utf8').catch(error => error?.code === 'ENOENT' ? null : undefined);
       await writeJson(this.paneFile(role), record);
       return true;
     });
     if (!prepared) return;
     if (this.stopped) return;
-    const result = await this.mutate(role, 'split', anchor,
-      ['split', '--pane', anchor, '--direction', direction, '--ratio', ratio, '--cwd', this.cwd, '--no-focus']);
+    let result;
+    try {
+      result = await this.mutate(role, 'split', anchor,
+        ['split', '--pane', anchor, '--direction', direction, '--ratio', ratio, '--cwd', this.cwd, '--no-focus']);
+    } catch (error) {
+      // A no-effect refusal created nothing, so the attempt never happened (r5).
+      if (error?.noEffect === true && previous !== undefined) await this.roleWrite(() =>
+        previous === null ? rm(this.paneFile(role), { force: true }) : writeFile(this.paneFile(role), previous));
+      throw error;
+    }
     if (!result?.pane?.pane_id) throw new Error('Owned fixed-role split returned no pane ID');
     record.paneId = result.pane.pane_id;
     await this.membership(record.paneId);
@@ -1025,7 +1266,10 @@ export class FixedDagPane extends DagPane {
         const selected = (await this.herdr('list'))?.panes?.filter(pane => pane.focused);
         if (selected?.length === 1 && selected[0].pane_id !== record.paneId &&
           await canCleanupPane(await this.herdr('process-info', '--pane', record.paneId), record, this.inspectShell)) {
-          await this.membership(record.paneId); await this.herdr('close', record.paneId); record.paneId = null;
+          // The cleanup close of an unlaunched pane is a layout mutation too: gate it.
+        const refusal = await this.coordinator?.gate?.(role, 'close', { paneId: record.paneId });
+        if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT' });
+        await this.membership(record.paneId); await this.herdr('close', record.paneId); record.paneId = null;
         }
         record.failed = true;
         await this.roleWrite(() => writeJson(this.paneFile(role), record));
@@ -1085,6 +1329,10 @@ export class FixedDagPane extends DagPane {
       const geometry = async () => (await this.herdr('layout', '--pane', this.parentPane))?.layout;
       const layout = await geometry();
       if (isColumnDashboard(layout, ids)) return;
+      // The single mutation gate, asked before the placement journal or any move:
+      // an automatic pass never rearranges (r4).
+      const refusal = await this.coordinator?.gate?.('dag', 'arrange', { paneId: this.parentPane });
+      if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT' });
       // Moving a pane collapses its old branch. A foreign pane must never be
       // resized as an incidental result of that collapse.
       if (layout?.tab_id !== tabId || layout.panes?.length !== 4 ||

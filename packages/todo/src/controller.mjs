@@ -5,10 +5,14 @@ import { EventEmitter, once } from 'node:events';
 import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { displayOwnerKey, installDisplayBridge } from './display-bridge.mjs';
 import { createPresence } from './presence.mjs';
 import { createSnapshotStorage, sameSnapshotScope } from './storage.mjs';
 import { claimParentSlot, cooperativelyReleasedParentSlot, parentSlotPaths, validParentSlot } from './parent-slot.mjs';
+
+// The automatic or explicit Todo pass a managed mutation belongs to.
+const passes = new AsyncLocalStorage();
 
 const execute = promisify(execFile);
 export const dashboardChannels = Object.freeze({
@@ -982,6 +986,8 @@ export class TodoPane {
       if (actor !== this.actor || lifetime !== this.lifetimeId) throw blocked('stale publisher');
       return job(actor);
     }).catch(error => {
+      // A layout wait made no mutation and is not a recovery block (IS-10, G4).
+      if (error?.code === 'LAYOUT_WAIT') throw error;
       // Only real unavailability latches recovery. A rejected stale ACK wrote
       // nothing, and a healthy actor's write error belongs to its caller.
       const unavailable = error?.code === 'MANAGED_UNAVAILABLE' || !actor?.leaseHeld || actor.blocked || actor.draining;
@@ -1114,13 +1120,62 @@ export class TodoPane {
         effect.generation === this.actor.snapshot.generation && effect.lifetimeId === operation.lifetimeId
         ? { id: operation.id, settled: true } : undefined };
   }
+  // The single mutation gate (attempt 5, verify-task-6-r4.md B2/B3). Every managed
+  // native mutation passes here inside the held writer, immediately before the
+  // actor dispatches it. An automatic pass re-gathers all region evidence and
+  // decides it fresh: FRESH authorizes only Todo's first chat split, INHERITED
+  // (the pass's claim) only a role split beside the chat; every swap, resize,
+  // focus, move or close, and every other outcome, waits. An explicit /dashboard
+  // pass keeps its behavior; a viewer's own q/X close runs outside any pass; a
+  // launch or retirement runs in its own verified pane.
+  // Phase (a) of the gate: every await (all region evidence and the current
+  // geometry, gathered into one snapshot). It returns phase (b): a synchronous
+  // decision over that snapshot, which awaits nothing.
+  async layoutEvidence(role, type, target, pass) {
+    // An unmanaged dashboard has no parent slot or region; its placement is unchanged.
+    if (!this.managed || type === 'run' || type === 'retire' || type === 'close' && !pass || pass?.explicit) return () => undefined;
+    const changed = 'layout-waiting: the dashboard panes changed during this pass; run /dashboard';
+    if (type !== 'split' || !this.provider?.authorityEvidence) return () => changed;
+    const evidence = await this.provider.authorityEvidence();
+    const chat = target?.paneId === this.binding.parentPaneId;
+    return () => this.provider.decideAuthority(evidence, { role, chat, claim: this.claim?.layout }) ?? undefined;
+  }
+  async layoutGate(role, type, target, pass) { return (await this.layoutEvidence(role, type, target, pass))(); }
   perform(role, type, target, dispatch) {
+    const pass = passes.getStore();
+    // The authority (r5/r6 A1): inside the parent-slot dispatch the dispatcher
+    // (a) awaits authorize(), the gathering, as its LAST await, then in one
+    // synchronous run (b) calls the returned decision and (c) issues herdr. A
+    // refusal is a known no-effect wait.
+    const authorize = async () => {
+      let decide;
+      try { decide = await this.layoutEvidence(role, type, target, pass); }
+      catch (error) { decide = () => `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
+      return () => {
+        let refusal;
+        try { refusal = decide(); }
+        catch (error) { refusal = `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
+        if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT', noEffect: true });
+      };
+    };
     const result = this.managedWrite(async actor => {
+      // Fast path only: the same gate, before the actor prepares anything.
+      const refusal = await this.layoutGate(role, type, target, pass);
+      if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT', noEffect: true });
       this.layoutActive = true;
       this.bridge?.readinessChanged();
       try {
-        const result = await actor.perform(actor.capability(role === 'todo' ? 'todo' : 'dag', role), { type, target }, dispatch,
-          ({ operation }) => this.invalidateCustodyEffect(operation));
+        let result;
+        try {
+          result = await actor.perform(actor.capability(role === 'todo' ? 'todo' : 'dag', role), { type, target },
+            ({ operation }) => dispatch({ operation, authorize }), ({ operation }) => this.invalidateCustodyEffect(operation));
+        } catch (error) {
+          if (error?.code !== 'LAYOUT_WAIT' || error.noEffect !== true) throw error;
+          // Settled without effect: repaint what PREPARED marked unpainted.
+          this.bridge?.invalidate();
+          await this.presence?.idle();
+          throw error;
+        }
         if (type === 'arrange' || type === 'close' ||
           (type === 'split' || type === 'run') && actor.snapshot.roles[role]?.ack?.painted === false) {
           // PREPARED keeps the paint sequence floor. Repaint the current source
@@ -1335,7 +1390,7 @@ export class TodoPane {
   }
   async mutate(role, type, target, args, observedEffect, beforeSubmit) {
     if (!this.managed) return this.herdr(...args);
-    return this.perform(role, type, target, async ({ operation }) => {
+    return this.perform(role, type, target, async ({ operation, authorize }) => {
       let resolve, reject;
       const effects = new Promise((done, fail) => { resolve = done; reject = fail; });
       effects.catch(() => {});
@@ -1364,9 +1419,15 @@ export class TodoPane {
           }).catch(error => { observation.error = error; });
         }
         await beforeSubmit?.();
+        // (a) The last await before the native command: all gathering.
+        const decide = await authorize();
+        // (b) The decision and (c) the herdr invocation run in one synchronous
+        // run: nothing is awaited between them.
+        decide();
         arrange?.submit();
         submitted = true;
-        const result = await this.herdr(...args);
+        const issued = this.herdr(...args);
+        const result = await issued;
         if (type === 'split') await this.nativePane(result?.pane?.pane_id);
         else if (type === 'close') {
           await exit.effects;
@@ -1376,7 +1437,11 @@ export class TodoPane {
         resolve();
         observation.settled = true;
         return { result, effects };
-      } catch (error) { reject(error); throw error; }
+      } catch (error) {
+        // A no-effect refusal leaves no effect to observe (r6 C).
+        if (error?.noEffect === true) this.effectObservations.delete(operation.id);
+        reject(error); throw error;
+      }
       finally { arrange?.close(); }
     });
   }
@@ -1760,6 +1825,9 @@ export class TodoPane {
     const owner = this;
     return { lifetimeId: this.lifetimeId, binding: this.binding,
       get actor() { return owner.actor; },
+      get todoRecord() { return { path: owner.recordFile, matches: record => owner.recordMatches(record) }; },
+      gate: (role, type, target) => owner.layoutGate(role, type, target, passes.getStore()),
+      passScope: (explicit, job) => passes.run({ explicit: Boolean(explicit || passes.getStore()?.explicit) }, job),
       join: lifetime => this.managedWrite(actor => actor.join('dag', lifetime)),
       perform: (role, type, target, dispatch) => this.perform(role, type, target, dispatch),
       mutate: (role, type, target, args, effect, beforeSubmit) => this.mutate(role, type, target, args, effect, beforeSubmit),
@@ -1993,7 +2061,7 @@ export class TodoPane {
     if (typeof this.node === 'function') this.node = await this.node();
     const record = { ...old, ...this.binding, scopeEpoch: this.scopeEpoch,
       statePath: this.stateFile, viewerPath: this.viewer, nodePath: this.node, launchToken: randomBytes(24).toString('hex'),
-      prepared: true, ready: false, manualClose: false, layoutClaim: this.claim };
+      prepared: true, ready: false, manualClose: false, layoutClaim: this.claim ?? old.layoutClaim };
     delete record.processId; delete record.viewerBirth;
     await this.retireRetainedRole(retained, () => this.roleWrite(async () => {
       await writeJson(this.recordFile, record);
@@ -2041,6 +2109,8 @@ export class TodoPane {
       const before = (await this.herdr('layout', '--pane', this.binding.parentPaneId))?.layout;
       if (before?.tab_id !== this.actor.snapshot.parent.tabId) throw blocked('recovery membership unavailable');
       let members = before.panes.map(pane => pane.pane_id).sort().join('\n');
+      const shape = layout => JSON.stringify([layout.area, layout.panes.map(pane => [pane.pane_id, pane.rect])]);
+      let geometry = shape(before);
       const socket = net.createConnection(process.platform === 'win32'
         ? `\\\\.\\pipe\\${this.binding.socketPath}` : this.binding.socketPath);
       this.recoveryWatch.socket = socket;
@@ -2059,10 +2129,13 @@ export class TodoPane {
         const layout = message.event === 'layout_updated' && message.data?.layout;
         if (layout?.tab_id !== before.tab_id || !layout.panes?.some(pane => pane.pane_id === this.binding.parentPaneId)) return;
         const current = layout.panes.map(pane => pane.pane_id).sort().join('\n');
-        if (current === members) return;
+        // A band waiting for size also retries on a geometry-only change.
+        const resized = shape(layout) !== geometry;
+        geometry = shape(layout);
+        if (current === members && !(resized && this.sizeWaiting)) return;
         members = current;
-        if (!this.stopped && this.recoveryBlocked) {
-          this.recoveryChanged = true;
+        if (!this.stopped && (this.recoveryBlocked || this.sizeWaiting)) {
+          if (this.recoveryBlocked) this.recoveryChanged = true;
           void this.schedule().catch(() => {});
         }
       });
@@ -2073,7 +2146,7 @@ export class TodoPane {
   }
   schedule({ forceRoles = [] } = {}) {
     const closureVersions = new Map(this.closureVersions);
-    return this.enqueue(async () => {
+    const pass = async () => {
       const forceCurrent = role => forceRoles.includes(role) &&
         (closureVersions.get(role) ?? 0) === (this.closureVersions.get(role) ?? 0);
       if (this.managed) {
@@ -2150,10 +2223,38 @@ export class TodoPane {
         }
       }
       const { tabId } = await this.membership(this.binding.parentPaneId);
-      const claim = { ...this.binding, tabId, lifetimeId: this.lifetimeId, layout: 'columns' };
+      const record = await readJson(this.recordFile);
+      // A conversation change keeps the parent's live role panes, so a missing
+      // Todo record alone is not a new dashboard: the region decision is null
+      // (fresh), a layout (inherited) or a wait, which mutates nothing. Every
+      // managed pass decides it, a live Todo's evidence included (r4 B2); the gate
+      // decides again before each mutation (r4 B3).
+      const region = this.managed && provider.ownedRegion
+        ? await provider.ownedRegion({ explicit: forceCurrent('todo') }) : null;
+      const inherited = !record && Boolean(region);
+      if (region && !region.layout) {
+        this.bandWaiting(region.waiting, forceRoles.length > 0);
+        return;
+      }
+      // A new managed dashboard gets the band. An existing one keeps the layout
+      // its Todo record, or else its inherited role records, carry: a record
+      // without 'band' stays columns.
+      const band = this.managed && Boolean(provider.bandLayout) &&
+        (record ? record.layoutClaim?.layout === 'band' : !region || region.layout === 'band');
+      const claim = { ...this.binding, tabId, lifetimeId: this.lifetimeId, layout: band ? 'band' : 'columns' };
       this.claim = claim;
-      if (this.managed && !existing && !await readJson(this.recordFile)) {
-        await this.ensureTodo({ ...this.binding, paneId: this.binding.parentPaneId, tabId, initial: true }, false);
+      // The band opens its area by splitting the chat once; /dashboard does the
+      // same when every role pane of a band is gone. An inherited region's chat
+      // is never split again (G2).
+      const reopen = band && !existing && record && forceCurrent('todo') && !region;
+      if (this.managed && !existing && (!record && !region || reopen)) {
+        if (band) {
+          const waiting = await provider.bandPreflight();
+          this.bandWaiting(waiting, forceRoles.length > 0);
+          if (waiting) return;
+        }
+        await this.ensureTodo({ ...this.binding, paneId: this.binding.parentPaneId, tabId, initial: true,
+          ratio: band ? provider.bandLayout.chatShare : 0.6 }, Boolean(reopen));
       }
       const offers = { dag: this.presence.offer('dag'), workers: this.presence.offer('workers') };
       const pair = await provider.openPair({ force: forceCurrent('dag') || forceCurrent('workers'),
@@ -2167,14 +2268,38 @@ export class TodoPane {
         else this.ownedRoles.delete(role);
       }
       this.bridge?.readinessChanged();
+      if (this.managed) this.bandWaiting(pair?.waiting, forceRoles.length > 0);
+      if (pair?.waiting) return; // r4 B4: a wait ends the pass before any later mutation.
       if (!pair?.workers || pair.workers.role !== 'workers' || !sameDashboardOwner(pair.workers, this.binding) ||
         pair.workers.tabId !== tabId) {
         this.status = 'layout-waiting'; return;
       }
       await this.membership(pair.workers.paneId);
-      if (!existing || forceCurrent('todo')) await this.ensureTodo(pair.workers, forceCurrent('todo'));
+      // An inherited region without a Todo keeps it closed until /dashboard.
+      if (!existing && !inherited || forceCurrent('todo')) await this.ensureTodo(pair.workers, forceCurrent('todo'));
       await provider.arrangeDashboard?.();
-    });
+    };
+    // Every mutation of this pass runs in its scope, so the gate knows whether it
+    // is automatic. A gate refusal is a wait: zero mutations, one notice, no latch.
+    // The same refusal on consecutive passes is noticed once.
+    return this.enqueue(() => passes.run({ explicit: forceRoles.length > 0 }, () => pass().then(() => {
+      this.gateWaiting = undefined;
+    }, error => {
+      if (error?.code !== 'LAYOUT_WAIT') throw error;
+      if (this.gateWaiting === error.message) this.sizeWaiting = error.message;
+      this.gateWaiting = error.message;
+      this.bandWaiting(error.message, forceRoles.length > 0);
+    })));
+  }
+  // Below the band minimum nothing is created. The owner hears it once per
+  // reason (an explicit /dashboard always answers) and a size change retries.
+  bandWaiting(message, force) {
+    const previous = this.sizeWaiting;
+    this.sizeWaiting = message;
+    if (!message) return;
+    this.status = 'layout-waiting';
+    if (force || message !== previous) this.notify(message);
+    void this.watchRecoveryMembership().catch(() => {});
   }
   async ensureTodo(anchor, force) {
     if (force) await this.roleTail;
@@ -2206,7 +2331,7 @@ export class TodoPane {
       const state = await readRoleState(this.stateFile);
       if (!state || !sameDashboardOwner(state, record) || state.paneId !== record.paneId ||
         state.launchToken !== record.launchToken) throw blocked('PREPARED source changed');
-      record = { ...record, scopeEpoch: this.scopeEpoch, layoutClaim: this.claim };
+      record = { ...record, scopeEpoch: this.scopeEpoch, layoutClaim: this.claim ?? record.layoutClaim };
       await this.roleWrite(async () => {
         await writeJson(this.recordFile, record);
         await writeJson(this.stateFile, this.roleState(record));
@@ -2222,7 +2347,7 @@ export class TodoPane {
         record = await this.roleWrite(async () => {
           const current = await readJson(this.recordFile);
           if (this.stopped || current.launchToken !== record.launchToken || current.manualClose && !force) return null;
-          const next = { ...current, scopeEpoch: this.scopeEpoch, layoutClaim: this.claim,
+          const next = { ...current, scopeEpoch: this.scopeEpoch, layoutClaim: this.claim ?? current.layoutClaim,
             processId: process.pid, ready: true, manualClose: false };
           await writeJson(this.recordFile, next);
           await writeJson(this.stateFile, this.roleState(next));
@@ -2286,11 +2411,20 @@ export class TodoPane {
     record = { schema: 'omo-herdr-dashboard/pane/1', ...this.binding, scopeEpoch: this.scopeEpoch, role: 'todo',
       statePath: this.stateFile, viewerPath: this.viewer, tabId, launchToken,
       nodePath: this.node, layoutClaim: this.claim, attempted: true, ready: false, manualClose: false };
+    const previous = await readFile(this.recordFile, 'utf8').catch(error => error?.code === 'ENOENT' ? null : undefined);
     await writeJson(this.recordFile, record);
     if (this.stopped) return;
-    const split = await this.mutate('todo', 'split', this.managed ? await this.currentTarget(anchor.paneId) : null,
-      ['split', '--pane', anchor.paneId, '--direction', anchor.initial ? 'right' : 'down',
-        '--ratio', anchor.initial ? '0.6' : '0.5', '--cwd', this.cwd, '--no-focus']);
+    let split;
+    try {
+      split = await this.mutate('todo', 'split', this.managed ? await this.currentTarget(anchor.paneId) : null,
+        ['split', '--pane', anchor.paneId, '--direction', anchor.initial ? 'right' : 'down',
+          '--ratio', anchor.initial ? String(anchor.ratio) : '0.5', '--cwd', this.cwd, '--no-focus']);
+    } catch (error) {
+      // A no-effect refusal created nothing, so the attempt never happened (r5).
+      if (error?.noEffect === true && previous !== undefined)
+        await (previous === null ? rm(this.recordFile, { force: true }) : writeFile(this.recordFile, previous));
+      throw error;
+    }
     if (!split?.pane?.pane_id) throw new Error('Owned Todo split returned no pane ID');
     record.paneId = split.pane.pane_id;
     await this.membership(record.paneId);
