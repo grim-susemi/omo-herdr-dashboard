@@ -92,9 +92,12 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
         deliver(observer);
         return;
       }
+      // A committed waiting snapshot (a readable branch without a native Todo) is
+      // painted and acknowledged like current or empty; an error or last-known is
+      // not. The display bridge alone keeps todo-sidebar unmasked without a Todo.
       if (message.type !== 'ack' || message.role !== observer.role || !baseline ||
         message.sequence !== baseline.sequence || message.sequence !== observer.sequence ||
-        !['current', 'empty'].includes(state.availability)) {
+        !['current', 'empty', 'waiting'].includes(state.availability)) {
         clearLease(observer);
         emit('rejected', { reason: 'ack', role: observer.role });
         changed();
@@ -196,7 +199,7 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
     },
     isReady(receipt) {
       const observer = observers.get(receipt?.role);
-      return !closed && ['current', 'empty'].includes(state.availability) &&
+      return !closed && ['current', 'empty', 'waiting'].includes(state.availability) &&
         sameSnapshotScope(receipt, owner) && Number.isSafeInteger(receipt.sequence) &&
         receipt.sequence === baseline?.sequence && observer?.sequence === receipt.sequence &&
         observer.expires > clock.now();

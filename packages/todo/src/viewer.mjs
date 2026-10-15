@@ -226,8 +226,8 @@ export async function startViewer(options, { input = process.stdin, output = pro
         await write(raw);
         const matches = current(captured.generation, captured.client) && captured.message !== null &&
           captured.message === message && captured.observation === observation && validatedObservation === observation &&
-          sameSnapshotScope(captured.scope, state) && ['current', 'empty'].includes(captured.availability) &&
-          ['current', 'empty'].includes(availability);
+          sameSnapshotScope(captured.scope, state) && ['current', 'empty', 'waiting'].includes(captured.availability) &&
+          ['current', 'empty', 'waiting'].includes(availability);
         events.emit('frame', { ...frame, raw, scope: captured.scope,
           sequence: captured.message?.sequence, stale: !matches });
         if (matches) captured.client.painted(captured.message);

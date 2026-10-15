@@ -14,10 +14,14 @@ import { createRoleClient } from '../packages/todo/src/presence.mjs';
 import { createBandDashboard, NATIVE_MUTATIONS, readRecord } from './helpers/band-dashboard.mjs';
 
 const KEYS = ['omo-dag', 'omo-task', 'todo-sidebar'];
+// Without a native Todo only the worker and DAG lines have something to replace.
+const WORKER_KEYS = ['omo-dag', 'omo-task'];
 const DASHBOARD = { forceRoles: ['dag', 'workers', 'todo'] };
 // The selected branch holds a native Todo (a todo tool result); it never changes here.
 const BRANCH = Object.freeze([{ type: 'message', id: 'todo-entry', message: { role: 'toolResult', toolName: 'todo',
   isError: false, details: { todos: [{ content: 'Migrate the dashboard', status: 'in_progress' }] } } }]);
+// A conversation without a native Todo: the bridge publishes a waiting snapshot.
+const NO_TODO = Object.freeze([{ type: 'message', id: 'chat-entry', message: { role: 'user', content: 'Arrange the dashboard' } }]);
 const NATIVE_LINES = { 'todo-sidebar': ['native todo'], 'omo-task': ['worker line'], 'omo-dag': ['dag line'] };
 
 // The host UI under the input box: what the owner sees. The bridge wraps setWidget.
@@ -59,9 +63,10 @@ function hidden(host, keys, label, ms = 20000) {
 // A viewer as the real ones bind presence (packages/dag/src/viewer.mjs bindPresence,
 // packages/todo/src/viewer.mjs connect): it watches its role state file, connects
 // with the presence offer the controller wrote there, and ACKs each snapshot it
-// painted, only for a current or empty source.
-function startViewer(statePath) {
-  let key, client, paintAgain, closed = false, tail = Promise.resolve();
+// painted: a current, empty or waiting (no native Todo) source. With paints false
+// it receives snapshots but paints only on paintAgain(); seen hears each receipt.
+function startViewer(statePath, { paints = true, seen } = {}) {
+  let key, client, paintAgain, received, closed = false, tail = Promise.resolve();
   const bind = async () => {
     if (closed) return;
     let state;
@@ -71,10 +76,12 @@ function startViewer(statePath) {
     key = JSON.stringify(offer); client?.close(); client = undefined;
     if (!offer) return;
     const next = createRoleClient({ offer, onSnapshot: (snapshot, message) => {
-      if (['current', 'empty'].includes(snapshot.availability)) {
+      received = message.sequence;
+      if (['current', 'empty', 'waiting'].includes(snapshot.availability)) {
         paintAgain = () => next.painted(message);
-        setImmediate(paintAgain);
+        if (paints) setImmediate(paintAgain);
       }
+      seen?.emit('change');
     } });
     client = next;
   };
@@ -83,7 +90,8 @@ function startViewer(statePath) {
     tail = tail.then(bind);
   });
   tail = tail.then(bind);
-  return { paintAgain() { assert.ok(paintAgain); paintAgain(); }, close() { closed = true; watcher.close(); client?.close(); } };
+  return { get received() { return received; }, paintAgain() { assert.ok(paintAgain); paintAgain(); },
+    close() { closed = true; watcher.close(); client?.close(); } };
 }
 
 // The placement journal's phase, read synchronously so that observing it does not
@@ -129,13 +137,13 @@ async function ackMismatches(f) {
   return text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.code === 'ACK_MISMATCH').length;
 }
 
-// Generation 7 opened columns (liveColumns in test/managed-layout.test.mjs, 172x46),
-// the conversation reloads, then the owner runs /dashboard. Returns after the
-// migration's native mutations, before any assertion about readiness.
-async function migrate(t, { interrupt = false } = {}) {
-  const host = hostUi(), viewers = new Map();
-  const f = await createBandDashboard({ generation: '000007',
-    display: { ui: host.ui, getBranch: () => BRANCH, getLeafId: () => 'todo-entry' } });
+// The dashboard over the real Todo controller start() and a host UI, with one
+// viewer per launched role (paints(role) false: that viewer never paints by
+// itself). source.error, when set, makes every branch read throw.
+async function open(t, { branch = BRANCH, paints = () => true } = {}) {
+  const host = hostUi(), viewers = new Map(), seen = new EventEmitter(), source = { error: null };
+  const f = await createBandDashboard({ generation: '000007', display: { ui: host.ui,
+    getBranch: () => { if (source.error) throw source.error; return branch; }, getLeafId: () => branch.at(-1).id } });
   t.after(async () => {
     for (const viewer of viewers.values()) viewer.close();
     await f.dispose();
@@ -143,8 +151,17 @@ async function migrate(t, { interrupt = false } = {}) {
   f.hooks.launch = async (role, phase) => {
     if (phase !== 'after') return;
     viewers.get(role)?.close();
-    viewers.set(role, startViewer(role === 'todo' ? f.todo.stateFile : f.dag.roleFile(role)));
+    viewers.set(role, startViewer(role === 'todo' ? f.todo.stateFile : f.dag.roleFile(role), { paints: paints(role), seen }));
   };
+  return { f, host, viewers, seen, source };
+}
+
+// Generation 7 opened columns (liveColumns in test/managed-layout.test.mjs, 172x46),
+// the conversation reloads, then the owner runs /dashboard. Returns after the
+// migration's native mutations, before any assertion about readiness. keys: the
+// native lines masked at each startup.
+async function migrate(t, { interrupt = false, branch, keys = KEYS } = {}) {
+  const { f, host, viewers, source } = await open(t, { branch });
   const provider = f.todo.provider, band = provider.bandLayout;
   delete provider.bandLayout;
   try { await f.todo.schedule(); } finally { provider.bandLayout = band; }
@@ -152,14 +169,14 @@ async function migrate(t, { interrupt = false } = {}) {
   await f.fake.herdr('resize', '--pane', 'parent', '--direction', 'left', '--amount', String(root.ratio - 69 / 172));
   assert.equal(isColumnDashboard(f.layout(), ids), true, 'generation 7 opened columns');
   drawNativeLines(host);
-  await hidden(host, KEYS, 'first startup');
+  await hidden(host, keys, 'first startup');
   assert.equal(f.actor.snapshot.phase, 'READY');
   const startups = [await ackMismatches(f)];
   // /reload: the controller stops and a new one claims the slot and adopts the live panes.
   await f.restart();
   await f.todo.schedule();
   drawNativeLines(host);
-  await hidden(host, KEYS, 'after the reload');
+  await hidden(host, keys, 'after the reload');
   assert.equal(f.actor.snapshot.phase, 'READY');
   const before = f.todo.presence.state.snapshot, fromHistory = host.history.length;
   // From the /dashboard pass on: every native mutation, every READY the actor
@@ -203,7 +220,7 @@ async function migrate(t, { interrupt = false } = {}) {
     finally { arranging = false; f.hooks.after = undefined; }
   };
   await retry();
-  return { f, host, ids, startups, before, fromHistory, mutations, ready, masking, viewers, retry };
+  return { f, host, ids, startups, before, fromHistory, mutations, ready, masking, viewers, retry, source };
 }
 
 test('band_ready_geometry_and_fresh_paints: after /dashboard migrates columns to the band, fresh paints make the slot READY and the bridge masks todo-sidebar, omo-task and omo-dag without a Todo change', async t => {
@@ -313,4 +330,75 @@ test('band interrupted arrangement: viewer paint renewals keep native lines visi
   assert.deepEqual(f.todo.presence.state.snapshot.phases, before.phases);
   startups.push(await ackMismatches(f));
   assert.ok(startups.every(count => count <= 2), `ACK_MISMATCH per startup: ${startups}`);
+});
+
+test('band_no_todo_masks_workers_and_dag: without a native Todo, painted waiting frames make the slot READY at startup, after the reload and after /dashboard; the bridge masks omo-task and omo-dag, never todo-sidebar', async t => {
+  const run = await migrate(t, { branch: NO_TODO, keys: WORKER_KEYS }), { f, host, ids, startups, before, source } = run;
+  assert.equal(before.availability, 'waiting', 'no native Todo');
+  // Completed geometry and settled effects.
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(await f.ids(), ids, 'the same panes');
+  assert.equal(journalPhase(f), 'COMPLETE');
+  assert.equal(await f.claimLayout(), 'band');
+  await hidden(host, WORKER_KEYS, 'after the migration');
+  assertArrangedReadiness(run);
+  const slot = f.actor.snapshot, published = f.todo.presence.state.snapshot;
+  assert.equal(slot.phase, 'READY');
+  assert.ok(slot.operations.every(operation => operation.status === 'SETTLED'));
+  assert.equal(published.availability, 'waiting');
+  for (const role of ['todo', 'dag', 'workers'])
+    assert.deepEqual(slot.roles[role].ack, { sequence: published.sequence, painted: true }, role);
+  assert.deepEqual(f.todo.bridge.status.masked.sort(), WORKER_KEYS);
+  // There is no native Todo to replace: todo-sidebar is never masked.
+  assert.deepEqual(host.visible.get('todo-sidebar'), NATIVE_LINES['todo-sidebar']);
+  assert.ok(host.history.every(entry => entry.key !== 'todo-sidebar' || entry.shown), 'todo-sidebar never masked');
+  startups.push(await ackMismatches(f));
+  assert.ok(startups.every(count => count <= 2), `ACK_MISMATCH per startup: ${startups}`);
+  assert.deepEqual(f.warnings, []);
+  // A branch read that throws still fails closed: every native line returns.
+  source.error = new Error('session branch unreadable');
+  f.todo.bridge.readinessChanged();
+  assert.deepEqual(f.todo.bridge.status.masked, []);
+  for (const key of KEYS) assert.deepEqual(host.visible.get(key), NATIVE_LINES[key], `${key} restored on a read error`);
+});
+
+test('band_no_todo_unpainted_role_not_masked: at a fresh band startup without a native Todo, a role that never painted keeps every native line shown; its paint then masks omo-task and omo-dag', async t => {
+  const { f, host, viewers, seen } = await open(t, { branch: NO_TODO, paints: role => role !== 'dag' });
+  // Subscribe before the startup: the latest sequence each role's paint was accepted for.
+  const presence = f.todo.presence, acked = new Map();
+  presence.events.on('event', event => {
+    if (event.type === 'ack') acked.set(event.role, event.sequence);
+    seen.emit('change');
+  });
+  await f.todo.schedule();
+  drawNativeLines(host);
+  const ids = await f.ids();
+  assert.equal(isBandDashboard(f.layout(), ids), true, 'a fresh managed startup opens the band');
+  // The todo and workers viewers painted the current waiting frame and presence
+  // accepted their paints; the DAG viewer received it and never painted.
+  const sequence = () => presence.state.snapshot?.sequence;
+  const painted = () => sequence() !== undefined && viewers.get('dag')?.received === sequence() &&
+    acked.get('todo') === sequence() && acked.get('workers') === sequence();
+  await when(seen, painted, () => `waiting paints not accepted: ${JSON.stringify({ sequence: sequence(),
+    received: viewers.get('dag')?.received, acked: [...acked] })}`);
+  await f.todo.managedIdle();
+  await f.todo.roleTail;
+  assert.ok(painted(), 'no newer publication');
+  assert.equal(presence.state.snapshot.availability, 'waiting');
+  for (const role of ['todo', 'workers'])
+    assert.deepEqual(f.actor.snapshot.roles[role].ack, { sequence: sequence(), painted: true }, role);
+  assert.notEqual(f.actor.snapshot.roles.dag.ack?.painted, true, 'the DAG never painted');
+  assert.notEqual(f.actor.snapshot.phase, 'READY');
+  assert.deepEqual(f.todo.bridge.status.masked, []);
+  for (const key of KEYS) assert.deepEqual(host.visible.get(key), NATIVE_LINES[key], `${key} shown`);
+  // The DAG viewer paints the frame it received: only the worker and DAG lines are masked.
+  const masked = hidden(host, WORKER_KEYS, 'after the DAG paint');
+  viewers.get('dag').paintAgain();
+  await masked;
+  await f.todo.managedIdle();
+  assert.equal(f.actor.snapshot.phase, 'READY');
+  assert.deepEqual(f.actor.snapshot.roles.dag.ack, { sequence: sequence(), painted: true });
+  assert.deepEqual(f.todo.bridge.status.masked.sort(), WORKER_KEYS);
+  assert.deepEqual(host.visible.get('todo-sidebar'), NATIVE_LINES['todo-sidebar']);
+  assert.deepEqual(f.warnings, []);
 });

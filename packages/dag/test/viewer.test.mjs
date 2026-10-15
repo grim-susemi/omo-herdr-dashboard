@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { watch } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -763,4 +764,74 @@ for (const view of ['dag', 'tasks']) test(`fixed ${view} follow keeps auto revea
     text.includes(view === 'dag' ? 'DAG (0)' : 'NEW_SCOPE_WORKER'));
   assert.doesNotMatch(rebased, /GRAPH_8|RETAINED_WORKER|LINKED_n8|ORDINARY_9/);
   await viewer.close();
+});
+
+// The fixed DAG viewer on a terminal without a PTY: stdin and stdout report a
+// TTY, so it binds presence and ACKs its painted frames as in a Herdr pane.
+const terminalShim = `data:text/javascript,${encodeURIComponent('for (const stream of [process.stdin, process.stdout]) ' +
+  "Object.defineProperty(stream, 'isTTY', { value: true }); process.stdin.setRawMode = () => process.stdin;")}`;
+
+test('fixed dag viewer ACKs a painted waiting presence snapshot (no native Todo) with its exact binding', { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-waiting-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'role.json');
+  const state = { schema: 'omo-herdr-dashboard/role/1', sessionId: 'waiting-scope', socketPath: 'fixture',
+    parentPaneId: 'fixture-parent', tabId: 'fixture-tab', paneId: 'fixture-owned', scopeEpoch: 1, role: 'dag',
+    launchToken: randomUUID(), connected: true, language: 'en', controlOffer: null, runs: [], tasks: [] };
+  state.ownerKey = createHash('sha256').update(JSON.stringify([state.socketPath, state.parentPaneId, state.sessionId]))
+    .digest('hex').slice(0, 24);
+  const binding = { v: 1, token: randomUUID(), ownerKey: state.ownerKey, sessionId: state.sessionId, scopeEpoch: 1, role: 'dag' };
+  const pipePath = `\\\\.\\pipe\\dag-waiting-${process.pid}-${randomUUID()}`;
+  state.presenceOffer = { pipePath, ...binding, sequence: 0 };
+  // The presence end of the pipe: one waiting snapshot after the hello, then every ACK.
+  const peer = new EventEmitter(), sockets = new Set();
+  let hello = false;
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.once('close', () => sockets.delete(socket));
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk;
+      for (let cut = buffer.indexOf('\n'); cut >= 0; cut = buffer.indexOf('\n')) {
+        const message = JSON.parse(buffer.slice(0, cut)); buffer = buffer.slice(cut + 1);
+        if (message.type !== 'hello') { peer.emit('message', message); continue; }
+        hello = true;
+        socket.write(`${JSON.stringify({ type: 'snapshot', ...binding, sequence: 1, snapshot: { ownerKey: binding.ownerKey,
+          sessionId: binding.sessionId, scopeEpoch: 1, sequence: 1, availability: 'waiting', phases: [] } })}\n`);
+      }
+    });
+  });
+  const listening = once(server, 'listening');
+  server.listen(pipePath); await listening;
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  await writeJson(file, state);
+  let frames = 0, stderr = '', child;
+  // Subscribe before the viewer starts; bounded.
+  const acked = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no ACK of the painted waiting snapshot: hello ${hello}, frames ${frames}, ` +
+      `exit ${child.exitCode}\n${stderr}`)), 10000);
+    peer.once('message', message => { clearTimeout(timer); resolve(message); });
+  });
+  child = spawn(process.execPath, ['--import', terminalShim, fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)),
+    '--view', 'dag', '--state', file, '--close-pane', state.paneId, '--launch-token', state.launchToken],
+  { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, HERDR_ENV: '0' } });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', data => { stderr += data; });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', data => { frames += data.split('\x1b[H').length - 1; });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+    child.stdin.write('q');
+    await exited.catch(() => child.kill());
+  });
+  assert.deepEqual(await acked, { type: 'ack', ...binding, sequence: 1 });
+  const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+  child.stdin.write('q');
+  assert.equal((await exited)[0], 0, stderr);
 });

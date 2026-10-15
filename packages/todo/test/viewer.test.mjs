@@ -571,3 +571,18 @@ test('completion transition animates once and stops its 65ms timer without remov
   await publish(); await repeated;
   assert.equal(f.time.intervalCount(65), 0);
 });
+
+test('a waiting snapshot (no native Todo) is ACKed after its output callback; the source error that follows is not', async t => {
+  const f = await fixture(t);
+  const receipt = await f.presence.publish({ ...projectNativeTodo([]), ...f.presence.getOwner() });
+  assert.equal(f.presence.state.availability, 'waiting');
+  const ack = signal(f.presence.events, 'event', event => event.type === 'ack' && event.role === 'todo' &&
+    event.sequence === receipt.sequence);
+  const viewer = await f.start(); await ack;
+  assert.equal(viewer.state.availability, 'waiting');
+  assert.equal(f.presence.isReady({ ...receipt, role: 'todo' }), true);
+  const stale = signal(viewer.events, 'frame', frame => frame.stale);
+  f.presence.sourceFailed(Object.assign(new Error('read failed'), { code: 'EPERM' }), f.presence.getOwner());
+  await stale;
+  assert.equal(f.presence.isReady({ ...receipt, role: 'todo' }), false);
+});

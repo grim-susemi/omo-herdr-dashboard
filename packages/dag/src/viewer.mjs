@@ -217,7 +217,7 @@ function draw() {
   process.stdout.write(interactive ? `\x1b[H${frame.replaceAll('\n', '\x1b[K\r\n')}\x1b[K` : `${frame}\n`, cause => {
     if (cause || closing || !client || presenceClient !== client || presenceMessage !== message ||
       !message || !sameScope(state, paintedScope) || !sameScope(message, state) || !state.connected ||
-      !['current', 'empty'].includes(message.snapshot.availability) || client.destroyed) return;
+      !['current', 'empty', 'waiting'].includes(message.snapshot.availability) || client.destroyed) return;
     const offer = state.presenceOffer;
     client.write(`${JSON.stringify({ type: 'ack', v: offer.v, token: offer.token, ownerKey: offer.ownerKey,
       sessionId: offer.sessionId, scopeEpoch: offer.scopeEpoch, role, sequence: message.sequence })}\n`);

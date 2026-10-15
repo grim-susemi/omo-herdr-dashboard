@@ -313,3 +313,44 @@ test('serialized delivery follows cache commit; ENOENT/EPERM publication failure
     assert.ok(widgets.has('todo-sidebar'));
   }
 });
+
+test('a painted waiting snapshot (no native Todo) is ACKed and leased; wrong role or sequence, expiry and a source error still fail closed', async t => {
+  const clock = fakeClock();
+  const presence = createPresence({ ...owner, storage: memoryStorage(), clock, pipePath: pipe('waiting') });
+  t.after(() => presence.close());
+  await presence.start();
+  const receipt = await presence.publish({ ...snapshot(presence), ...projectNativeTodo([]) });
+  assert.equal(presence.state.availability, 'waiting');
+  const attached = attachClient(t, presence, 'dag');
+  const message = await signal(attached.client.events, 'snapshot');
+  assert.equal(message.snapshot.availability, 'waiting');
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), false, 'delivery is not a paint');
+  const offer = presence.offer('dag');
+  for (const [field, value] of [['sequence', receipt.sequence + 1], ['role', 'workers']]) {
+    const rejected = signal(presence.events, 'event', event => event.type === 'rejected');
+    attached.client.socket.write(`${JSON.stringify({ ...offer, type: 'ack', sequence: receipt.sequence, [field]: value })}\n`);
+    await rejected;
+    assert.equal(presence.isReady({ ...receipt, role: 'dag' }), false);
+  }
+  const ack = signal(presence.events, 'event', event => event.type === 'ack' && event.role === 'dag');
+  await paint(attached.client, message, []);
+  await ack;
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), true);
+  assert.equal(presence.isReady({ ...receipt, role: 'todo' }), false, 'only the painted role');
+  assert.equal(presence.isReady({ ...receipt, scopeEpoch: 2, role: 'dag' }), false);
+  clock.advance(10000);
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), false, 'the paint lease expires');
+  const renewal = signal(presence.events, 'event', event => event.type === 'ack' && event.role === 'dag');
+  await paint(attached.client, message, []);
+  await renewal;
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), true);
+  const status = signal(attached.client.events, 'status');
+  presence.sourceFailed(Object.assign(new Error('read failed'), { code: 'EPERM' }), presence.getOwner());
+  await status;
+  assert.equal(presence.state.availability, 'error', 'a waiting snapshot is never last-known');
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), false);
+  const rejected = signal(presence.events, 'event', event => event.type === 'rejected');
+  attached.client.socket.write(`${JSON.stringify({ ...offer, type: 'ack', sequence: receipt.sequence })}\n`);
+  await rejected;
+  assert.equal(presence.isReady({ ...receipt, role: 'dag' }), false);
+});
