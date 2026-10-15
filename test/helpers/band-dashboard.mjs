@@ -29,8 +29,12 @@ export async function readRecord(path) {
 // models an install-generation upgrade that relaunches the live viewers.
 // hooks.before(args): runs before every native call; a throw is that call's reply.
 // hooks.after(args): runs after every native call took effect, before its reply.
+// display: { ui, getBranch, getLeafId } runs the Todo controller's real start()
+// instead of the presence and bridge fakes: the real presence pipe, readiness
+// adapter and display bridge (over display.ui) and the parent-slot claim start()
+// makes. restart() then stops the controller as a reload does.
 export async function createBandDashboard({ width = 172, height = 46, managed = true, events = false,
-  sessionId = 'session', generation: installed = '000004' } = {}) {
+  sessionId = 'session', generation: installed = '000004', display } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-band-'));
   const socketPath = join(directory, 'herdr-socket');
   const pipePath = process.platform === 'win32' ? `\\\\.\\pipe\\${socketPath}` : socketPath;
@@ -91,7 +95,9 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
   const createControllers = async () => {
     todo = new TodoPane({ managed, stateDir: join(directory, 'todo'), cwd: directory, herdr, inspectShell,
       environment: { HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: 'parent' },
-      ctx: { sessionManager: { getSessionId: () => session, getSessionFile: () => join(directory, `${session}.jsonl`) } },
+      ctx: { ...(display && { hasUI: true, mode: 'tui', ui: display.ui }), sessionManager: { getSessionId: () => session,
+        getSessionFile: () => join(directory, `${session}.jsonl`),
+        ...(display && { getBranch: display.getBranch, getLeafId: display.getLeafId }) } },
       node: 'node', viewer: join(directory, `generation-${generation}`, 'todo', 'viewer.mjs'),
       // A verified viewer retirement: the viewer exits and leaves its shell.
       retireViewer: async record => { delete panes.get(record.paneId).viewer; return { manual: false }; },
@@ -101,16 +107,19 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
       viewer: join(directory, `generation-${generation}`, 'dag', 'viewer.mjs'), notify: message => warnings.push(message) });
     controllers.push(todo, dag);
     todo.scopeEpoch = dag.scopeEpoch = 1;
-    // Per conversation, like the real scope cache under the owner directory.
-    todo.storage = { path: join(todo.directory, 'todo-cache.json') };
-    todo.presence = { events: new EventEmitter(), offer: role => ({ v: 1, ...todo.binding, role, scopeEpoch: 1 }),
-      rotateRole: role => ({ v: 1, ...todo.binding, role, scopeEpoch: 1 }), idle: async () => {}, close: async () => {} };
-    todo.bridge = { invalidate() {}, readinessChanged() {}, remove() {} };
+    if (!display) {
+      // Per conversation, like the real scope cache under the owner directory.
+      todo.storage = { path: join(todo.directory, 'todo-cache.json') };
+      todo.presence = { events: new EventEmitter(), offer: role => ({ v: 1, ...todo.binding, role, scopeEpoch: 1 }),
+        rotateRole: role => ({ v: 1, ...todo.binding, role, scopeEpoch: 1 }), idle: async () => {}, close: async () => {} };
+      todo.bridge = { invalidate() {}, readinessChanged() {}, remove() {} };
+    }
     if (!events) todo.watchRecoveryMembership = async () => {};
     todo.publishCustodyBinding = async () => {};
     todo.holdRoleViewer = async () => {};
     dag.sourceSaved();
-    dag.save = async () => {};
+    // With a display the role state files carry the real presence offers to the viewers.
+    if (!display) dag.save = async () => {};
     todo.provider = dag.provider();
     dag.coordinator = todo.coordinator();
     // Like the production dispatcher: the authorization is the last await before the native call.
@@ -125,6 +134,15 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     // The real start() saves each source before scheduling; discovery needs the directories.
     await mkdir(todo.directory, { recursive: true });
     await mkdir(dag.directory, { recursive: true });
+    if (display) {
+      await todo.start();
+      if (!managed) return;
+      actor = todo.actor;
+      actors.push(actor);
+      dag.managedActor = actor;
+      await actor.join('dag', dag.lifetimeId);
+      return;
+    }
     if (!managed) return;
     const observed = await todo.observeManaged({});
     actor = await claimParentSlot({ stateDir: join(directory, 'owner'), socketPath, ...observed,
@@ -205,22 +223,28 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
     // cooperatively and fresh controllers claim the same parent slot. A new
     // sessionId makes it a conversation change that keeps the live panes.
     async restart({ sessionId: next, generation: upgrade } = {}) {
-      const releasing = actor.release();
-      await actor.drain('todo', todo.lifetimeId); await actor.drain('dag', dag.lifetimeId);
-      await releasing;
+      if (display) await todo.stop();
+      else {
+        const releasing = actor.release();
+        await actor.drain('todo', todo.lifetimeId); await actor.drain('dag', dag.lifetimeId);
+        await releasing;
+      }
       if (next) session = next;
       if (upgrade) generation = upgrade;
       await createControllers();
     },
     async dispose() {
-      for (const controller of controllers) controller.recoveryWatch?.socket?.destroy();
-      peer?.destroy();
-      if (server?.listening) await new Promise(resolve => server.close(resolve));
-      for (const value of actors) if (value.db.isOpen) {
-        if (value.db.isTransaction) value.db.exec('ROLLBACK');
-        value.db.close();
+      // The real presence and control pipes close with the controller.
+      try { if (display) await todo.stop(); } finally {
+        for (const controller of controllers) controller.recoveryWatch?.socket?.destroy();
+        peer?.destroy();
+        if (server?.listening) await new Promise(resolve => server.close(resolve));
+        for (const value of actors) if (value.db.isOpen) {
+          if (value.db.isTransaction) value.db.exec('ROLLBACK');
+          value.db.close();
+        }
+        await rm(directory, { recursive: true, force: true });
       }
-      await rm(directory, { recursive: true, force: true });
     },
   };
 }

@@ -1166,6 +1166,7 @@ export class TodoPane {
       const refusal = await this.layoutGate(role, type, target, pass);
       if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT', noEffect: true });
       this.layoutActive = true;
+      if (this.arrangement) this.arrangement.moving = true;
       this.bridge?.readinessChanged();
       try {
         let result;
@@ -1465,7 +1466,7 @@ export class TodoPane {
     const old = this.actor.snapshot.roles[event.role];
     if (this.actor.snapshot.phase === 'READY' && old?.ack?.painted &&
       old.ack.sequence === event.sequence && old.generation === this.actor.snapshot.generation) return;
-    void this.managedWrite(async actor => {
+    void this.managedReady(async actor => {
       const record = actor.snapshot.roles[event.role];
       const receipt = { ...this.presence.getOwner(), role: event.role, sequence: event.sequence };
       if (!record || !this.presence.isReady(receipt)) return;
@@ -1475,9 +1476,21 @@ export class TodoPane {
         await actor.ackRole({ ...actor.capability(event.role === 'todo' ? 'todo' : 'dag', event.role),
           paneId: record.paneId, statePath: record.statePath, launchToken: record.launchToken,
           controlToken: record.controlToken, painted: true, sequence: event.sequence });
-      const snapshot = actor.snapshot;
-      if (snapshot.phase !== 'READY' && ['todo', 'dag', 'workers'].every(role => snapshot.roles[role]?.ack?.painted &&
-        this.presence.isReady({ ...receipt, role }) && snapshot.roles[role].ack.sequence === event.sequence)) {
+      return event.sequence;
+    });
+  }
+  // READY needs every role's accepted paint of the current publication and no
+  // arrangement that has begun moving panes: between its steps the paints are
+  // fresh but the geometry is not complete (todo 9). accept(actor) accepts a paint
+  // and returns its sequence; a finished arrangement decides again here.
+  managedReady(accept) {
+    return this.managedWrite(async actor => {
+      const sequence = await accept(actor);
+      if (sequence === undefined) return;
+      const snapshot = actor.snapshot, receipt = { ...this.presence.getOwner(), sequence };
+      if (!this.arrangement?.moving && snapshot.phase !== 'READY' && ['todo', 'dag', 'workers'].every(role =>
+        snapshot.roles[role]?.ack?.painted && this.presence.isReady({ ...receipt, role }) &&
+        snapshot.roles[role].ack.sequence === sequence)) {
         await actor.ready();
         return true;
       }
@@ -1555,7 +1568,8 @@ export class TodoPane {
         const record = this.ownedRoles.get(receipt?.role);
         if (this.managed) {
           const snapshot = this.actor?.snapshot;
-          if (this.stopped || this.managedBlocked || this.recoveryBlocked || this.layoutActive || this.sourceRefreshing ||
+          if (this.stopped || this.managedBlocked || this.recoveryBlocked || this.layoutActive || this.arrangement?.moving ||
+            this.sourceRefreshing ||
             this.actor?.inlineFallback !== false || snapshot?.sessionId !== this.binding.sessionId ||
             snapshot.participants.todo?.lifetimeId !== this.lifetimeId ||
             snapshot.participants.dag?.lifetimeId !== this.provider?.lifetimeId ||
@@ -2286,17 +2300,29 @@ export class TodoPane {
       await this.membership(pair.workers.paneId);
       // An inherited region without a Todo keeps it closed until /dashboard.
       if (!existing && !inherited || forceCurrent('todo')) await this.ensureTodo(pair.workers, forceCurrent('todo'));
-      const arranged = await provider.arrangeDashboard?.();
-      // An explicit /dashboard migrated the dashboard to the band (todo 7): the
-      // Todo record takes the band claim last, after the DAG and workers records.
-      if (this.managed && arranged?.layout === 'band' && claim.layout !== 'band') {
-        this.claim = { ...claim, layout: 'band' };
-        await this.roleWrite(async () => {
-          const current = await readJson(this.recordFile);
-          if (this.recordMatches(current) && !current.manualClose && current.paneId)
-            await writeJson(this.recordFile, { ...current, layoutClaim: this.claim });
-        });
+      // Once the arrangement moves a pane (perform), READY and the bridge's coverage
+      // wait for all of it, not for each step: its geometry and placement journal
+      // are complete only when it returns (todo 9). A benign interruption keeps
+      // that barrier through viewer renewals and later attempts until success.
+      const arrangement = this.arrangement ??= { moving: false };
+      try {
+        const arranged = await provider.arrangeDashboard?.();
+        // An explicit /dashboard migrated the dashboard to the band (todo 7): the
+        // Todo record takes the band claim last, after the DAG and workers records.
+        if (this.managed && arranged?.layout === 'band' && claim.layout !== 'band') {
+          this.claim = { ...claim, layout: 'band' };
+          await this.roleWrite(async () => {
+            const current = await readJson(this.recordFile);
+            if (this.recordMatches(current) && !current.manualClose && current.paneId)
+              await writeJson(this.recordFile, { ...current, layoutClaim: this.claim });
+          });
+        }
+        this.arrangement = null;
+      } finally {
+        if (arrangement.moving) this.bridge?.readinessChanged();
       }
+      // Complete: the paints accepted while it ran decide READY now.
+      if (arrangement.moving) await this.managedReady(actor => actor.snapshot.roles.todo?.ack?.sequence);
     };
     // Every mutation of this pass runs in its scope, so the gate knows whether it
     // is automatic. A gate refusal is a wait: zero mutations, one notice, no latch.
