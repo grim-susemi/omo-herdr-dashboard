@@ -2,7 +2,9 @@
 
 One extension, one command, one repository for native Todo, ordinary workers and workflow DAGs.
 
-Inside OmO running in Herdr, enter `/dashboard`. It opens all three views and explicitly reopens closed views. Todo and ordinary workers occupy the upper and lower halves of the left dashboard column. DAG occupies the full right dashboard column. The conversation keeps the left 40% of the terminal; the dashboard uses the remaining 60%.
+Inside OmO running in Herdr, enter `/dashboard`. It opens all three views and explicitly reopens closed views. The dashboard uses a band layout: Todo is a wide band across the top of the dashboard area, and below it ordinary workers sit on the left with DAG on the right. A new managed dashboard gives the conversation the left half of the terminal and the dashboard the right half.
+
+Existing conversations keep their current columns layout after an upgrade, restart or `/reload`. Automatic paths leave the conversation's geometry and input focus unchanged. Running `/dashboard` changes a columns dashboard to the band in place without resizing the conversation. Swaps may briefly select a dashboard pane; the migration ends with focus on the conversation. Unmanaged mode keeps its current layout.
 
 Each view follows current work automatically. Click to inspect a card, drag vertically or use the mouse wheel to browse without moving the other views. Leaving the view restores automatic tracking; reopening also starts in automatic mode. The footer shows tracking and connection status instead of a keyboard legend. Closed Todo groups can be expanded by clicking their summary. Terminals must support SGR mouse and focus reporting. Existing keyboard controls remain available without occupying the screen.
 
@@ -10,6 +12,6 @@ Build with Node 24 or newer: `npm run build`. Install the built package with `no
 
 Source is maintained together under `packages/todo` and `packages/dag`. Their original Git history and MIT notices are retained. The unified entry and installer live at the repository root. No global OmO engine, game file or unrelated extension is modified. All current changes are maintained as commits in this repository's `main` branch. Component packages are private; upstream upload and npm publication are disabled.
 
-If a role is closed or the geometry is invalid, issue `/dashboard` from the conversation pane. The command may rebuild the owned role panes to restore the two columns. Role pane IDs can change; native Todo data and independent view preferences persist. Merely receiving an update does not reopen a manually closed view.
+If a role is closed or the geometry is invalid, issue `/dashboard` from the conversation pane. The command may rebuild the owned role panes to restore the band. Role pane IDs can change; native Todo data and independent view preferences persist. Merely receiving an update does not reopen a manually closed view.
 
 See [current verification](VERIFICATION.md) for the observed behavior, test scope and limitations. Component READMEs and historical QA scripts describe their original standalone installations; use this root entry and installer for the unified dashboard.

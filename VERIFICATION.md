@@ -1,5 +1,22 @@
 # Current dashboard verification
 
+## Band layout source candidate
+
+New managed dashboards use the band layout. Todo spans the top of the dashboard
+area; ordinary workers (left) and DAG (right) share the row below it. A columns
+dashboard stays columns through upgrades, restarts and `/reload`, and changes to
+the band only when the owner runs `/dashboard`. Automatic paths leave the
+conversation's geometry and input focus unchanged. Explicit migration keeps its
+geometry, may briefly select a dashboard pane during swaps, and ends with focus
+on the conversation. Unmanaged mode keeps its current layout.
+
+Measured suite counts and native Herdr results for this candidate are recorded
+by plan todo 13. Older counts below are historical and don't describe it.
+
+Known limitation, NOT VERIFIED: after a dashboard claims the band, rolling back
+to install generation 7 makes generation 7 treat the `band` claim as the legacy
+stacked layout. After a rollback, start a new conversation.
+
 ## 2026-10-09 mouse-first source candidate
 
 The source candidate has a quieter layout, no keyboard legend, and independent
@@ -15,10 +32,8 @@ Herdr 0.9.3 did not forward those moves as terminal focus reports, so the candid
 also subscribes to the public focus event stream. It does not poll or modify Herdr.
 All owned viewers, streams and fixtures were closed after the checks.
 
-Root tests passed 6/6; Todo passed 141/141; DAG passed 216/219. The remaining three
-failures are unchanged Windows fixtures in `packages/dag/test/herdr.test.mjs`
-that create a POSIX `herdr` stub while the Windows resolver searches for
-`herdr.exe`. JavaScript syntax checks, unified build, offline installation and
+Suite counts for that candidate are superseded; see plan todo 13 for the
+measured counts. JavaScript syntax checks, unified build, offline installation and
 imports of both packaged viewers passed. The archive contains 40 files and 26
 runtime modules. The package check now imports each viewer because hash parity
 alone missed a required input module omitted by the Todo build list.
@@ -39,16 +54,7 @@ Verified on Windows on 2026-10-04 with Node 24.12.0, Herdr 0.9.3, OmO 5.1.16 and
 
 ## Tests and package checks
 
-| Check | Result |
-| --- | --- |
-| Todo unit/component suite | 135 passed |
-| Stock SDK host tests | 30 passed; all 16 source hashes unchanged; private fixture removed |
-| Affected DAG controller, extension, view, follow and real Windows PTY tests | 109 passed |
-| Unified installer isolation test | 1 passed |
-| Unified build | Passed |
-| Offline archive install | Passed; 38 archive files, 24 component runtime hashes matched, one extension entry |
-
-The first affected DAG run lacked its declared `node-pty` development dependency in the new checkout. After supplying the existing exact 1.1.0 dependency locally, all 109 affected tests passed. This is not a claim that the entire inherited standalone DAG suite was rerun or passed; earlier unrelated Windows helper failures remain outside that coverage.
+The per-suite counts from this baseline are stale and were removed. Plan todo 13 records the measured counts for the current source.
 
 Two regressions were reproduced before their fixes: a readable native Todo branch with no Todo entry could fail startup, and Herdr's same-tab `move` returned success without changing geometry. Tests preserve the expected behavior. The current layout uses actual supported splits and swaps and validates role geometry after placement.
 
@@ -56,7 +62,7 @@ Two regressions were reproduced before their fixes: a readable native Todo branc
 
 The actual installed generation contained only `omo-herdr-dashboard.js` as its Herdr extension entry. All 24 installed component runtime hashes matched the tested build. Managed legacy entries were backed up; unrelated extensions, original engine files and game files were not changed.
 
-Actual Herdr pane geometry was verified at 172 columns by 46 rows: conversation 69 columns, Todo 52 by 23 at the upper left of the dashboard, ordinary workers 52 by 23 below it, and DAG 51 by 46 on the right. The 52-column Todo footer included the complete compact control hint without clipping `q`.
+The geometry below is the earlier columns layout, kept as history. Actual Herdr pane geometry was verified at 172 columns by 46 rows: conversation 69 columns, Todo 52 by 23 at the upper left of the dashboard, ordinary workers 52 by 23 below it, and DAG 51 by 46 on the right. The 52-column Todo footer included the complete compact control hint without clipping `q`.
 
 Native `/todo append`, `start` and `done` commands were exercised through the actual parent session. Todo follow was turned off while the DAG and worker views remained on. Closing Todo with `q` and running `/dashboard` rebuilt the verified owned roles, retained Todo follow-off and native target data, and preserved the conversation input target. Completed Todo phases folded by default. Fresh waiting state and active/completed states were observed.
 
@@ -65,9 +71,9 @@ Private evidence contains actual visible Herdr ANSI frames, role geometry, owner
 ## Reproduce the current manual checks
 
 1. Build and install the root package in an explicit disposable agent directory. Start a fresh OmO session in a separately owned Herdr tab. Confirm a single dashboard entry is loaded.
-2. Issue `/dashboard` from the conversation. Use `herdr pane layout --pane <parent>` to verify exactly four panes and the requested two-column role order; inspect visible ANSI for each role.
+2. Issue `/dashboard` from the conversation. Use `herdr pane layout --pane <parent>` to verify exactly four panes in the band order (Todo across the top, workers lower left, DAG lower right); inspect visible ANSI for each role.
 3. Add and start a native Todo. Toggle `f` only in Todo and verify the other follow states are unchanged. Close Todo with `q`, issue `/dashboard` from the conversation, then verify data and view preferences persist even if pane IDs changed.
 4. Complete the Todo and inspect default phase folding and the compact footer. Check ordinary-worker and DAG source updates using the existing producer records or an isolated fixture; distinguish waiting/error/disconnected labels from live data.
 5. Clean only resources whose creation receipts, pane/process identity, cwd and launch arguments establish ownership. Preserve unrelated tabs and installation generations.
 
-Herdr swaps can briefly change selection; the controller applies observed ownership and focus guards. This verifies final Herdr input selection, not OS foreground or physical keyboard routing. Historical `packages/todo/scripts/qa-live.mjs` covers the retired three-row candidate and must not be treated as this layout's acceptance script.
+Herdr swaps can briefly change selection; the controller applies observed ownership and focus guards. This verifies final Herdr input selection, not OS foreground or physical keyboard routing. Historical `packages/todo/scripts/qa-live.mjs` covers the retired three-row candidate and must not be treated as the band layout's acceptance script.
