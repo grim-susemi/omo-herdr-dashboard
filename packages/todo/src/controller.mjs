@@ -5,6 +5,7 @@ import { EventEmitter, once } from 'node:events';
 import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { displayOwnerKey, installDisplayBridge } from './display-bridge.mjs';
 import { createPresence } from './presence.mjs';
@@ -141,7 +142,16 @@ async function writeJson(path, value) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
-    await rename(temporary, path);
+    // Windows denies replacing a file while a reader (a viewer or this
+    // controller) holds it open. Retry only those codes, briefly and bounded
+    // (as parent-slot publish and dag storage); anything else escapes.
+    for (let attempt = 0; ; attempt++) {
+      try { await rename(temporary, path); break; }
+      catch (error) {
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt === 5) throw error;
+        await delay(10 * 2 ** attempt);
+      }
+    }
   } catch (error) { await rm(temporary, { force: true }); throw error; }
 }
 export async function readRoleState(path) {

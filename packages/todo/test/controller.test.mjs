@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { EventEmitter, once } from 'node:events';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import fs, { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -377,4 +378,61 @@ test('child exclusion precedes UI getters; noninteractive lifecycle and commands
   assert.equal(commands.size, 0, 'the integrated DAG entry owns the one dashboard command');
   await handlers.get('session_start')({}, { hasUI: true, mode: 'rpc',
     sessionManager: { getSessionFile: () => '/synthetic/parent.jsonl' } });
+});
+
+// Windows denies replacing todo.json while a reader (a viewer or the controller
+// itself) holds it open, so the denial is injected at the real rename of the
+// existing state file. The retry is win32-only, as for the slot and DAG writers.
+const win32 = process.platform === 'win32';
+const denial = code => Object.assign(new Error(`${code}: rename denied`), { code });
+async function adoptedTodo(t) {
+  const f = await fixture(t);
+  f.ready.resolve(); f.controller.bind(f.pi);
+  f.pi.events.emit(dashboardChannels.provider, { v: 1, kind: 'dag-provider', ...f.controller.binding, provider: f.provider });
+  await f.controller.schedule();
+  return f;
+}
+function armStateRename(t, controller, fault) {
+  const rename = fs.rename, attempts = [];
+  const mocked = t.mock.method(fs, 'rename', async (from, to) => {
+    if (to !== controller.stateFile) return rename(from, to);
+    const error = fault(attempts.length);
+    attempts.push(error?.code ?? 'ok');
+    if (error) throw error;
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  return { attempts, restore() { mocked.mock.restore(); syncBuiltinESMExports(); } };
+}
+const noTemporaries = async controller => (await readdir(controller.directory)).filter(name => name.endsWith('.tmp'));
+
+test('one transient EPERM replacing the existing Todo state file is retried and the update lands', async t => {
+  const f = await adoptedTodo(t), before = await readFile(f.controller.stateFile, 'utf8');
+  const fault = armStateRename(t, f.controller, index => index === 0 ? denial('EPERM') : null);
+  try {
+    if (win32) await f.controller.schedule();
+    else await assert.rejects(f.controller.schedule(), { code: 'EPERM' });
+  } finally { fault.restore(); }
+  assert.deepEqual(fault.attempts, win32 ? ['EPERM', 'ok'] : ['EPERM']);
+  assert.equal((await readRoleState(f.controller.stateFile)).paneId, JSON.parse(before).paneId);
+  assert.deepEqual(await noTemporaries(f.controller), []);
+});
+
+test('a persistent EPERM replacing the Todo state file is bounded, surfaces and leaves the old file intact', async t => {
+  const f = await adoptedTodo(t), before = await readFile(f.controller.stateFile, 'utf8');
+  const fault = armStateRename(t, f.controller, () => denial('EPERM'));
+  try { await assert.rejects(f.controller.schedule(), { code: 'EPERM' }); } finally { fault.restore(); }
+  assert.deepEqual(fault.attempts, Array(win32 ? 6 : 1).fill('EPERM'));
+  assert.equal(await readFile(f.controller.stateFile, 'utf8'), before);
+  assert.deepEqual(await noTemporaries(f.controller), []);
+});
+
+test('a non-transient error replacing the Todo state file is not retried', async t => {
+  const f = await adoptedTodo(t), before = await readFile(f.controller.stateFile, 'utf8');
+  // Fails once only: a retry would succeed, so a rejection proves there was none.
+  const fault = armStateRename(t, f.controller, index => index === 0 ? denial('ENOSPC') : null);
+  try { await assert.rejects(f.controller.schedule(), { code: 'ENOSPC' }); } finally { fault.restore(); }
+  assert.deepEqual(fault.attempts, ['ENOSPC']);
+  assert.equal(await readFile(f.controller.stateFile, 'utf8'), before);
+  assert.deepEqual(await noTemporaries(f.controller), []);
 });
