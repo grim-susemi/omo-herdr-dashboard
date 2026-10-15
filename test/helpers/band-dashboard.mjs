@@ -27,6 +27,7 @@ export async function readRecord(path) {
 // sessionId: the conversation; restart({ sessionId }) models a conversation change.
 // generation: the install generation of the viewer paths; restart({ generation })
 // models an install-generation upgrade that relaunches the live viewers.
+// hooks.before(args): runs before every native call; a throw is that call's reply.
 // hooks.after(args): runs after every native call took effect, before its reply.
 export async function createBandDashboard({ width = 172, height = 46, managed = true, events = false,
   sessionId = 'session', generation: installed = '000004' } = {}) {
@@ -50,6 +51,7 @@ export async function createBandDashboard({ width = 172, height = 46, managed = 
   };
   const herdr = async (...args) => {
     calls.push({ args, authority });
+    await hooks.before?.(args);
     if (args[0] === 'process-info') {
       const paneId = args[args.indexOf('--pane') + 1];
       await fake.herdr('get', paneId);

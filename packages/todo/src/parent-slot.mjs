@@ -36,10 +36,11 @@ const fail = (code, cause) => Object.assign(new Error(code, cause ? { cause } : 
   { code, inlineFallback: true });
 const keyFor = (socket, pane) => createHash('sha256').update(JSON.stringify([socket, pane])).digest('hex');
 const diagnosticBranches = new Set(['claim', 'publish', 'validate-target', 'dispatch', 'reconcile',
-  'release', 'controller-write', 'legacy-source', 'schedule', 'stop']);
+  'release', 'controller-write', 'legacy-source', 'schedule', 'stop', 'placement']);
 const diagnosticCodes = new Set(['NONE', 'EFFECT_UNKNOWN', 'IDENTITY_MISMATCH', 'OPERATION_MISMATCH',
   'LEASE_LOST', 'PUBLISH_FAILED', 'STALE_CAPABILITY', 'SLOT_CORRUPT', 'ACK_MISMATCH', 'CLOSURE_MISMATCH',
-  'SQLITE_BUSY', 'SOURCE_MISMATCH', 'RECOVERY_BLOCKED', 'EPERM', 'EBUSY', 'ENOENT', 'pane_not_found', 'MANAGED_UNAVAILABLE']);
+  'SQLITE_BUSY', 'SOURCE_MISMATCH', 'RECOVERY_BLOCKED', 'EPERM', 'EBUSY', 'ENOENT', 'pane_not_found', 'MANAGED_UNAVAILABLE',
+  'LAYOUT_WAIT']);
 // The ACK condition that failed; names only, never the compared values.
 const diagnosticReasons = new Set(['role-missing', 'paneId', 'statePath', 'launchToken', 'controlToken',
   'generation', 'sessionId', 'painted', 'sequence-invalid', 'sequence-stale']);

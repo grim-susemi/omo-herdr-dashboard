@@ -5,8 +5,8 @@ import { once, EventEmitter } from 'node:events';
 import * as filesystem from 'node:fs/promises';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { mkdtemp, readFile, rm, rename } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, rename, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FixedDagPane, isBandDashboard, isColumnDashboard } from '../packages/dag/src/controller.mjs';
@@ -238,7 +238,7 @@ async function legacyUpgradeFixture(t, mismatch = 'viewer') {
   const dag = new FixedDagPane({ managedAvailable: true, stateDir: join(directory, 'herdr-dag'), cwd: directory,
     socket: 'qa:socket', parentPane: 'parent', sessionId: 'session', node: 'node', herdr,
     viewer: join(directory, 'generation-000004', 'dag', 'viewer.mjs'),
-    inspectShell: async pid => [{ ProcessId: pid, Birth: 'shell-birth', CreationDate: 'shell-date',
+    inspectShell: async pid => [{ ProcessId: pid, Birth: 'shell-birth', CreationDate: '2026-10-14T00:00:00.000Z',
       ExecutablePath: 'shell', CommandLine: 'shell' }] });
   const parent = { paneId: 'parent', tabId: 'tab', shell: { pid: 100, birth: 'shell-birth' } };
   const producer = { pid: 200, birth: 'producer-birth', executable: 'node', argvDigest: 'a'.repeat(64) };
@@ -2173,12 +2173,18 @@ test('band_foreign_identity: a temporary pane that gains a foreign process is ne
     if (args[0] === 'split') temporary = f.layout().panes.find(pane => !Object.values(ids).includes(pane.pane_id)).pane_id;
     if (args[0] === 'swap' && temporary) f.foreignProcess(temporary);
   });
-  const from = f.mutations().length;
-  await assert.rejects(f.todo.schedule(DASHBOARD));
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  // Todo 8: a known stop inside a move waits; its journal stays unresolved for the next /dashboard.
+  await f.todo.schedule(DASHBOARD);
   const added = f.mutations().slice(from).map(call => call.args);
   assert.deepEqual(added.map(args => args[0]), ['split', 'swap', 'focus'], 'nothing after the foreign process appeared');
   assert.ok(f.fake.panes().includes(temporary), 'the foreign pane is never closed');
   assert.equal((await readRecord(join(f.dag.directory, 'placement.json'))).phase, 'BLOCKED');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['IDENTITY_MISMATCH'], 'one diagnostics entry');
   for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
   assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
 });
@@ -2450,7 +2456,8 @@ test('band_dispatch_authorization: a focus change inside the custody callback of
       await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); // the owner
     }
   };
-  await assert.rejects(f.todo.schedule(DASHBOARD), /input selection changed during placement/);
+  // Todo 8: the refusal waits; the journal stays unresolved for the next /dashboard.
+  await f.todo.schedule(DASHBOARD);
   assert.ok(changed);
   assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]), ['split'], 'no swap, close or focus after the change');
   const journal = await readRecord(join(f.dag.directory, 'placement.json'));
@@ -2459,7 +2466,10 @@ test('band_dispatch_authorization: a focus change inside the custody callback of
   const [refused] = f.actor.snapshot.operations.slice(-1);
   assert.deepEqual([refused.type, refused.status], ['arrange', 'SETTLED'], 'a known no-effect refusal');
   assert.equal(f.actor.blocked, false);
-  assert.ok(f.todo.recoveryBlocked, 'an unresolved placement latches, as a failed guard does');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch (todo 8)');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
   assert.deepEqual(rectArray(f.layout().panes.find(pane => pane.pane_id === 'parent').rect), COLUMNS_SOURCE['172x46'].parent);
 });
@@ -2604,4 +2614,551 @@ test('band unmanaged columns: an explicit /dashboard never enters the band path'
   assert.equal(isColumnDashboard(f.layout(), ids), true);
   assert.equal(isBandDashboard(f.layout(), ids), false);
   assert.equal(await f.claimLayout(), 'columns');
+});
+
+// ---- Todo 8: an unresolved placement journal is resolved through the actor ----
+
+const placementPath = f => join(f.dag.directory, 'placement.json');
+// The parent slot's blocked-diagnostics entries written for placement waits.
+async function placementDiagnostics(f) {
+  const text = await readFile(join(f.actor.paths.directory, 'blocked-diagnostics.jsonl'), 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  });
+  return text.split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.branch === 'placement');
+}
+// The owner moves the input selection inside the custody callback of the native mutation
+// that follows `index` others from now, when its actor type is `type`: that step is
+// refused at its final authorization.
+function ownerFocusesAt(f, type, index) {
+  const custody = f.todo.invalidateCustodyEffect, from = f.mutations().length;
+  const owner = { changed: false, restore() { f.todo.invalidateCustodyEffect = custody; } };
+  f.todo.invalidateCustodyEffect = async operation => {
+    await custody.call(f.todo, operation);
+    if (!owner.changed && operation.type === type && f.mutations().length - from === index) {
+      owner.changed = true;
+      await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right');
+    }
+  };
+  return owner;
+}
+// The owner selects the chat again.
+async function selectChat(f) {
+  for (let step = 0; step < 4 && f.fake.focused() !== 'parent'; step++)
+    await f.fake.herdr('focus', '--pane', f.fake.focused(), '--direction', 'left');
+  assert.equal(f.fake.focused(), 'parent');
+}
+// A live columns dashboard whose explicit migration stopped inside its first move (the DAG
+// below Todo), right after the temporary split ('split') or after the swap ('swap'): the
+// owner moved the selection, so the next step was refused at its final authorization.
+async function stuckMove(t, after) {
+  const { f, ids } = await liveColumns(t);
+  const owner = after === 'split' ? ownerFocusesAt(f, 'arrange', 1) : ownerFocusesAt(f, 'close', 3);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+  owner.restore();
+  assert.ok(owner.changed, 'the owner moved the selection inside the move');
+  const journal = await readRecord(placementPath(f));
+  return { f, ids, from, diagnostics, failure, journal, temporary: journal?.temporary?.paneId };
+}
+// The controller stopped right after the first move's SPLIT_SETTLED write: the journal keeps
+// that phase, and the next controller claims the slot under a newer generation.
+async function stoppedAfterSplit(t) {
+  const { f, ids } = await liveColumns(t);
+  const placementFocus = f.dag.placementFocus.bind(f.dag);
+  let journal;
+  f.dag.placementFocus = async (...args) => {
+    const current = await readRecord(placementPath(f));
+    if (!journal && current?.phase === 'SPLIT_SETTLED') {
+      journal = current;
+      throw Object.assign(new Error('QA stop'), { code: 'QA_INTERRUPT' });
+    }
+    return placementFocus(...args);
+  };
+  await f.todo.schedule(DASHBOARD).catch(() => {});
+  assert.equal(journal?.phase, 'SPLIT_SETTLED');
+  await writeJson(placementPath(f), journal); // its later journal writes never happened
+  await f.restart();
+  assert.ok(f.actor.snapshot.generation > journal.generation, 'a newer slot generation');
+  return { f, ids, journal, temporary: journal.temporary.paneId };
+}
+// The migration's remaining steps after its first move (task-1 b2).
+const AFTER_FIRST_MOVE = ['split', 'swap', 'focus', 'focus', 'close', 'swap', 'focus', 'resize', 'resize'];
+async function assertBand(f, ids, phases, added) {
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent, `the chat rect is identical after ${phase.verb}`);
+  assertChatUntouched(added, ids);
+  assertActorOnly(f);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(await f.ids(), ids, 'the same pane ids');
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'no temporary pane remains');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent', 'focus ends on the chat');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  assert.ok(!f.todo.recoveryBlocked);
+}
+
+test('band_stuck_journal_temp_present: a focus change after SPLIT_SETTLED waits with the temporary pane kept; the next /dashboard resumes the move to COMPLETE and the band', async t => {
+  const { f, ids, from, diagnostics, failure, journal, temporary } = await stuckMove(t, 'split');
+  assert.equal(failure, undefined, 'a wait, not a failure');
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]), ['split'], 'zero further mutations after the refusal');
+  assert.deepEqual([journal.phase, journal.failedStage], ['BLOCKED', 'SPLIT_SETTLED']);
+  assert.ok(f.fake.panes().includes(temporary), 'the temporary pane is kept');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.actor.blocked, false);
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => [entry.code, entry.role]),
+    [['LAYOUT_WAIT', 'dag']], 'one diagnostics entry');
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  // Automatic passes never resolve a journal.
+  const stuck = f.mutations().length;
+  await f.todo.schedule();
+  await f.todo.schedule();
+  assert.deepEqual(f.mutations().slice(stuck).map(head), [], 'automatic passes make no mutation');
+  assert.deepEqual(await readRecord(placementPath(f)), journal);
+  await selectChat(f);
+  const phases = watchPhases(f), resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(resumed).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['swap', 'focus', 'close', ...AFTER_FIRST_MOVE],
+    'the move resumes at its swap, then the migration continues');
+  assert.deepEqual(added[0], ['swap', '--source-pane', ids.dag, '--target-pane', temporary]);
+  assert.deepEqual(added[2], ['close', temporary]);
+  await assertBand(f, ids, phases, added);
+  assert.ok(f.warnings.every(message => /^layout-waiting: /.test(message)), 'no BLOCKED warning');
+});
+
+test('band_stuck_journal_temp_present: a journal left at SPLIT_SETTLED by a stopped controller resumes under the next slot generation to COMPLETE and the band', async t => {
+  const { f, ids, journal, temporary } = await stoppedAfterSplit(t);
+  assert.ok(f.fake.panes().includes(temporary));
+  assert.notEqual(journal.ownerNonce, f.actor.snapshot.ownerNonce, 'written by the previous owner');
+  const phases = watchPhases(f), from = f.mutations().length, w = f.warnings.length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['swap', 'focus', 'close', ...AFTER_FIRST_MOVE]);
+  assert.deepEqual(added[0], ['swap', '--source-pane', ids.dag, '--target-pane', temporary]);
+  assert.deepEqual(added[2], ['close', temporary]);
+  await assertBand(f, ids, phases, added);
+  assert.equal(f.warnings.length, w, 'no new notice');
+});
+
+test('band_stuck_journal_resolved: a verified temporary pane left after the swap is closed through the actor and the migration continues to the band', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'swap');
+  assert.deepEqual([journal.phase, journal.failedStage], ['BLOCKED', 'SWAP_SETTLED']);
+  assert.ok(f.fake.panes().includes(temporary));
+  await selectChat(f);
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['close', ...AFTER_FIRST_MOVE], 'only the close of the finished swap, then the remaining steps');
+  assert.deepEqual(added[0], ['close', temporary]);
+  await assertBand(f, ids, phases, added);
+});
+
+test('band_target_gone band_stuck_journal_pre_swap_gone: the temporary pane gone after SPLIT_SETTLED and before the swap restarts the same move and completes it', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'split');
+  assert.deepEqual([journal.phase, journal.failedStage], ['BLOCKED', 'SPLIT_SETTLED']);
+  await f.exitPane(temporary);
+  await selectChat(f);
+  const phases = watchPhases(f), from = f.mutations().length, w = f.warnings.length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['split', 'swap', 'focus', 'close', ...AFTER_FIRST_MOVE],
+    'the move starts again from its first step, then the migration continues');
+  assert.deepEqual(added[0].slice(0, 7), ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.5']);
+  assert.equal(added[1][2], ids.dag, 'the same pane moves');
+  assert.notEqual(added[3][1], temporary, 'through a new temporary pane');
+  await assertBand(f, ids, phases, added);
+  assert.equal(f.warnings.length, w, 'no new notice');
+});
+
+test('band_target_gone band_stuck_journal_post_swap_gone: the temporary pane gone after the swap completes the move from the recorded swap and the geometry without a native mutation', async t => {
+  const { f, ids, from: start, journal, temporary } = await stuckMove(t, 'swap');
+  assert.deepEqual(f.mutations().slice(start).map(call => call.args[0]), ['split', 'swap', 'focus'], 'zero further mutations after the refusal');
+  assert.deepEqual([journal.phase, journal.failedStage], ['BLOCKED', 'SWAP_SETTLED']);
+  await f.exitPane(temporary);
+  await selectChat(f);
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), AFTER_FIRST_MOVE, 'the finished move is not replayed');
+  assert.deepEqual(added[0].slice(0, 7), ['split', '--pane', ids.dag, '--direction', 'right', '--ratio', '0.5']);
+  await assertBand(f, ids, phases, added);
+});
+
+test('band_target_gone: only an authoritative pane_not_found makes the temporary pane gone; an unreadable answer waits', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'split');
+  await f.exitPane(temporary);
+  await selectChat(f);
+  f.hooks.before = args => {
+    if (args[0] === 'get' && args[1] === temporary) throw Object.assign(new Error('transport lost'), { code: 'transport_error' });
+  };
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  await f.todo.schedule(DASHBOARD);
+  delete f.hooks.before;
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'zero mutations');
+  assert.deepEqual(await readRecord(placementPath(f)), journal);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['IDENTITY_MISMATCH']);
+  await f.todo.schedule(DASHBOARD);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_stuck_journal_failure a refused temporary split: the restarted move is refused at its split; the unresolved journal stays and the next /dashboard retries it', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'split');
+  await f.exitPane(temporary);
+  await selectChat(f);
+  const owner = ownerFocusesAt(f, 'split', 0);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length, w = f.warnings.length;
+  const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+  owner.restore();
+  assert.ok(owner.changed);
+  assert.equal(failure, undefined, 'a wait, not a failure');
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'the new temporary split is never issued');
+  assert.deepEqual(await readRecord(placementPath(f)), journal, 'the unresolved journal stays as it was');
+  const [refused] = f.actor.snapshot.operations.slice(-1);
+  assert.deepEqual([refused.type, refused.status], ['split', 'SETTLED'], 'a known no-effect refusal');
+  assert.equal(f.actor.blocked, false);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, w + 1);
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['LAYOUT_WAIT'], 'one diagnostics entry');
+  // The next /dashboard applies the same rules again: the move restarts and completes.
+  await selectChat(f);
+  const resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(resumed).map(call => call.args);
+  assert.deepEqual(added[0].slice(0, 7), ['split', '--pane', ids.todo, '--direction', 'down', '--ratio', '0.5']);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+for (const [variant, change] of Object.entries({
+  'a different shell birth': (f, journal) => writeJson(placementPath(f),
+    { ...journal, temporary: { ...journal.temporary, shell: { ...journal.temporary.shell, birth: 'another-shell-birth' } } }),
+  'a viewer process': async (f, journal) => f.foreignProcess(journal.temporary.paneId),
+  'another tab': (f, journal) => writeJson(placementPath(f), { ...journal, temporary: { ...journal.temporary, tabId: 'another-tab' } }),
+  'another owner nonce': (f, journal) => writeJson(placementPath(f), { ...journal, ownerNonce: randomUUID() }),
+})) test(`band_stuck_journal_failure ${variant}: the temporary pane's identity does not verify, so /dashboard waits without closing it`, async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'split');
+  await change(f, journal);
+  const recorded = await readRecord(placementPath(f)), rects = f.rects({ ...ids, temporary });
+  await selectChat(f);
+  for (const attempt of [1, 2]) { // a later explicit /dashboard applies the same rules again
+    const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length, w = f.warnings.length;
+    const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+    assert.equal(failure, undefined, `attempt ${attempt}: a wait, not a failure`);
+    assert.deepEqual(f.mutations().slice(from).map(head), [], `attempt ${attempt}: zero mutations`);
+    assert.ok(f.fake.panes().includes(temporary), 'the unverified pane is never closed');
+    assert.deepEqual(f.rects({ ...ids, temporary }), rects);
+    assert.deepEqual(await readRecord(placementPath(f)), recorded);
+    assert.equal(f.todo.status, 'layout-waiting');
+    assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+    assert.equal(f.actor.blocked, false);
+    assert.equal(f.warnings.length, w + 1, 'an explicit /dashboard always answers');
+    assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+    assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['IDENTITY_MISMATCH'],
+      'one diagnostics entry');
+  }
+  // The owner closes that pane: it is authoritatively gone, so the move starts again and completes.
+  await f.exitPane(temporary);
+  await f.todo.schedule(DASHBOARD);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_stuck_journal_failure a focus change before the resumed swap: the resolution stops at its guard with zero mutations; the journal stays for the next /dashboard', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'split');
+  await selectChat(f);
+  const placementFocus = f.dag.placementFocus.bind(f.dag);
+  let reads = 0;
+  f.dag.placementFocus = async (...args) => {
+    if (++reads === 2) await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); // the owner, at the resumed swap's guard
+    return placementFocus(...args);
+  };
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length, w = f.warnings.length;
+  const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+  f.dag.placementFocus = placementFocus;
+  assert.equal(reads >= 2, true);
+  assert.equal(failure, undefined, 'a wait, not a failure');
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'zero mutations');
+  assert.ok(f.fake.panes().includes(temporary));
+  assert.deepEqual(await readRecord(placementPath(f)), journal, 'the unresolved journal stays as it was');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, w + 1);
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['LAYOUT_WAIT'], 'one diagnostics entry');
+  await selectChat(f);
+  await f.todo.schedule(DASHBOARD);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+// The phase a journal recorded and the panes must agree before anything is issued.
+test('band_stuck_journal_failure the recorded phase disagrees with the panes: a journal that recorded its swap while the panes show it undone waits without a mutation', async t => {
+  const { f, ids, journal, temporary } = await stuckMove(t, 'swap');
+  assert.deepEqual([journal.phase, journal.failedStage], ['BLOCKED', 'SWAP_SETTLED']);
+  await f.fake.herdr('swap', '--source-pane', ids.dag, '--target-pane', temporary); // the owner undoes the swap
+  await selectChat(f);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'zero mutations');
+  assert.ok(f.fake.panes().includes(temporary));
+  assert.deepEqual(await readRecord(placementPath(f)), journal);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked);
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['OPERATION_MISMATCH']);
+  // The owner closes the extra pane: nothing temporary is left and the swap was recorded, so the
+  // journal is COMPLETE and the migration plans again from the panes.
+  await f.exitPane(temporary);
+  await f.todo.schedule(DASHBOARD);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_stuck_journal_failure the recorded phase disagrees with the panes: a journal stopped before its swap while the panes show it done waits without a mutation', async t => {
+  const { f, ids, journal, temporary } = await stoppedAfterSplit(t);
+  await f.fake.herdr('swap', '--source-pane', ids.dag, '--target-pane', temporary); // the owner made the swap
+  await selectChat(f);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'zero mutations');
+  assert.ok(f.fake.panes().includes(temporary));
+  assert.deepEqual(await readRecord(placementPath(f)), journal);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked);
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['OPERATION_MISMATCH']);
+  // The owner closes the extra pane: the geometry proves the move, so the journal is COMPLETE.
+  await f.exitPane(temporary);
+  const resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(resumed).map(call => call.args[0]), AFTER_FIRST_MOVE, 'the move is not replayed');
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+for (const [variant, write] of Object.entries({
+  'an unreadable journal': f => writeFile(placementPath(f), '{"phase":'),
+  'a journal that recorded no temporary pane': f => writeJson(placementPath(f), { schema: 'omo-herdr-dashboard/temporary-placement/1',
+    ...f.dag.binding, phase: 'BLOCKED', failedStage: 'PREPARED', temporary: null }),
+})) test(`band_stuck_journal_failure ${variant}: any other unresolved state waits with one diagnostics entry, never BLOCKED`, async t => {
+  const { f, ids } = await liveColumns(t);
+  await write(f);
+  const bytes = await readFile(placementPath(f), 'utf8'), rects = f.rects(ids);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  const failure = await f.todo.schedule(DASHBOARD).then(() => undefined, error => error);
+  assert.equal(failure, undefined, 'a wait, not a failure');
+  assert.deepEqual(f.mutations().slice(from).map(head), [], 'zero mutations');
+  assert.deepEqual(f.rects(ids), rects);
+  assert.equal(await readFile(placementPath(f), 'utf8'), bytes);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
+  assert.equal(f.warnings.length, 1);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(entry => entry.code), ['OPERATION_MISMATCH']);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+});
+
+test('band_stuck_journal_failure EFFECT_UNKNOWN on a resize: the controller waits with one placement diagnostic while the actor stays UNKNOWN and nothing is replayed', async t => {
+  const { f, temporary } = await stuckMove(t, 'split');
+  await selectChat(f);
+  let lost = false;
+  f.hooks.lose = args => !lost && args[0] === 'resize' && (lost = true);
+  const from = f.mutations().length, diagnostics = (await placementDiagnostics(f)).length;
+  await f.todo.schedule(DASHBOARD);
+  delete f.hooks.lose;
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]),
+    ['swap', 'focus', 'close', ...AFTER_FIRST_MOVE.slice(0, -1)], 'nothing after the unknown resize');
+  assert.ok(!f.fake.panes().includes(temporary));
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE', 'no unresolved journal is left');
+  assert.equal(f.actor.blocked, true, 'the unknown effect stays fail-closed');
+  assert.equal(f.actor.snapshot.operations.at(-1).status, 'UNKNOWN');
+  assert.equal(f.todo.recoveryBlocked, true, 'the actor recovery latch stays set');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(row => row.code), ['EFFECT_UNKNOWN']);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+  const settled = f.mutations().length, operations = f.actor.snapshot.operations;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(settled).map(head), [], 'nothing is replayed after the unknown effect');
+  assert.deepEqual(f.actor.snapshot.operations, operations, 'no mutation or fabricated settlement');
+  assert.equal(f.actor.blocked, true);
+  assert.equal(f.todo.recoveryBlocked, true);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.deepEqual((await placementDiagnostics(f)).slice(diagnostics).map(row => row.code), ['EFFECT_UNKNOWN']);
+});
+
+// Generation 7's first move put the DAG right of the chat through a temporary split of the
+// chat. Both live journals stopped there (warnings-diagnosis.md W6, W12): BLOCKED at
+// SPLIT_SETTLED by an older slot generation. Built through the real actor, so the slot
+// records the temporary split with the journal's owner nonce.
+async function generation7Journal(t, error) {
+  const { f, ids } = await liveColumns(t);
+  const beforeLayout = f.layout(), coordinator = f.todo.coordinator();
+  const created = await coordinator.passScope(true, () => f.dag.mutate('dag', 'split', 'parent',
+    ['split', '--pane', 'parent', '--direction', 'right', '--ratio', '0.5', '--cwd', f.directory, '--no-focus']));
+  const temporary = created.pane.pane_id, slot = f.actor.snapshot;
+  const journal = { schema: 'omo-herdr-dashboard/temporary-placement/1', ...f.dag.binding, lifetimeId: f.dag.lifetimeId,
+    ownerNonce: slot.ownerNonce, generation: slot.generation, source: await coordinator.target(ids.dag),
+    anchor: await coordinator.target('parent'), direction: 'right', selected: 'parent', phase: 'BLOCKED', beforeLayout,
+    temporary: await coordinator.target(temporary), operations: slot.operations, createdPaneId: temporary,
+    splitReceipt: created, failedStage: 'SPLIT_SETTLED', error, failureLayout: f.layout() };
+  await writeJson(placementPath(f), journal);
+  await f.restart();
+  assert.ok(f.actor.snapshot.generation > journal.generation, 'an older slot generation wrote the journal');
+  return { f, ids, journal, temporary };
+}
+
+test('band_stuck_journal_resolved generation-7 journal with its temporary pane (W12): /dashboard completes that move through the actor without changing the chat', async t => {
+  const { f, ids, temporary } = await generation7Journal(t, { message: 'layout-waiting: placement requires the selected owned tab' });
+  const chat = rectArray(f.layout().panes.find(pane => pane.pane_id === 'parent').rect);
+  const phases = watchPhases(f), from = f.mutations().length, w = f.warnings.length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.deepEqual(added.map(args => args[0]), ['swap', 'focus', 'close']);
+  assert.deepEqual(added[0], ['swap', '--source-pane', ids.dag, '--target-pane', temporary]);
+  assert.deepEqual(added[2], ['close', temporary]);
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), chat, 'the chat keeps its rect');
+  assertChatUntouched(added, ids);
+  assertActorOnly(f);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(await f.ids(), ids);
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort());
+  assert.equal(f.fake.focused(), 'parent');
+  // The generation-7 arrangement it completes is no band source: an explicit wait, not a latch.
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.ok(!f.todo.recoveryBlocked);
+  assert.equal(f.warnings.length, w + 1);
+  assert.match(f.warnings.at(-1), /^layout-waiting: .*\/dashboard/);
+  assert.deepEqual(await claims(f), ['columns', 'columns', 'columns']);
+});
+
+test('band_target_gone generation-7 journal left with EFFECT_UNKNOWN (W6): its temporary pane and its moved DAG pane are gone, so /dashboard records it COMPLETE and opens the band', async t => {
+  const { f, ids, temporary } = await generation7Journal(t, { code: 'EFFECT_UNKNOWN', message: 'EFFECT_UNKNOWN' });
+  await f.exitPane(temporary);
+  await f.exitPane(ids.dag); // that conversation's DAG pane was replaced later (W6)
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const now = await f.ids(), added = f.mutations().slice(from).map(call => call.args);
+  assert.notEqual(now.dag, ids.dag, 'the DAG reopened');
+  assert.ok(!added.some(args => args[0] === 'close'), 'nothing of the journal is left to close');
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assertChatUntouched(added, now);
+  assertActorOnly(f);
+  assert.equal(isBandDashboard(f.layout(), now), true);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+  assert.ok(!f.todo.recoveryBlocked);
+});
+
+test('band_target_gone generation-7 journal whose temporary pane is gone while its DAG lives: the move that split the chat is not repeated, and /dashboard migrates the columns without touching the chat', async t => {
+  const { f, ids, temporary } = await generation7Journal(t, { code: 'EFFECT_UNKNOWN', message: 'EFFECT_UNKNOWN' });
+  await f.exitPane(temporary); // the chat takes its space back (task-1 S7)
+  assert.deepEqual(f.rects(ids), COLUMNS_SOURCE['172x46'], 'the panes before the move');
+  const phases = watchPhases(f), from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(from).map(call => call.args);
+  assert.ok(!added.some(args => args[0] === 'split' && args[2] === 'parent'), 'the chat is never split again');
+  for (const phase of phases) assert.deepEqual(rectArray(phase.chat), BAND_TARGET['172x46'].parent);
+  assertChatUntouched(added, ids);
+  assertActorOnly(f);
+  assert.equal((await readRecord(placementPath(f))).phase, 'COMPLETE');
+  assert.deepEqual(f.rects(ids), BAND_TARGET['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+  assert.deepEqual(await claims(f), ['band', 'band', 'band']);
+});
+
+test('band_reopen_missing_role prepared receipt: a reopen stopped between the workers split and its swap resumes from the persisted receipt without a second split', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const before = await f.ids();
+  await f.exitPane(before.workers);
+  let moved = false;
+  f.hooks.after = async args => { // the owner moves the selection as the new workers pane appears
+    if (!moved && args[0] === 'split') { moved = true; await f.fake.herdr('focus', '--pane', 'parent', '--direction', 'right'); }
+  };
+  const count = f.mutations().length;
+  await f.todo.schedule(DASHBOARD).catch(() => {}); // the todo-6 reopen stops before its swap
+  delete f.hooks.after;
+  assert.ok(moved);
+  assert.deepEqual(f.mutations().slice(count).map(call => call.args[0]), ['split'], 'no swap after the selection changed');
+  const record = await readRecord(f.dag.paneFile('workers'));
+  assert.equal(record.prepared, true, 'the prepared receipt is persisted before the swap');
+  assert.ok(f.fake.panes().includes(record.paneId));
+  assert.equal(record.processId, undefined);
+  await selectChat(f);
+  const resumed = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  const added = f.mutations().slice(resumed).map(call => call.args);
+  assert.ok(!added.some(args => args[0] === 'split'), 'no second split');
+  const ids = await f.ids();
+  assert.equal(ids.workers, record.paneId, 'the prepared pane is launched');
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'one pane per role');
+  assertActorOnly(f);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.rects(ids), FRESH_BAND['172x46']);
+  assert.equal(f.fake.focused(), 'parent');
+});
+
+test('band_reopen_missing_role prepared receipt: one failed new-shell observation keeps the split without swap or launch, including a later explicit retry', async t => {
+  const f = await bandDashboard(t);
+  await f.todo.schedule();
+  const before = await f.ids();
+  await f.exitPane(before.workers);
+  const inspect = f.dag.inspectShell;
+  let pid, failed = false;
+  f.hooks.after = async args => {
+    if (args[0] === 'split' && !pid) {
+      const pane = f.layout().panes.find(row => !Object.values(before).includes(row.pane_id));
+      pid = (await f.todo.nativePane(pane.pane_id)).shell.pid;
+    }
+  };
+  f.dag.inspectShell = async value => {
+    if (value === pid && !failed) { failed = true; throw new Error('shell observation unavailable once'); }
+    return inspect(value);
+  };
+  const from = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.ok(failed);
+  assert.deepEqual(f.mutations().slice(from).map(call => call.args[0]), ['split']);
+  const record = await readRecord(f.dag.paneFile('workers'));
+  assert.ok(f.fake.panes().includes(record.paneId), 'the split is retained with its locator');
+  assert.equal(record.processId, undefined);
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.equal(f.actor.blocked, false);
+  assert.ok(!f.todo.recoveryBlocked);
+  const retry = f.mutations().length;
+  await f.todo.schedule(DASHBOARD);
+  assert.deepEqual(f.mutations().slice(retry).map(head), [], 'a later observation cannot invent the missing birth checkpoint');
+  assert.equal(f.todo.status, 'layout-waiting');
+  assert.equal(f.actor.blocked, false);
+  assert.ok(!f.todo.recoveryBlocked);
+  assert.deepEqual(await readRecord(f.dag.paneFile('workers')), record);
+  // Only authoritative absence releases an unverified split; normal observations resume for the next shell.
+  await f.exitPane(record.paneId);
+  delete f.hooks.after;
+  await f.todo.schedule(DASHBOARD);
+  const ids = await f.ids();
+  assert.notEqual(ids.workers, record.paneId);
+  assert.equal(isBandDashboard(f.layout(), ids), true);
+  assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort());
+  assertActorOnly(f);
 });

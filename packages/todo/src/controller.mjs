@@ -2154,6 +2154,10 @@ export class TodoPane {
         (closureVersions.get(role) ?? 0) === (this.closureVersions.get(role) ?? 0);
       if (this.managed) {
         if (forceRoles.length) this.warned.clear(); // An explicit /dashboard always gets its answer.
+        if (this.actor?.blocked && this.placementWaiting && this.actor.snapshot.operations.some(operation =>
+          operation.id === this.placementWaiting.operationId && operation.status === 'UNKNOWN')) {
+          throw Object.assign(new Error(this.placementWaiting.message), { code: 'LAYOUT_WAIT' });
+        }
         if (this.recoveryBlocked && !forceRoles.length && !this.recoveryChanged) {
           const actor = this.actor, slot = actor?.snapshot;
           // A latch only waits on a really unavailable actor. On a healthy READY
@@ -2186,6 +2190,8 @@ export class TodoPane {
           }
           this.recoveryBlocked = false;
         } catch (error) {
+          if (error?.code === 'LAYOUT_WAIT' && this.actor?.leaseHeld && !this.actor.blocked && !this.actor.draining)
+            throw error;
           this.recoveryBlocked = true;
           await this.actor?.diagnose('schedule', error?.code ? error : { code: 'RECOVERY_BLOCKED' });
           await this.watchRecoveryMembership().catch(() => {});
@@ -2299,6 +2305,10 @@ export class TodoPane {
       this.gateWaiting = undefined;
     }, error => {
       if (error?.code !== 'LAYOUT_WAIT') throw error;
+      if (error.cause?.code === 'EFFECT_UNKNOWN') {
+        const operation = this.actor.snapshot.operations.findLast(operation => operation.status === 'UNKNOWN');
+        if (operation) this.placementWaiting = { operationId: operation.id, message: error.message };
+      }
       if (this.gateWaiting === error.message) this.sizeWaiting = error.message;
       this.gateWaiting = error.message;
       this.bandWaiting(error.message, forceRoles.length > 0);

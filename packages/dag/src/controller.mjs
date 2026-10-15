@@ -94,6 +94,19 @@ const claimWaiting = 'layout-waiting: the open dashboard panes have no single re
 const closedWaiting = 'layout-waiting: the dashboard panes were closed; run /dashboard to reopen them';
 const unplaceable = 'layout-waiting: the dashboard panes cannot be re-placed from this arrangement; close them, then run /dashboard';
 const foreignWaiting = 'layout-waiting: this tab holds a pane the dashboard does not own; close it, then run /dashboard';
+const placementUnverified = 'layout-waiting: a pane left by an interrupted dashboard placement cannot be verified; ' +
+  'close it, then run /dashboard';
+const placementMismatch = 'layout-waiting: an interrupted dashboard placement does not match the panes in this tab; ' +
+  'close its extra pane if one is open, then run /dashboard';
+const placementSchema = 'omo-herdr-dashboard/temporary-placement/1';
+// Whether a journal phase proves its move's swap done (true) or not issued (false).
+// SWAP_PREPARED leaves it to the panes (undefined).
+const swapRecorded = { PREPARED: false, SPLIT_APPLIED: false, SPLIT_SETTLED: false, SWAP_PREPARED: undefined,
+  SWAP_SETTLED: true, CLOSE_PREPARED: true };
+const temporaryOf = journal => {
+  const id = journal?.temporary?.paneId ?? journal?.createdPaneId;
+  return typeof id === 'string' && id ? id : undefined;
+};
 
 const sameRect = (a, b) => ['x', 'y', 'width', 'height'].every(key => a?.[key] === b?.[key]);
 // The same native tree, focus aside: tab, area, every pane rect and every split.
@@ -127,6 +140,33 @@ const temporaryLeaf = '\u0000temporary';
 // Rects aside: a terminal resize keeps every ratio and moves no pane between leaves.
 const sameTree = (a, b) => Boolean(a && b) && (a.pane || b.pane ? a.pane === b.pane : a.direction === b.direction &&
   Math.fround(a.ratio) === Math.fround(b.ratio) && sameTree(a.first, b.first) && sameTree(a.second, b.second));
+// The same panes in the same places: every direction and leaf, ratios aside.
+const sameShape = (a, b) => Boolean(a && b) && (a.pane || b.pane ? a.pane === b.pane : a.direction === b.direction &&
+  sameShape(a.first, b.first) && sameShape(a.second, b.second));
+// The trees of one journaled move: before it, after its temporary split, after its swap
+// and after its temporary close.
+function moveTrees(node, id, target, direction) {
+  const split = mapLeaves(node, leaf => leaf.pane === target
+    ? { direction, ratio: 0.5, first: leaf, second: { pane: temporaryLeaf } } : leaf);
+  const swapped = swapLeaves(split, id, temporaryLeaf);
+  return [node, split, swapped, dropLeaf(swapped, temporaryLeaf)];
+}
+// A simulated phase keeps the chat's rect, collapses no pane below one cell and, after a
+// swap, lets focus return to the chat leftwards in at most three steps through role panes
+// only (like restorePlacementFocus).
+function phaseSafe(node, area, parent, chat, swapped) {
+  const rects = placeTree(node, area);
+  if (!sameRect(rects.get(parent), chat) || [...rects.values()].some(rect => rect.width < 1 || rect.height < 1))
+    return false;
+  const reaches = (id, steps) => {
+    if (id === parent) return true;
+    const from = rects.get(id);
+    const left = [...rects].filter(([other, rect]) => other !== id && rect.x + rect.width === from.x &&
+      Math.min(rect.y + rect.height, from.y + from.height) > Math.max(rect.y, from.y)).map(([other]) => other);
+    return steps > 0 && left.length > 0 && left.every(other => other !== temporaryLeaf && reaches(other, steps - 1));
+  };
+  return swapped === undefined || reaches(swapped, 3);
+}
 
 // The native split tree behind a layout reply: { pane } leaves and { direction,
 // ratio, first, second } splits, every split and pane used exactly once; else null.
@@ -166,20 +206,7 @@ function planBandMigration(layout, ids) {
     leavesOf(tree.second).sort().join('\n') !== roles) return { waiting: unplaceable };
   const area = layout.area, chat = placeTree(tree, area).get(ids.parent);
   if (!bandSizes({ width: area.width - chat.width, height: area.height }).fits) return { waiting: bandWaiting };
-  const temporary = temporaryLeaf;
-  const safe = (node, swapped) => {
-    const rects = placeTree(node, area);
-    if (!sameRect(rects.get(ids.parent), chat) || [...rects.values()].some(rect => rect.width < 1 || rect.height < 1))
-      return false;
-    const reaches = (id, steps) => {
-      if (id === ids.parent) return true;
-      const from = rects.get(id);
-      const left = [...rects].filter(([other, rect]) => other !== id && rect.x + rect.width === from.x &&
-        Math.min(rect.y + rect.height, from.y + from.height) > Math.max(rect.y, from.y)).map(([other]) => other);
-      return steps > 0 && left.length > 0 && left.every(other => other !== temporary && reaches(other, steps - 1));
-    };
-    return swapped === undefined || reaches(swapped, 3);
-  };
+  const safe = (node, swapped) => phaseSafe(node, area, ids.parent, chat, swapped);
   const steps = [['move', ids.dag, ids.todo, 'down'], ['move', ids.workers, ids.dag, 'right'], ['swap', ids.workers, ids.dag]];
   for (let start = steps.length; start >= 0; start--) {
     const plan = steps.slice(start), trees = [];
@@ -187,15 +214,15 @@ function planBandMigration(layout, ids) {
     for (const [kind, id, target, direction] of plan) {
       // The tree each guard of this step must find (A3): the step's arguments
       // were decided on these, before, between and after its mutations.
-      const phases = [node];
-      if (kind === 'swap') { node = swapLeaves(node, id, target); ok = safe(node, id); }
-      else {
-        node = mapLeaves(node, leaf => leaf.pane === target ? { direction, ratio: 0.5, first: leaf, second: { pane: temporary } } : leaf);
-        ok = safe(node); phases.push(node);
-        node = swapLeaves(node, id, temporary); ok &&= safe(node, id); phases.push(node);
-        node = dropLeaf(node, temporary); ok &&= safe(node);
+      if (kind === 'swap') {
+        trees.push([node, swapLeaves(node, id, target)]);
+        node = trees.at(-1)[1]; ok = safe(node, id);
+      } else {
+        trees.push(moveTrees(node, id, target, direction));
+        const [, split, swapped, closed] = trees.at(-1);
+        ok = safe(split) && safe(swapped, id) && safe(closed);
+        node = closed;
       }
-      trees.push([...phases, node]);
       if (!ok) break;
     }
     const panes = [...placeTree(node, area)].map(([pane_id, rect]) => ({ pane_id, rect }));
@@ -214,8 +241,9 @@ function planBandMigration(layout, ids) {
 // - silent: no record naming a pane, and no registration or one whose pane is gone;
 // - closed: a valid record whose pane, like any registered one, is gone;
 // - consistent: a valid open record in the parent's tab, registered with the same
-//   pane (or with no registration at all while its launch is still pending, so an
-//   interrupted creation resumes), which has exactly one list row, in the parent's tab;
+//   pane (or, while its launch is still pending, with no registration at all or one
+//   whose pane is authoritatively gone, so an interrupted creation or reopening
+//   resumes), which has exactly one list row, in the parent's tab;
 // - otherwise unverified.
 // FRESH (null) needs a readable list, the parent's tab and only silent roles, or
 // closed ones on an explicit /dashboard: an automatic pass never reopens a
@@ -235,7 +263,7 @@ export function decideRegion({ tabId, readable, roles, explicit = false }) {
     }
     const rows = panes.get(record.paneId)?.rows;
     if (record.state !== 'valid' || record.manualClose || record.tabId !== tabId ||
-      registered !== record.paneId && !(registered === undefined && record.pending) ||
+      registered !== record.paneId && !(record.pending && (registered === undefined || panes.get(registered)?.gone)) ||
       rows?.length !== 1 || rows[0] !== tabId) return { waiting: unverifiedRegion };
     layouts.add(record.layout);
   }
@@ -933,6 +961,16 @@ export class FixedDagPane extends DagPane {
     return pair;
   }
   async preflightRecovery() {
+    if (this.managedAvailable) for (const role of ['workers', 'dag']) {
+      const record = await readJson(this.paneFile(role));
+      // A split whose shell was never observed cannot acquire a birth from a later shell.
+      if (this.recordMatches(record, role) && record.paneId && record.prepared && !record.processId &&
+        (!record.creationDate || !record.creationBirth) && !await this.paneGone(record.paneId)) {
+        this.status = 'layout-waiting';
+        throw Object.assign(new Error('layout-waiting: the new dashboard shell has no verified checkpoint; ' +
+          'close that pane, then run /dashboard'), { code: 'LAYOUT_WAIT' });
+      }
+    }
     if (this.coordinator?.actor && this.coordinator.reconcileLegacy)
       return this.coordinator.reconcileLegacy(this.stateDir, legacyPaneIdentity, this.viewer);
     const entries = await discoverLegacyRecords(this.stateDir, this.binding);
@@ -1250,7 +1288,8 @@ export class FixedDagPane extends DagPane {
       return;
     }
     if (record?.manualClose && !force()) return;
-    if (record?.paneId && record.prepared && !record.processId) {
+    if (record?.paneId && record.prepared && !record.processId &&
+      (!this.managedAvailable || !await this.paneGone(record.paneId))) {
       const member = await this.membership(record.paneId);
       const identity = member.tabId === record.tabId &&
         await legacyPaneIdentity(await this.herdr('process-info', '--pane', record.paneId), record, this.inspectShell);
@@ -1366,6 +1405,18 @@ export class FixedDagPane extends DagPane {
     const shell = await observePaneShell(createdInfo, record, this.inspectShell);
     if (shell) { record.creationDate = shell.shell.CreationDate; if (this.managedAvailable) record.creationBirth = shell.shell.Birth; }
     record.prepared = true;
+    const persist = () => this.roleWrite(async () => {
+      await writeJson(this.paneFile(role), record);
+      await writeJson(this.roleFile(role), this.roleState(record));
+    });
+    if (beforePane && this.managedAvailable) {
+      await persist();
+      if (!record.creationDate || !record.creationBirth || shell.children.length) {
+        this.refusal = 'layout-waiting: the new dashboard shell has no verified checkpoint; close that pane, then run /dashboard';
+        this.status = 'layout-waiting';
+        return;
+      }
+    }
     if (beforePane) {
       try {
         const current = await this.placementFocus(tabId, beforePane);
@@ -1388,10 +1439,7 @@ export class FixedDagPane extends DagPane {
       }
     }
     this.records.set(role, record);
-    await this.roleWrite(async () => {
-      await writeJson(this.paneFile(role), record);
-      await writeJson(this.roleFile(role), this.roleState(record));
-    });
+    await persist();
     return this.launchRole(record);
   }
   async launchRole(record) {
@@ -1443,7 +1491,7 @@ export class FixedDagPane extends DagPane {
         todo.manualClose || todo.tabId !== tabId) throw new Error('layout-waiting: invalid Todo placement owner');
       const ids = { parent: this.parentPane, todo: todo.paneId, workers: pair.workers.paneId, dag: pair.dag.paneId };
       const geometry = async () => (await this.herdr('layout', '--pane', this.parentPane))?.layout;
-      const layout = await geometry();
+      let layout = await geometry();
       // A matching shape is left as it is (G9): the band under a band claim, judged
       // within the owned panes' own rectangle so a pane the owner opened elsewhere
       // in the tab does not make a correct band look wrong; and unmanaged columns
@@ -1495,21 +1543,23 @@ export class FixedDagPane extends DagPane {
         this.status = 'current';
         return { layout: 'band' };
       };
+      // Todo 8: an unresolved placement journal no longer blocks; this explicit
+      // pass resolves it through the actor below, or waits.
+      let stuck;
       if (this.managedAvailable) {
-        const previous = await readJson(placementPath());
-        if (previous && previous.phase !== 'COMPLETE') {
-          this.status = 'BLOCKED';
-          throw blocked('unresolved owned temporary placement');
-        }
+        stuck = await readJson(placementPath()).catch(() => ({ phase: 'UNREADABLE' }));
+        if (stuck?.phase === 'COMPLETE') stuck = undefined;
         // G9: the owned panes already have the band shape under a columns claim
         // (the owner arranged them, or a migration stopped after its moves).
         // Nothing moves and no ratio is re-applied; only the claim follows.
-        if (ownedBand) return promote();
+        if (!stuck && ownedBand) return promote();
       }
       // Moving a pane collapses its old branch. A foreign pane must never be
-      // resized as an incidental result of that collapse.
-      if (layout?.tab_id !== tabId || layout.panes?.length !== 4 ||
-        layout.panes.some(pane => !Object.values(ids).includes(pane.pane_id)))
+      // resized as an incidental result of that collapse. The unresolved
+      // journal's own temporary pane is the one other pane allowed here.
+      const extra = layout?.panes?.some(pane => pane.pane_id === temporaryOf(stuck)) ? [temporaryOf(stuck)] : [];
+      if (layout?.tab_id !== tabId || layout.panes?.length !== 4 + extra.length ||
+        layout.panes.some(pane => ![...Object.values(ids), ...extra].includes(pane.pane_id)))
         throw this.managedAvailable ? wait(foreignWaiting) : new Error('layout-waiting: dashboard region contains unowned panes');
       await preflight(async () => { for (const id of Object.values(ids)) await this.membership(id); });
       const selected = await preflight(() => this.placementFocus(tabId, todo.paneId));
@@ -1556,12 +1606,27 @@ export class FixedDagPane extends DagPane {
           if (this.stopped || failed) return `layout-waiting: the placement could not be verified (${failed?.message ?? 'stopped'})`;
           if (focus.value !== selected) return 'layout-waiting: input selection changed during placement';
           if (!dag.value || !workers.value || owner.value?.paneId !== todo.paneId) return 'layout-waiting: dashboard owner changed during placement';
-          if (!chatKept(current.value)) return 'layout-waiting: the chat pane changed during placement';
+          if (share !== undefined && !chatKept(current.value)) return 'layout-waiting: the chat pane changed during placement';
           if (!sameLayout(current.value, expected)) return 'layout-waiting: the dashboard panes changed during placement';
         };
       };
-      const move = async (id, target, direction, phases) => {
-        const accepted = await guard(phases[0]);
+      // One allowlisted blocked-diagnostics entry per placement wait (todo 8).
+      const diagnosePlacement = code => this.coordinator.actor?.diagnose?.('placement', { code }, { role: 'dag' });
+      // `phases` are the trees before the split, the swap and the close, and after the
+      // close. `resume` (todo 8) continues an unresolved journal: { journal } starts its
+      // move again from the split; { journal, temporary, swapped } goes on with its
+      // verified temporary pane at the swap or, once swapped, at the close.
+      const move = async (id, target, direction, phases, resume) => {
+        const from = resume?.temporary ? resume.swapped ? 2 : 1 : 0;
+        temporaryPaneId = resume?.temporary?.paneId;
+        const accepted = await guard(phases[from]).catch(async error => {
+          // Stopped before its first step, a resumed journal stays for the next /dashboard.
+          if (resume && !error?.code && /^layout-waiting: /.test(error?.message ?? '')) {
+            await diagnosePlacement('LAYOUT_WAIT');
+            throw wait(error.message);
+          }
+          throw error;
+        });
         if (!this.managedAvailable) {
           await this.mutate('dag', 'arrange', id, ['move', id, '--tab', tabId, '--target-pane', target, '--split', direction, '--no-focus']);
           await guard();
@@ -1569,16 +1634,20 @@ export class FixedDagPane extends DagPane {
         }
         const journalPath = join(this.directory, 'placement.json');
         const previous = await readJson(journalPath);
-        if (previous && previous.phase !== 'COMPLETE') {
+        if (previous && previous.phase !== 'COMPLETE' && JSON.stringify(previous) !== JSON.stringify(resume?.journal)) {
           this.status = 'BLOCKED';
           throw blocked('unresolved owned temporary placement');
         }
         const source = await this.coordinator.target(id), anchor = await this.coordinator.target(target);
         const actor = this.coordinator.actor, lifetimeId = this.lifetimeId;
-        let temporary, stage = 'PREPARED';
-        const journal = { schema: 'omo-herdr-dashboard/temporary-placement/1', ...this.binding,
-          lifetimeId, ownerNonce: actor.snapshot.ownerNonce, generation: actor.snapshot.generation,
-          source, anchor, direction, selected, phase: stage, beforeLayout: await geometry(), temporary: null };
+        const { ownerNonce, generation } = actor.snapshot;
+        let temporary = resume?.temporary, stage = ['PREPARED', 'SPLIT_SETTLED', 'SWAP_SETTLED'][from];
+        // A resumed journal keeps the owner, panes and layout it recorded (its
+        // temporary split's lineage); only its old failure is dropped.
+        const journal = from ? { ...resume.journal } : { schema: placementSchema, ...this.binding,
+          lifetimeId, ownerNonce, generation, source, anchor, direction, selected, phase: stage,
+          beforeLayout: await geometry(), temporary: null };
+        for (const key of ['failedStage', 'error', 'failureLayout', 'layoutError', 'cleanup', 'cleanupError']) delete journal[key];
         const saveJournal = async phase => {
           journal.phase = phase;
           journal.temporary = temporary ?? null;
@@ -1587,7 +1656,7 @@ export class FixedDagPane extends DagPane {
         };
         const identities = async () => {
           if (this.coordinator.actor !== actor || this.lifetimeId !== lifetimeId ||
-            actor.snapshot.ownerNonce !== journal.ownerNonce || actor.snapshot.generation !== journal.generation)
+            actor.snapshot.ownerNonce !== ownerNonce || actor.snapshot.generation !== generation)
             throw blocked('placement owner or lifetime changed');
           this.coordinator.assertCurrent();
           if (JSON.stringify(await this.coordinator.target(id)) !== JSON.stringify(source) ||
@@ -1605,23 +1674,27 @@ export class FixedDagPane extends DagPane {
           temporary = undefined;
           temporaryPaneId = undefined;
         };
-        await identities(); await saveJournal(stage);
+        if (!from) { await identities(); await saveJournal(stage); }
         try {
-          const created = await this.mutate('dag', 'split', target,
-            ['split', '--pane', target, '--direction', direction, '--ratio', '0.5', '--cwd', this.cwd, '--no-focus'], undefined, stepCheck(accepted));
-          if (!created?.pane?.pane_id) throw blocked('temporary split has no native receipt');
-          temporaryPaneId = created.pane.pane_id;
-          journal.createdPaneId = temporaryPaneId;
-          journal.splitReceipt = created;
-          await saveJournal('SPLIT_APPLIED');
-          temporary = await this.coordinator.target(created.pane.pane_id);
-          stage = 'SPLIT_SETTLED'; await saveJournal(stage);
-          const swapping = await guard(phases[1]); await identities();
-          await saveJournal('SWAP_PREPARED');
-          await this.mutate('dag', 'arrange', id,
-            ['swap', '--source-pane', id, '--target-pane', temporary.paneId], undefined, stepCheck(swapping));
-          stage = 'SWAP_SETTLED'; await saveJournal(stage);
-          await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
+          if (!from) {
+            const created = await this.mutate('dag', 'split', target,
+              ['split', '--pane', target, '--direction', direction, '--ratio', '0.5', '--cwd', this.cwd, '--no-focus'], undefined, stepCheck(accepted));
+            if (!created?.pane?.pane_id) throw blocked('temporary split has no native receipt');
+            temporaryPaneId = created.pane.pane_id;
+            journal.createdPaneId = temporaryPaneId;
+            journal.splitReceipt = created;
+            await saveJournal('SPLIT_APPLIED');
+            temporary = await this.coordinator.target(created.pane.pane_id);
+            stage = 'SPLIT_SETTLED'; await saveJournal(stage);
+          }
+          if (from < 2) {
+            const swapping = await guard(phases[1]); await identities();
+            await saveJournal('SWAP_PREPARED');
+            await this.mutate('dag', 'arrange', id,
+              ['swap', '--source-pane', id, '--target-pane', temporary.paneId], undefined, stepCheck(swapping));
+            stage = 'SWAP_SETTLED'; await saveJournal(stage);
+            await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
+          }
           const closing = await guard(phases[2]); await identities();
           await closeTemporary(closing);
           stage = 'COMPLETE'; await saveJournal(stage);
@@ -1631,23 +1704,28 @@ export class FixedDagPane extends DagPane {
           // returns to its previous state, so the next /dashboard resumes.
           if (error?.code === 'LAYOUT_WAIT' && error.noEffect === true && stage === 'PREPARED' && !temporaryPaneId) {
             await this.roleWrite(() => previous ? writeJson(journalPath, previous) : rm(journalPath, { force: true }));
+            // A restarted move (todo 8) leaves its unresolved journal for the next /dashboard.
+            if (resume) { await diagnosePlacement('LAYOUT_WAIT'); throw wait(error.message); }
             throw error;
           }
-          this.status = 'BLOCKED';
           journal.failedStage = stage;
           journal.error = { code: error.code, message: error.message };
           try { journal.failureLayout = await geometry(); }
           catch (layoutError) { journal.layoutError = { code: layoutError.code, message: layoutError.message }; }
-          // Never replay or mutate after an UNKNOWN actor effect. A known,
-          // settled temporary split can be closed only through the current
-          // capability and the same independently verified empty-shell identity.
-          if (temporary && !actor.blocked && actor.leaseHeld && !actor.draining) {
-            try { const current = await guard(); await identities(); await closeTemporary(current); journal.cleanup = 'exact-empty-shell-closed'; }
-            catch (cleanupError) { journal.cleanupError = { code: cleanupError.code, message: cleanupError.message }; }
-          }
           await saveJournal('BLOCKED');
-          // A refusal after the temporary pane exists had no effect either, but
-          // the placement is unresolved: like a failed guard, it is not a wait.
+          // Todo 8: a stop that left no unknown effect (the actor is usable and
+          // recorded none) keeps the temporary pane as it is, with no further
+          // mutation, and waits: the next explicit /dashboard resolves the journal.
+          // Never replay or mutate after an UNKNOWN actor effect.
+          if (temporaryPaneId && this.coordinator.actor === actor && !actor.blocked && actor.leaseHeld &&
+            !actor.draining && error?.code !== 'EFFECT_UNKNOWN') {
+            const waiting = error?.code === 'LAYOUT_WAIT' || /^layout-waiting: /.test(error?.message ?? '');
+            await diagnosePlacement(waiting ? 'LAYOUT_WAIT' : 'IDENTITY_MISMATCH');
+            this.status = 'layout-waiting';
+            throw wait(waiting ? error.message
+              : `layout-waiting: the dashboard placement stopped (${String(error?.message).replace(/^BLOCKED: /, '')})`);
+          }
+          this.status = 'BLOCKED';
           throw error?.code === 'LAYOUT_WAIT' ? new Error(error.message) : error;
         }
         await guard(phases[3]);
@@ -1658,12 +1736,93 @@ export class FixedDagPane extends DagPane {
         await this.restorePlacementFocus(id, selected, tabId, todo.paneId);
         await guard(phases?.[1]);
       };
+      // Todo 8: an unresolved journal is resolved through the actor in exactly two
+      // cases: its temporary pane is authoritatively gone (no list row and
+      // pane_not_found, the actor's target_gone rule), or it is still here with the
+      // identity the journal recorded. The four owned panes are verified (the pair
+      // and Todo above, every guard and step check), the recorded phase and the
+      // panes choose the action, and anything else waits with one diagnostics entry.
+      // Returns whether panes were moved.
+      const resolvePlacement = async journal => {
+        const unresolved = async (message, code) => {
+          this.status = 'layout-waiting';
+          await diagnosePlacement(code);
+          throw wait(message);
+        };
+        const temporary = temporaryOf(journal), source = journal?.source?.paneId, anchor = journal?.anchor?.paneId;
+        const recorded = journal?.phase === 'BLOCKED' ? journal.failedStage : journal?.phase;
+        // A failure after SPLIT_SETTLED may have issued the swap: the panes decide.
+        const swapped = !Object.hasOwn(swapRecorded, recorded ?? '') ? null
+          : journal.phase === 'BLOCKED' && recorded === 'SPLIT_SETTLED' ? undefined : swapRecorded[recorded];
+        const before = splitTree(journal?.beforeLayout), roles = Object.values(ids);
+        if (journal?.schema !== placementSchema || !sameOwner(journal, this.binding) || !temporary || swapped === null ||
+          !['right', 'down'].includes(journal.direction) || !before || typeof source !== 'string' ||
+          typeof anchor !== 'string' || source === anchor || source === this.parentPane ||
+          [source, anchor].includes(temporary) || journal.temporary && journal.temporary.paneId !== temporary)
+          return unresolved(placementMismatch, 'OPERATION_MISMATCH');
+        const now = await geometry(), tree = splitTree(now), area = now?.area;
+        const sameRoles = leavesOf(before).sort().join('\n') === [...roles].sort().join('\n');
+        // The chat share the guards keep, while the chat is the root's left child.
+        const kept = tree?.direction === 'right' && tree.first.pane === this.parentPane ? tree.ratio : undefined;
+        const complete = async () => {
+          await this.roleWrite(() => writeJson(placementPath(), { ...journal, phase: 'COMPLETE' }));
+          return false;
+        };
+        if (!now?.panes?.some(pane => pane.pane_id === temporary)) {
+          if (!await this.paneGone(temporary)) return unresolved(placementUnverified, 'IDENTITY_MISMATCH');
+          // (a) The temporary pane is gone. Nothing of the placement is left when its
+          // moved or target pane is gone too, or when its swap was recorded or the
+          // panes prove it.
+          const gone = id => id !== this.parentPane && this.paneGone(id);
+          if (await gone(source) || await gone(anchor) || swapped === true) return complete();
+          const [pre, , , post] = sameRoles ? moveTrees(before, source, anchor, journal.direction) : [];
+          if (sameShape(tree, post)) return complete();
+          if (!sameShape(tree, pre)) return unresolved(placementMismatch, 'OPERATION_MISMATCH');
+          // The move did not take place: it starts again from its first step through
+          // the actor. One that would split or resize the chat (a generation-7 move
+          // beside it, G2) is not repeated: nothing is left to place.
+          const phases = moveTrees(tree, source, anchor, journal.direction);
+          const chat = placeTree(tree, area).get(this.parentPane);
+          const safe = (node, swappedId) => phaseSafe(node, area, this.parentPane, chat, swappedId);
+          if (!safe(phases[1]) || !safe(phases[2], source) || !safe(phases[3])) return complete();
+          share = kept;
+          await move(source, anchor, journal.direction, phases, { journal });
+          return true;
+        }
+        // (b) The temporary pane is here: its pane id, shell birth and tab are the
+        // recorded ones, no process runs in it, and its split is this slot's own
+        // (the journal's owner nonce and generation, settled).
+        const identity = await this.coordinator.target(temporary).catch(() => undefined);
+        const lineage = this.coordinator.actor.snapshot.operations.some(op => op.type === 'split' && op.status === 'SETTLED' &&
+          op.ownerNonce === journal.ownerNonce && op.generation === journal.generation && op.target?.paneId === anchor);
+        if (!journal.temporary || journal.temporary.tabId !== tabId || !lineage ||
+          JSON.stringify(identity) !== JSON.stringify(journal.temporary))
+          return unresolved(placementUnverified, 'IDENTITY_MISMATCH');
+        const marked = tree && mapLeaves(tree, leaf => leaf.pane === temporary ? { pane: temporaryLeaf } : leaf);
+        const [, split, after] = sameRoles && [source, anchor].every(id => roles.includes(id))
+          ? moveTrees(before, source, anchor, journal.direction) : [];
+        const chat = marked && placeTree(marked, area).get(this.parentPane);
+        const safe = (node, swappedId) => phaseSafe(node, area, this.parentPane, chat, swappedId);
+        let phases;
+        if (swapped !== true && sameShape(marked, split)) {
+          const next = swapLeaves(marked, source, temporaryLeaf);
+          phases = [undefined, marked, next, dropLeaf(next, temporaryLeaf)];
+          if (!safe(phases[2], source) || !safe(phases[3])) phases = undefined;
+        } else if (swapped !== false && sameShape(marked, after)) {
+          phases = [undefined, undefined, marked, dropLeaf(marked, temporaryLeaf)];
+          if (!safe(phases[3])) phases = undefined;
+        }
+        if (!phases) return unresolved(placementMismatch, 'OPERATION_MISMATCH');
+        share = kept;
+        await move(source, anchor, journal.direction, phases, { journal, temporary: journal.temporary, swapped: !phases[1] });
+        return true;
+      };
       if (this.managedAvailable) {
         // The owner typed /dashboard in the chat: the migration starts and ends there (IS-8).
         if (selected !== this.parentPane) throw wait('layout-waiting: select the chat pane in this tab, then run /dashboard');
-        const planned = planBandMigration(layout, ids);
-        if (planned.waiting) { this.status = 'layout-waiting'; throw wait(planned.waiting); }
-        share = planned.share;
+        let planned = stuck ? undefined : planBandMigration(layout, ids), moved = false;
+        if (planned?.waiting) { this.status = 'layout-waiting'; throw wait(planned.waiting); }
+        share = planned?.share;
         const rect = (value, id) => value?.panes?.find(pane => pane.pane_id === id)?.rect;
         const splitOf = (value, direction, area) => {
           const found = value?.splits?.filter(split => split?.direction === direction && sameRect(split.rect, area));
@@ -1680,16 +1839,32 @@ export class FixedDagPane extends DagPane {
         const resize = async (basis, paneId, direction, split, cells, length, expected) => {
           if (!split) throw new Error('layout-waiting: dashboard band split unavailable');
           await guard();
-          await this.mutate('dag', 'arrange', paneId, ['resize', '--pane', paneId, '--direction', direction,
-            '--amount', String(Math.abs(split.ratio - cells / length))], { paneId, rect: expected }, stepCheck(basis));
+          try {
+            await this.mutate('dag', 'arrange', paneId, ['resize', '--pane', paneId, '--direction', direction,
+              '--amount', String(Math.abs(split.ratio - cells / length))], { paneId, rect: expected }, stepCheck(basis));
+          } catch (error) {
+            if (error?.code !== 'EFFECT_UNKNOWN') throw error;
+            await diagnosePlacement('EFFECT_UNKNOWN');
+            throw Object.assign(wait('layout-waiting: a dashboard resize has an unknown effect; ' +
+              'restart this OmO window before running /dashboard'), { cause: error });
+          }
         };
         try {
+          if (stuck) {
+            moved = await resolvePlacement(stuck);
+            layout = await geometry();
+            if (layout?.tab_id !== tabId || layout.panes?.length !== 4 ||
+              layout.panes.some(pane => !Object.values(ids).includes(pane.pane_id))) throw wait(foreignWaiting);
+            planned = planBandMigration(layout, ids);
+            if (planned.waiting) throw wait(planned.waiting);
+            share = planned.share;
+          }
           for (const [index, [kind, id, target, direction]] of planned.plan.entries())
             await (kind === 'move' ? move(id, target, direction, planned.trees[index]) : swap(id, target, planned.trees[index]));
           const placed = await geometry();
           if (!isBandDashboard(placed, ids) || !chatKept(placed)) throw new Error('layout-waiting: dashboard band placement mismatch');
           // G9: ratios belong only to a pass that created or moved panes.
-          if (planned.plan.length) {
+          if (planned.plan.length || moved) {
             const chat = rect(placed, ids.parent);
             const region = { x: chat.x + chat.width, y: placed.area.y, width: placed.area.width - chat.width, height: placed.area.height };
             const sizes = bandSizes(region);
