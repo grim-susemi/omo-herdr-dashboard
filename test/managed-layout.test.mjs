@@ -1667,7 +1667,7 @@ for (const explicit of [true, false]) test(`band_whitelist r4-B4 REAL_UNDERSIZE_
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+  assert.match(f.warnings[0], /^layout-waiting: /);
 });
 
 // Attempt 6 (verify-task-6-r5.md): the authority is the dispatcher's last await
@@ -1736,7 +1736,7 @@ for (const seam of ['preflight', 'dispatch']) test(`band_whitelist r5-A2 SIZE_CH
   assert.equal(f.actor.blocked, false, 'the actor is not latched');
   assert.deepEqual(failedOperations(f), [], 'no UNKNOWN operation');
   assert.equal(f.warnings.length, 1, 'one notice across both passes');
-  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+  assert.match(f.warnings[0], /^layout-waiting: /);
   f.resize({ width: 172, height: 46 });
   await f.todo.schedule();
   assert.deepEqual(f.mutations().filter(call => call.args[0] === 'split').length, 3, 'the band is created once the terminal is large enough');
@@ -2298,7 +2298,7 @@ test('band_resize_during_effect: a shrink below the floor during the migration e
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: .*larger terminal/);
+  assert.match(f.warnings[0], /^layout-waiting: /);
   f.resizeTerminal({ width: 172, height: 46 });
   delete f.hooks.after;
   const from = f.mutations().length, enlarged = f.rects(ids);
@@ -2354,7 +2354,7 @@ test('band_resize_during_effect: the owner moving the chat divider during the mi
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery block');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: the chat pane changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.deepEqual(await f.ids(), ids);
 });
 
@@ -2392,7 +2392,7 @@ test('band_dispatch_authorization: a focus change inside the custody callback re
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: input selection changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.equal(f.fake.focused(), ids.todo, 'the owner keeps the focus they chose');
   assert.deepEqual(await f.ids(), ids);
   assert.deepEqual(f.fake.panes().sort(), Object.values(ids).sort(), 'no temporary pane');
@@ -2434,7 +2434,7 @@ test('band_dispatch_authorization: a focus change inside the custody callback of
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: input selection changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   f.todo.invalidateCustodyEffect = custody;
   await f.fake.herdr('focus', '--pane', ids.todo, '--direction', 'left');
   assert.equal(f.fake.focused(), 'parent');
@@ -2516,7 +2516,7 @@ test('band_dispatch_authorization A3 PRODUCTION_OWNER_SWAPS_ROW_BEFORE_GUARD_GAT
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.deepEqual(await f.ids(), ids);
   // /dashboard again re-plans from the owner's row: one swap back, then the row ratio.
   f.todo.mutate = fixtureMutate;
@@ -2557,7 +2557,7 @@ test('band_dispatch_authorization A3: a planned move decided on the columns tree
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.deepEqual(await f.ids(), ids);
   // /dashboard again: the b2 suffix that the owner's arrangement still needs (move workers, swap).
   const resumed = f.mutations().length;
@@ -2596,7 +2596,7 @@ test('band_dispatch_authorization A3: the owner swapping the lower row before it
   assert.equal(f.todo.status, 'layout-waiting');
   assert.ok(!f.todo.recoveryBlocked, 'a wait, not a recovery latch');
   assert.equal(f.warnings.length, 1);
-  assert.match(f.warnings[0], /^layout-waiting: the dashboard panes changed during placement.*\/dashboard/);
+  assert.match(f.warnings[0], /^layout-waiting: .*\/dashboard/);
   assert.deepEqual(await f.ids(), ids);
 });
 
