@@ -650,7 +650,7 @@ test('workers completed group toggles independently and selected completed detai
   assert.match(selected,/Completed tasks \(8\) \[\+\]/);
   await viewer.frame(text=>text.includes('PROGRESS_0'),()=>viewer.send({keys:' '}));
   state.tasks[0].metrics={cost_usd:0,cost_status:'reported',source:'fixture-metrics'};
-  const updated=await viewer.frame(text=>text.includes('$0.0000 [reported]'),()=>writeJson(file,state));
+  const updated=await viewer.frame(text=>text.includes('$0.0000')&&!text.includes('[reported]'),()=>writeJson(file,state));
   assert.match(updated,/PROGRESS_0/);
   await viewer.frame(text=>text.split('\n').length===18&&text.includes('PROGRESS_0'),()=>viewer.send({resize:[18,40]}));
   await viewer.close();const saved=JSON.parse(await readFile(file+'.view.json','utf8'));assert.equal(saved.expanded['[null,"t0"]'],true);assert.equal(saved.navigation.completedExpanded,false);

@@ -226,12 +226,14 @@ function elapsedTime(task, { now, connected, updatedAt }, status) {
 }
 
 const measured = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
-function metricSummary(task, language) {
+function metricSummary(task, language, showReported = true) {
   const metrics = task?.metrics;
   const quality = metrics?.cost_status;
   const knownCost = measured(metrics?.cost_usd) && quality !== 'unavailable' && quality !== 'invalid';
+  const badge = quality === 'reported' && !showReported ? '' :
+    ` [${t(language, quality === 'reported' || quality === 'estimated' ? quality : 'metricUnknown')}]`;
   const cost = knownCost ? `${metrics.cost_usd > 0 && metrics.cost_usd < 0.0001 ?
-    '<$0.0001' : `$${metrics.cost_usd.toFixed(4)}`} [${t(language, quality === 'reported' || quality === 'estimated' ? quality : 'metricUnknown')}]` :
+    '<$0.0001' : `$${metrics.cost_usd.toFixed(4)}`}${badge}` :
     `${t(language, 'cost')}: ${t(language, 'metricUnknown')}`;
   const native = measured(metrics?.tokens_per_second);
   const derived = Number.isSafeInteger(metrics?.output_tokens) && metrics.output_tokens >= 0 &&
@@ -317,7 +319,7 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
     titleText,
     metadata,
     `${indent}${progress}`,
-    `${indent}${task?.metrics ? metricSummary(task, language) : ''}`,
+    `${indent}${task?.metrics ? metricSummary(task, language, Boolean(node)) : ''}`,
     `${indent}${timeRow}`,
   ].map((line, index) => {
     const activity = index === 2 && timing.connected ? activitySummary(task, language, timing.now) : null;

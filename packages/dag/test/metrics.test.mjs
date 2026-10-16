@@ -48,12 +48,13 @@ test('negative nonfinite fractional token counts and arbitrary quality are not m
 
 test('compact cost distinguishes unknown estimated and reported including genuine zero and tiny positives', () => {
   for (const [cost, quality, expected] of [
-    [0, 'reported', '$0.0000 [reported]'], [0.4493, 'reported', '$0.4493 [reported]'],
-    [0.000001, 'reported', '<$0.0001 [reported]'], [1, 'estimated', '$1.0000 [estimated]'],
+    [0, 'reported', '$0.0000'], [0.4493, 'reported', '$0.4493'],
+    [0.000001, 'reported', '<$0.0001'], [1, 'estimated', '$1.0000 [estimated]'],
     [1, undefined, '$1.0000 [Unknown]'] ]) {
     const text = frame(normalizeTask(record({ ...stats, cost_usd: cost, cost_status: quality })));
     assert.ok(text.includes(expected), text);
     assert.ok(text.includes('388 tok/s'));
+    if (quality === 'reported') assert.doesNotMatch(text, /\[reported\]/);
     assert.doesNotMatch(text, /free|273 tok\/s/i);
   }
   for (const quality of ['unavailable', 'invalid']) {
@@ -61,6 +62,14 @@ test('compact cost distinguishes unknown estimated and reported including genuin
     assert.match(text, /Cost: Unknown/);
     assert.doesNotMatch(text, /\$0\.0000/);
   }
+});
+
+test('Korean ordinary worker cost omits reported badge but keeps the amount and detail quality', () => {
+  const task = normalizeTask(record({ ...stats, cost_usd: 0.4493 }));
+  const compact = frame(task, { language: 'ko' });
+  assert.match(compact, /\$0\.4493/);
+  assert.doesNotMatch(compact, /\[보고됨\]/);
+  assert.match(frame(task, { language: 'ko', verbose: true }), /reported/);
 });
 
 test('generation rate prefers native values and only falls back to positive generation time', () => {
