@@ -130,7 +130,7 @@ test('all ten width-one frames reach running root, descendants, graph and detail
   assert.deepEqual(state, before);
 });
 
-test('depth-two session ownership, localized child markers and model suffix survive the width sweep', () => {
+test('depth-two session ownership, localized child groups and aligned arrows survive the width sweep', () => {
   const data = new TaskData({ cwd: '/unused', sessionId: 'root-session' });
   data.merge(raw({ child_session_id: 'child-session',
     description: `DESCRIPTION_HEAD ${'wrapped description words '.repeat(12)}DESCRIPTION_TAIL`,
@@ -149,8 +149,9 @@ test('depth-two session ownership, localized child markers and model suffix surv
     assert.doesNotMatch(frame.text, /provider\//i);
     const children = frame.text.split('\n').filter(line => line.includes('↳'));
     assert.equal(children.length, 2);
-    for (const line of children) assert.ok(line.includes(messages[language].subtask));
-    assert.ok(children[1].indexOf('↳') > children[0].indexOf('↳'));
+    for (const line of children) assert.ok(!line.includes(`↳ ${messages[language].subtask}`));
+    assert.equal(children[1].indexOf('↳'), children[0].indexOf('↳'));
+    assert.ok(frame.text.includes(t(language, 'subtasksCount', { count: 2 })));
     const detail = renderFrame(state, { ...options, verbose: true }).text;
     assert.doesNotMatch(detail, /provider\//i);
     assert.ok(detail.includes(':xhigh'));
@@ -199,6 +200,57 @@ const cardRun = { id: 'run', name: 'RUN', status: 'running', edges: [],
   nodes: [{ id: 'node', label: 'NODE', state: 'running', taskId: 'root' }] };
 const cardLines = (frame, range) => frame.text.split('\n')
   .slice(frame.bodyStart + range.start - frame.scroll, frame.bodyStart + range.end - frame.scroll);
+
+test('approved child cards retain their group and arrows without extra indentation or losing metadata', () => {
+  const state = cardState();
+  Object.assign(state.tasks[0], { agent: 'deep-low', turns: 41, toolCalls: 11 });
+  Object.assign(state.tasks[1], { agent: 'unspecified-low', model: 'claude-sonnet-5-5',
+    status: 'completed', startedAt: new Date(cardNow - 60000).toISOString(),
+    completedAt: new Date(cardNow - 32000).toISOString(), turns: 5, toolCalls: 3,
+    metrics: { cost_usd: 0.1242, cost_status: 'reported', tokens_per_second: 604 } });
+  const before = structuredClone(state);
+  for (const language of ['en', 'ko', 'zh-cn']) for (const columns of [24, 30, 32, 40, 54, 80, 120]) {
+    for (const view of ['tasks', 'dag']) {
+      const source = { ...state, runs: view === 'dag' ? [cardRun] : [] };
+      const options = { language, columns, rows: 160, color: false, frame: 0,
+        now: cardNow, view, selectedTaskId: 'root', selectedNodeId: 'node' };
+      const frame = renderFrame(source, options);
+      const lines = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
+      const group = t(language, 'subtasksCount', { count: 2 });
+      assert.equal(lines.filter(line => line.includes(group)).length, 1);
+      const childAt = lines.findIndex(line => line.includes('↳ ✓ CHILD_TITLE'));
+      const grandAt = lines.findIndex(line => line.includes('↳ ○ GRAND_TITLE'));
+      assert.ok(childAt >= 0 && grandAt > childAt);
+      const contentAt = lines.find(line => line.includes('[deep-low]')).indexOf('[');
+      assert.equal(lines[childAt].indexOf('↳'), contentAt);
+      assert.equal(lines[grandAt].indexOf('↳'), contentAt);
+      const child = lines.slice(childAt, grandAt);
+      const badge = child.find(line => line.includes('['));
+      assert.equal(badge.indexOf('['), contentAt);
+      const money = child.find(line => line.includes('$0.1242'));
+      assert.equal(money.indexOf('$'), contentAt);
+      assert.ok(money.includes('604 tok/s'));
+      const timed = child.find(line => line.includes('⧖'));
+      assert.equal(timed.indexOf('⧖'), contentAt);
+      assert.ok(timed.includes(t(language, 'compactSeconds', { count: 28 })));
+      assert.ok(timed.includes(t(language, 'compactTurns', { count: 5 })));
+      if (columns >= 32) {
+        assert.ok(badge.includes('[unspecified-low]'));
+        if (columns === 32) {
+          const model = child.find(line => line.includes('claude-sonnet-5-5:medium'));
+          assert.ok(model, 'the existing full model row survives removing the indent');
+          assert.equal(model.indexOf('claude'), contentAt);
+        }
+        assert.ok(timed.includes(t(language, 'compactTools', { count: 3 })));
+      }
+      for (const line of child) assert.ok(!line.includes(`↳ ${messages[language].subtask}`));
+      assert.ok(frame.text.split('\n').every(line => width(line) < columns));
+      const colored = renderFrame(source, { ...options, color: true });
+      assert.equal(stripVTControlCharacters(colored.text), frame.text);
+    }
+  }
+  assert.deepEqual(state, before);
+});
 
 test('worker and DAG cards follow their content with role badges, a time mark and no blank rows', () => {
   for (const language of ['en', 'ko']) for (const columns of [40, 80]) for (const view of ['tasks', 'dag']) {

@@ -1,5 +1,42 @@
 # Current dashboard verification
 
+## 2026-10-17 compact child-card alignment
+
+Compact worker and DAG child cards retain the localized counted group heading and
+arrow, remove the repeated child label and align child metadata with root cards.
+The previous role/model wrapping budget is preserved, including narrow panes.
+
+The focused renderer sweep covers three languages, seven widths from 24 to 120
+columns, both views and two child depths. The updated and new regression checks
+passed. The renderer/model/fixed-view run changed from 51 passing and 32 failing
+tests before the edit to 52 passing and the same 32 failures afterward. Those
+existing failures include stale frame expectations and two fixed-view PTY tests;
+this is not a clean full-suite result.
+
+The unified build and offline package check passed (41 archive files, 27 runtime
+modules). An actual owned Herdr pane ran the candidate with a pinned Node process:
+initial layout, tracking off/on, collapse/expand, disconnect/reconnect and normal
+quit passed. Raw visible ANSI and process identity were retained privately. This
+exercise used isolated worker data, not the owner's live task state.
+
+One independent read-only gate reviewer approved installation after checking the
+source delta, candidate hashes and eight visible frames. Test commands were run
+by the implementer, not repeated by that reviewer.
+
+Managed installation created generation 17 and retained generation 16 unchanged.
+All 39 prior files were checked: only the approved renderer differed in the new
+generation. A fresh actual Herdr viewer launched from installed generation 17
+passed the same eight transitions and exited normally; its exact Node process
+identity and source hash were recorded. The owned test tab was separate from
+the owner's conversation. Existing conversations were not force-reloaded.
+
+Installation and activation are separate: a newly installed generation is used
+by a fresh conversation or deliberate `/reload`. Existing in-memory controllers
+and their viewer processes do not switch merely because the installer succeeds.
+
+Korean summary: child arrows and group counts remain; repeated labels and extra
+indentation are removed. Existing test failures remain disclosed above.
+
 ## 2026-10-16 worker-update masking repair
 
 Ordinary worker content updates no longer invalidate healthy viewer offers or

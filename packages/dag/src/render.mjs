@@ -300,11 +300,13 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
     if (task?.[key] !== undefined && task[key] !== null) stats.push(t(language, label, { count: value(task[key]) }));
   }
   const room = Math.max(1, roomOverride ?? columns - 4);
-  const indent = '  '.repeat(Math.min(depth, Math.max(0, Math.floor((room - 12) / 2))));
-  const marker = depth ? `↳ ${t(language, 'subtask')}` : selected ? '>' : ' ';
+  const depthColumns = 2 * Math.min(depth, Math.max(0, Math.floor((room - 12) / 2)));
+  const indent = '';
+  const marker = depth ? '↳' : selected ? '>' : ' ';
   const identity = [task?.agent, task?.category].map(part => clean(part).trim()).filter(Boolean).join('/');
-  const badge = identity ? `[${fit(identity, Math.max(1, room - width(indent) - 2))}]` : '';
-  const modelRoom = room - width(indent) - (badge ? width(badge) + 1 : 0);
+  // Keep existing role/model wrapping while removing the visible child inset.
+  const badge = identity ? `[${fit(identity, Math.max(1, room - depthColumns - 2))}]` : '';
+  const modelRoom = room - depthColumns - (badge ? width(badge) + 1 : 0);
   // If the role badge would crowd out model:effort, the badge keeps its own row and the model follows it.
   const modelOwnRow = Boolean(task?.model) && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2;
   const metadata = modelOwnRow ? `${indent}${badge}` :
