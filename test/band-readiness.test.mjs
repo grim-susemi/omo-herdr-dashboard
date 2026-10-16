@@ -11,6 +11,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { isBandDashboard, isColumnDashboard } from '../packages/dag/src/controller.mjs';
 import { createRoleClient } from '../packages/todo/src/presence.mjs';
+import { dashboardChannels } from '../packages/todo/src/controller.mjs';
 import { createBandDashboard, NATIVE_MUTATIONS, readRecord } from './helpers/band-dashboard.mjs';
 
 const KEYS = ['omo-dag', 'omo-task', 'todo-sidebar'];
@@ -269,12 +270,57 @@ test('band_ready_geometry_and_fresh_paints: with readiness forced false after th
   f.todo.bridge.readinessChanged();
   for (const key of KEYS) assert.deepEqual(host.visible.get(key), NATIVE_LINES[key], `${key} restored`);
   assert.deepEqual(f.todo.bridge.status.masked, []);
+  await f.actor.diagnostics;
+  const diagnostics = (await readFile(join(f.actor.paths.directory, 'blocked-diagnostics.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line));
+  const denied = diagnostics.filter(entry => entry.branch === 'display' && entry.reason === 'recovery-blocked');
+  assert.ok(denied.some(entry => entry.role === 'workers' &&
+    entry.sequence === f.todo.bridge.status.publication.sequence && entry.phase === 'READY'));
   f.todo.recoveryBlocked = false;
   f.todo.bridge.readinessChanged();
   for (const key of KEYS) assert.equal(host.visible.get(key), undefined, `${key} masked again`);
   assert.deepEqual(f.todo.bridge.status.masked.sort(), KEYS);
   for (const key of KEYS) assert.deepEqual(masking.slice(from).filter(change => change.key === key).map(change => change.shown),
     [true, false], `${key} restored once, then masked once`);
+});
+
+test('content-only worker updates keep healthy native widgets hidden and retain viewer offers', async t => {
+  const { f, host } = await open(t);
+  const provider = f.todo.provider, bus = new EventEmitter();
+  f.todo.provider = undefined;
+  const pi = { events: {
+    on(name, callback) { bus.on(name, callback); return () => bus.off(name, callback); },
+    emit: (name, event) => bus.emit(name, event),
+  } };
+  f.todo.bind(pi);
+  pi.events.emit(dashboardChannels.provider, {
+    v: 1, kind: 'dag-provider', ...f.todo.binding, provider,
+  });
+  await f.todo.tail;
+  drawNativeLines(host);
+  await hidden(host, KEYS, 'before content update');
+  const sequence = f.todo.bridge.status.publication.sequence;
+  const offers = Object.fromEntries(['todo', 'dag', 'workers'].map(role => [role, f.todo.presence.offer(role)]));
+  const before = host.history.length;
+  f.dag.sourceEvents.emit('source', { ...f.dag.source(), tasks: [
+    { id: 'worker-1', status: 'running', description: 'A worker progress update' },
+  ] });
+  assert.equal(host.visible.get('omo-task'), undefined, 'content progress is not loss of the healthy viewer');
+  await f.todo.tail;
+  await f.todo.managedIdle();
+  assert.equal(f.todo.bridge.status.publication.sequence, sequence);
+  for (const role of ['todo', 'dag', 'workers'])
+    assert.deepEqual(f.todo.presence.offer(role), offers[role], `${role} keeps its presence identity`);
+  assert.ok(host.history.slice(before).every(entry => !entry.shown), 'no native widget flashes during content progress');
+  f.dag.sourceEvents.emit('source', { ...f.dag.source(), runs: [
+    { id: 'dag-coverage', nodes: [{ id: 'node', taskId: 'worker-1' }] },
+  ] });
+  assert.equal(f.todo.sourceRefreshing, true, 'DAG coverage changes still require fresh paint');
+  assert.deepEqual(host.visible.get('omo-task'), NATIVE_LINES['omo-task']);
+  await f.todo.tail;
+  await hidden(host, KEYS, 'after changed DAG coverage is painted');
+  for (const role of ['todo', 'dag', 'workers'])
+    assert.notEqual(f.todo.presence.offer(role).token, offers[role].token, `${role} reauthorizes changed DAG coverage`);
 });
 
 test('band interrupted arrangement: viewer paint renewals keep native lines visible until an explicit retry completes', async t => {

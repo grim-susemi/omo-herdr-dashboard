@@ -36,14 +36,19 @@ const fail = (code, cause) => Object.assign(new Error(code, cause ? { cause } : 
   { code, inlineFallback: true });
 const keyFor = (socket, pane) => createHash('sha256').update(JSON.stringify([socket, pane])).digest('hex');
 const diagnosticBranches = new Set(['claim', 'publish', 'validate-target', 'dispatch', 'reconcile',
-  'release', 'controller-write', 'legacy-source', 'schedule', 'stop', 'placement']);
+  'release', 'controller-write', 'legacy-source', 'schedule', 'stop', 'placement', 'display']);
 const diagnosticCodes = new Set(['NONE', 'EFFECT_UNKNOWN', 'IDENTITY_MISMATCH', 'OPERATION_MISMATCH',
   'LEASE_LOST', 'PUBLISH_FAILED', 'STALE_CAPABILITY', 'SLOT_CORRUPT', 'ACK_MISMATCH', 'CLOSURE_MISMATCH',
   'SQLITE_BUSY', 'SOURCE_MISMATCH', 'RECOVERY_BLOCKED', 'EPERM', 'EBUSY', 'ENOENT', 'pane_not_found', 'MANAGED_UNAVAILABLE',
   'LAYOUT_WAIT']);
 // The ACK condition that failed; names only, never the compared values.
 const diagnosticReasons = new Set(['role-missing', 'paneId', 'statePath', 'launchToken', 'controlToken',
-  'generation', 'sessionId', 'painted', 'sequence-invalid', 'sequence-stale']);
+  'generation', 'sessionId', 'painted', 'sequence-invalid', 'sequence-stale', 'ready', 'stopped',
+  'managed-blocked', 'recovery-blocked', 'layout-active', 'arrangement-moving', 'source-refreshing',
+  'actor-fallback', 'participant-mismatch', 'role-generation', 'role-paint', 'role-sequence',
+  'role-not-ready', 'role-closed', 'presence-not-ready', 'scope-mismatch']);
+const ioCodes = new Set(['EPERM', 'EACCES', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC', 'EIO', 'EMFILE', 'ENFILE', 'EROFS']);
+const publishStages = new Set(['open', 'write', 'sync', 'close', 'rename', 'directory-sync']);
 
 // A reload in the same native producer may reuse only the exact last published
 // journal of an actor whose SQLite handle was cooperatively closed. This
@@ -257,19 +262,29 @@ class ParentSlot {
     const entry = { time: new Date().toISOString(), branch, code,
       ...(['split', 'run', 'close', 'arrange', 'retire'].includes(operation?.type) ? { type: operation.type } : {}),
       ...(Object.hasOwn(roleOwner, operation?.role ?? '') ? { role: operation.role } : {}),
-      ...(reason ? { reason } : {}) };
+      ...(reason ? { reason } : {}),
+      ...(ioCodes.has(cause?.cause?.code) ? { ioCode: cause.cause.code } : {}),
+      ...(publishStages.has(cause?.stage) ? { stage: cause.stage } : {}),
+      ...(positive(cause?.sequence) ? { sequence: cause.sequence } : {}),
+      ...(positive(cause?.ackSequence) ? { ackSequence: cause.ackSequence } : {}),
+      ...(phases.includes(cause?.phase) ? { phase: cause.phase } : {}) };
     const path = join(this.paths.directory, 'blocked-diagnostics.jsonl');
     this.diagnostics = this.diagnostics.then(async () => {
       let entries = [];
       try {
         if ((await this.fs.stat(path)).size <= 64 * 1024) {
           entries = (await this.fs.readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-            .filter(value => keys(value, ['time', 'branch', 'code'], ['type', 'role', 'reason']) &&
+            .filter(value => keys(value, ['time', 'branch', 'code'],
+              ['type', 'role', 'reason', 'ioCode', 'stage', 'sequence', 'ackSequence', 'phase']) &&
               typeof value.time === 'string' && new Date(value.time).toISOString() === value.time &&
               diagnosticBranches.has(value.branch) && diagnosticCodes.has(value.code) &&
               (!value.type || ['split', 'run', 'close', 'arrange', 'retire'].includes(value.type)) &&
               (!value.role || Object.hasOwn(roleOwner, value.role)) &&
-              (!value.reason || diagnosticReasons.has(value.reason)));
+              (!value.reason || diagnosticReasons.has(value.reason)) &&
+              (!value.ioCode || ioCodes.has(value.ioCode)) && (!value.stage || publishStages.has(value.stage)) &&
+              (!Object.hasOwn(value, 'sequence') || positive(value.sequence)) &&
+              (!Object.hasOwn(value, 'ackSequence') || positive(value.ackSequence)) &&
+              (!value.phase || phases.includes(value.phase)));
         }
       } catch { /* Diagnostics are never authority or a reason to block recovery. */ }
       entries.push(entry);
@@ -313,15 +328,19 @@ class ParentSlot {
       throw fail('SLOT_CORRUPT');
     }
     const temporary = `${this.paths.slotPath}.${this.record.ownerNonce}.pending`;
-    let file;
+    let file, stage = 'open';
     try {
       file = await this.fs.open(temporary, 'wx', 0o600);
+      stage = 'write';
       await file.writeFile(JSON.stringify(next));
+      stage = 'sync';
       await file.sync();
+      stage = 'close';
       await file.close(); file = null;
       // Windows denies replacing slot.json while any reader holds it open and
       // allows it once the reader closes. Retry only those codes, briefly and
       // bounded (as dag storage writeJson); anything else fails closed below.
+      stage = 'rename';
       for (let attempt = 0; ; attempt++) {
         try { await this.fs.rename(temporary, this.paths.slotPath); break; }
         catch (error) {
@@ -331,6 +350,7 @@ class ParentSlot {
       }
       // Flush the rename's directory entry on filesystem-socket platforms.
       if (process.platform !== 'win32') {
+        stage = 'directory-sync';
         const directory = await this.fs.open(dirname(this.paths.slotPath), 'r');
         try { await directory.sync(); } finally { await directory.close(); }
       }
@@ -338,8 +358,9 @@ class ParentSlot {
       this.publishedRecord = structuredClone(next);
     } catch (error) {
       this.blocked = true;
-      await this.diagnose('publish', fail('PUBLISH_FAILED'), next.operations.find(op => op.id === next.transaction.id));
-      throw fail('PUBLISH_FAILED', error);
+      const failure = Object.assign(fail('PUBLISH_FAILED', error), { stage });
+      await this.diagnose('publish', failure, next.operations.find(op => op.id === next.transaction.id));
+      throw failure;
     } finally {
       if (file) await file.close();
       await this.fs.rm(temporary, { force: true });

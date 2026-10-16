@@ -117,6 +117,12 @@ test('release closes SQLite even when DRAINING publication fails', async t => {
   deny = true;
   await assert.rejects(actor.release(), { code: 'PUBLISH_FAILED' });
   assert.equal(actor.db.isOpen, false);
+  await actor.diagnostics;
+  const diagnostics = (await fs.readFile(join(actor.paths.directory, 'blocked-diagnostics.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line));
+  const failure = diagnostics.find(entry => entry.branch === 'publish' && entry.code === 'PUBLISH_FAILED');
+  assert.equal(failure.ioCode, 'EPERM');
+  assert.equal(failure.stage, 'rename');
   await fs.rename(actor.paths.directory, `${actor.paths.directory}.moved`);
   await fs.rename(`${actor.paths.directory}.moved`, actor.paths.directory);
 });

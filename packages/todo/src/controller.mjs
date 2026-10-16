@@ -1605,20 +1605,40 @@ export class TodoPane {
       hasDagOwnedTasks: () => this.presence.hasDagOwnedTasks(),
       isReady: receipt => {
         const record = this.ownedRoles.get(receipt?.role);
+        const snapshot = this.actor?.snapshot;
+        const result = reason => {
+          this.readinessReasons ??= new Map();
+          if (this.readinessReasons.get(receipt.role) !== reason) {
+            this.readinessReasons.set(receipt.role, reason);
+            void this.actor?.diagnose('display', { code: 'NONE', reason, sequence: receipt.sequence,
+              ackSequence: snapshot?.roles[receipt.role]?.ack?.sequence, phase: snapshot?.phase },
+              { role: receipt.role });
+          }
+          return reason === 'ready';
+        };
         if (this.managed) {
-          const snapshot = this.actor?.snapshot;
-          if (this.stopped || this.managedBlocked || this.recoveryBlocked || this.layoutActive || this.arrangement?.moving ||
-            this.sourceRefreshing ||
-            this.actor?.inlineFallback !== false || snapshot?.sessionId !== this.binding.sessionId ||
-            snapshot.participants.todo?.lifetimeId !== this.lifetimeId ||
-            snapshot.participants.dag?.lifetimeId !== this.provider?.lifetimeId ||
-            !['todo', 'dag', 'workers'].every(role => snapshot.roles[role]?.generation === snapshot.generation &&
-              snapshot.roles[role]?.ack?.painted && snapshot.roles[role].ack.sequence === receipt.sequence &&
-              this.ownedRoles.get(role)?.ready && !this.ownedRoles.get(role).manualClose &&
-              this.presence.isReady({ ...receipt, role }))) return false;
+          for (const [reason, denied] of [
+            ['stopped', this.stopped], ['managed-blocked', this.managedBlocked],
+            ['recovery-blocked', this.recoveryBlocked], ['layout-active', this.layoutActive],
+            ['arrangement-moving', this.arrangement?.moving], ['source-refreshing', this.sourceRefreshing],
+            ['actor-fallback', this.actor?.inlineFallback !== false],
+            ['scope-mismatch', snapshot?.sessionId !== this.binding.sessionId],
+            ['participant-mismatch', snapshot?.participants.todo?.lifetimeId !== this.lifetimeId ||
+              snapshot?.participants.dag?.lifetimeId !== this.provider?.lifetimeId],
+          ]) if (denied) return result(reason);
+          for (const role of ['todo', 'dag', 'workers']) {
+            if (snapshot.roles[role]?.generation !== snapshot.generation) return result('role-generation');
+            if (!snapshot.roles[role]?.ack?.painted) return result('role-paint');
+            if (snapshot.roles[role].ack.sequence !== receipt.sequence) return result('role-sequence');
+            if (!this.ownedRoles.get(role)?.ready) return result('role-not-ready');
+            if (this.ownedRoles.get(role).manualClose) return result('role-closed');
+            if (!this.presence.isReady({ ...receipt, role })) return result('presence-not-ready');
+          }
         }
-        return record?.scopeEpoch === this.scopeEpoch && record.ready === true && record.manualClose !== true &&
-          Number.isSafeInteger(record.processId) && this.presence.isReady(receipt);
+        if (record?.scopeEpoch !== this.scopeEpoch) return result('scope-mismatch');
+        if (record.ready !== true || !Number.isSafeInteger(record.processId)) return result('role-not-ready');
+        if (record.manualClose === true) return result('role-closed');
+        return result(this.presence.isReady(receipt) ? 'ready' : 'presence-not-ready');
       },
     };
     this.onPresenceEvent = event => {
@@ -1853,8 +1873,12 @@ export class TodoPane {
       this.source = provider.getSource();
       this.offSource = provider.subscribeSource(source => {
         if (this.stopped || this.provider !== provider) return;
+        const coverageChanged = this.source?.connected !== source.connected ||
+          JSON.stringify(this.source?.runs) !== JSON.stringify(source.runs);
         this.source = source;
-        if (this.managed) { this.sourceDirty = true; this.sourceRefreshing = true; }
+        // Worker progress is already saved in the same viewers' role files.
+        // It does not replace their identities or change DAG coverage.
+        if (this.managed && coverageChanged) { this.sourceDirty = true; this.sourceRefreshing = true; }
         this.bridge?.readinessChanged();
         void this.schedule().catch(() => {});
       });
