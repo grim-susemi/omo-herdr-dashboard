@@ -42,11 +42,21 @@ export function createHerdr(env = process.env) {
   return async (...args) => {
     const bin = resolveHerdrBin(env);
     if (!bin) throw new Error('Herdr is not available in this session');
-    const { stdout } = await execute(bin, ['pane', ...args], { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+    let stdout;
+    try {
+      ({ stdout } = await execute(bin, ['pane', ...args], { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024 }));
+    } catch (error) {
+      // Herdr exits non-zero with a structured error body; keep its code (e.g.
+      // pane_not_found) so absence is recognised, as the Todo wrapper does.
+      let reply;
+      try { reply = JSON.parse(error.stdout || error.stderr); } catch { throw error; }
+      if (!reply?.error) throw error;
+      throw Object.assign(new Error(reply.error.message ?? JSON.stringify(reply.error), { cause: error }), { code: reply.error.code });
+    }
     // pane run acknowledges success with an empty body in Herdr protocol 20.
     if (!stdout.trim()) return {};
     const reply = JSON.parse(stdout);
-    if (reply.error) throw new Error(reply.error.message ?? JSON.stringify(reply.error));
+    if (reply.error) throw Object.assign(new Error(reply.error.message ?? JSON.stringify(reply.error)), { code: reply.error.code });
     return reply.result;
   };
 }

@@ -8,7 +8,7 @@ import { createHerdr, herdrSession } from './src/herdr.mjs';
 import { resolveViewerNode } from './src/runtime.mjs';
 import { t, languageOf } from './src/i18n.mjs';
 
-export default function extension(pi, { createController = options => new FixedDagPane(options) } = {}) {
+export default function extension(pi, { createController = options => new FixedDagPane(options), recoveryTimeoutMs = 20000 } = {}) {
   let language = languageOf(process.env.OMO_HERDR_DAG_LANG ?? 'en');
   let controller;
   let unsubscribe;
@@ -123,13 +123,42 @@ export default function extension(pi, { createController = options => new FixedD
     lifecycle = starting.catch(() => {});
     return starting;
   }
+  // The managed coordinator is only (re)built by session_start/session_tree. A failed
+  // Todo claim, a retired coordinator that was never replaced, or a latched actor used
+  // to leave /dashboard throwing "managed W coordinator unavailable" until the OmO window
+  // restarted. /dashboard now repairs that state through the same start() path.
+  const coordinatorLost = () => {
+    if (!managedAvailable) return false;
+    const actor = controller?.coordinator?.actor;
+    return !actor || actor.blocked === true || actor.leaseHeld === false || actor.draining === true;
+  };
+  // Cheapest repair first: ask the live Todo owner for its coordinator again.
+  function reattachCoordinator() {
+    if (!controller || controller.stopped) return;
+    pi.events.emit(channels.query, { v: 1, requestId: randomUUID(), kind: 'todo-owner', ...controller.binding });
+  }
+  async function recoverCoordinator(ctx) {
+    let timer;
+    const expired = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no result after ${recoveryTimeoutMs} ms`)), recoveryTimeoutMs);
+    });
+    try { await Promise.race([start({ kind: 'dashboard-recover' }, ctx), expired]); }
+    catch (error) {
+      ctx.ui.notify(`DAG pane: BLOCKED: managed W coordinator could not be re-established (${error?.message ?? error}); restart this OmO window`, 'warning');
+    } finally { clearTimeout(timer); }
+  }
   pi.on('session_start', start);
   pi.on('session_tree', start);
   pi.on('session_shutdown', async () => { await stop(); await lifecycle; });
   pi.registerCommand('dashboard', {
     description: 'Open or reopen the Todo, worker and DAG dashboard.',
     handler: async (_args, ctx) => {
-      if (!eligible(ctx) || !controller) return;
+      if (!eligible(ctx)) return;
+      if (coordinatorLost()) {
+        reattachCoordinator();
+        if (coordinatorLost()) await recoverCoordinator(ctx);
+      }
+      if (!controller) return;
       await controller.open().catch(() => {});
     },
   });

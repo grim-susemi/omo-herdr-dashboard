@@ -21,7 +21,7 @@ import { t } from './i18n.mjs';
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 // Terminal primitives: one-cell inset, semantic ANSI colors and bounded ask.
 const style = { accent: '36', phase: '35', muted: '90', completed: '90', abandoned: '90',
-  in_progress: '36', warning: '33', error: '31' };
+  in_progress: '36', warning: '33', error: '31', activePhase: '33' };
 const layout = { taskInset: 5, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
 const marks = { pending: '[ ]', in_progress: '[•]', completed: '[✓]', abandoned: '[×]', cancelled: '[×]' };
 export const STRIKE_INTERVAL_MS = 65;
@@ -128,28 +128,37 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const taskRanges = Object.create(null), phaseRanges = Object.create(null);
   const bodyLines = [];
   const phaseOccurrences = new Map();
-  const closedPhases = phases.filter(isClosedPhase).length;
-  const closedRange = closedPhases ? { start: 0, end: 1 } : null;
-  if (closedPhases) bodyLines.push(paint(fit(`${t(language, 'closedPhases', { count: closedPhases })} ${completedExpanded ? '[-]' : '[+]'}`, columns), 'muted', color));
+  // Closed phases have no summary row: the header's [closed/total] already counts them, and 'c' still expands them.
+  const closedRange = null;
+  // Compact layout: only phases holding active work (else the first open phase) list their tasks;
+  // the others keep a one-row header that the closed-summary toggle expands.
+  const openPhases = new Set(phases.flatMap((phase, index) =>
+    phase.tasks.some(task => task.status === 'in_progress') ? [index] : []));
+  if (!openPhases.size && phases.some(phase => !isClosedPhase(phase))) openPhases.add(phases.findIndex(phase => !isClosedPhase(phase)));
+  const foldRanges = [];
   for (const [phaseIndex, phase] of phases.entries()) {
     const occurrence = phaseOccurrences.get(phase.name) ?? 0;
     phaseOccurrences.set(phase.name, occurrence + 1);
     const phaseKey = snapshot?.phaseSummaries?.[phaseIndex]?.key ?? JSON.stringify([phase.name, occurrence]);
-    if (bodyLines.length) bodyLines.push('');
+    if (isClosedPhase(phase) && !completedExpanded) continue;
+    const folded = !completedExpanded && phase.tasks.length > 0 && !isClosedPhase(phase) && !openPhases.has(phaseIndex);
     const start = bodyLines.length;
     const count = counts(phase.tasks);
-    const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}`;
-    const nameRoom = columns - width(summary) - 2;
-    const phaseStyle = isClosedPhase(phase) ? 'muted' : 'phase';
-    if (nameRoom > 0) bodyLines.push(paint(`${fit(phase.name, nameRoom)}: ${summary}`, phaseStyle, color, true));
-    else bodyLines.push(paint(fit(`${phase.name}:`, columns), phaseStyle, color, true), ...wrap(summary, columns));
+    const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}${folded ? ' [+]' : ''}`;
+    // Each phase title is a divider row "─ name n/m ───"; only the phase holding the current work keeps a colour.
+    const nameRoom = columns - width(summary) - 5;
+    const label = fit(nameRoom > 0 ? `${fit(phase.name, nameRoom)} ${summary}` : summary, Math.max(1, columns - 3));
+    const tail = '─'.repeat(Math.max(0, columns - width(label) - 3));
+    bodyLines.push(openPhases.has(phaseIndex) && !isClosedPhase(phase)
+      ? `${paint('─ ', 'muted', color)}${paint(label, 'activePhase', color, true)}${paint(` ${tail}`, 'muted', color)}`
+      : paint(`─ ${label} ${tail}`, 'muted', color));
     const taskOccurrences = new Map();
-    for (const [taskIndex, task] of (isClosedPhase(phase) && !completedExpanded ? [] : phase.tasks).entries()) {
+    if (folded) foldRanges.push({ start, end: bodyLines.length });
+    for (const [taskIndex, task] of (folded ? [] : phase.tasks).entries()) {
       const taskOccurrence = taskOccurrences.get(task.content) ?? 0;
       taskOccurrences.set(task.content, taskOccurrence + 1);
       const key = snapshot?.phaseSummaries?.[phaseIndex]?.taskKeys?.[taskIndex] ??
         JSON.stringify([phase.name, occurrence, task.content, taskOccurrence]);
-      if (taskIndex && (task.status === 'in_progress' || phase.tasks[taskIndex - 1].status === 'in_progress')) bodyLines.push('');
       const taskStart = bodyLines.length;
       const prefix = `${target?.key === key ? '>' : ' '}${marks[task.status]} `;
       const wrapped = wrap(task.content, columns - layout.taskInset);
@@ -182,30 +191,20 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     const lines = fallback.slice(0, rows).map(line => fit(line, columns));
     while (lines.length < rows) lines.push('');
     return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges,
-      scroll, askScroll, bodyStart: 0, bodyRows: 0, askRows: 0, closedRange };
+      scroll, askScroll, bodyStart: 0, bodyRows: 0, askRows: 0, closedRange, foldRanges };
   }
-  const top = [paint(fit(head, columns), ['last-known', 'disconnected'].includes(source) ? 'warning' :
-    source === 'error' ? 'error' : 'accent', color, true), paint(fit(tally(total), columns), 'muted', color)];
-  if (rows >= 12) top.push(paint('─'.repeat(columns), 'muted', color));
-  top.push(paint(fit(current, columns), target ? 'in_progress' : 'pending', color, Boolean(target)));
-  const askLines = wrap(snapshot?.ask?.text ?? t(language, 'noAsk'), columns);
-  const room = rows - top.length - 1 - Number(Boolean(error));
-  const askBudget = Math.min(layout.askMaxRows + 1,
-    Math.max(0, room - layout.minimumWorkRows - layout.sectionGap));
-  const askRows = askBudget > 1 ? askBudget - 1 : askBudget;
-  askScroll = clamp(askScroll, askLines.length - askRows);
-  const ask = [];
-  if (askBudget > 1) {
-    ask.push(paint(fit(`${t(language, 'ask')} ${askScroll + 1}-${Math.min(askScroll + askRows, askLines.length)}/${askLines.length}`, columns), 'muted', color));
-    ask.push(...askLines.slice(askScroll, askScroll + askRows).map(line => paint(line, 'muted', color)));
-    while (ask.length < askBudget) ask.push('');
-  } else if (askBudget === 1) {
-    const label = `${t(language, 'ask')} ${askScroll + 1}/${askLines.length}: `;
-    const narrowAsk = wrap(snapshot?.ask?.text ?? t(language, 'noAsk'), Math.max(1, columns - width(label)));
-    askScroll = clamp(askScroll, narrowAsk.length - 1);
-    ask.push(paint(fit(`${t(language, 'ask')} ${askScroll + 1}/${narrowAsk.length}: ${narrowAsk[askScroll]}`, columns), 'muted', color));
-  }
-  if (room > layout.minimumWorkRows) ask.push('');
+  const headStyle = ['last-known', 'disconnected'].includes(source) ? 'warning' : source === 'error' ? 'error' : 'accent';
+  // One header row "Todo [closed/total]  done:n · drop:n" under which a divider runs; the live state is
+  // only in the footer. The current task is the marked body row, so no Now or Ask row repeats it.
+  const name = `${t(language, 'todo')} [${total.closed}/${total.total}]`;
+  const detail = `${t(language, 'completed')}:${total.completed} · ${t(language, 'dropped')}:${total.dropped}`;
+  const divider = paint('─'.repeat(columns), 'muted', color);
+  const top = [width(`${name}  ${detail}`) <= columns
+    ? `${paint(t(language, 'todo'), headStyle, color, true)} ${paint(`[${total.closed}/${total.total}]`, 'activePhase', color, true)}  ${paint(detail, 'muted', color)}`
+    : paint(fit(name, columns), headStyle, color, true), divider];
+  const room = rows - top.length - 2 - Number(Boolean(error));
+  const askRows = 0, ask = [];
+  askScroll = 0;
   const bodyRows = Math.max(0, room - ask.length);
   const active = taskRanges[target?.key];
   if (revealTarget && active && bodyRows > 0 &&
@@ -216,13 +215,14 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
   while (visible.length < bodyRows) visible.push('');
   const live = !error && ['current', 'empty'].includes(availability);
-  const footer = `${t(language, columns < 30 ? follow && live ? 'followShortOn' : 'followShortOff' :
-    follow && live ? 'followOn' : 'followOff')} | ${t(language, source)}`;
+  // Below 40 columns every pane shortens the follow label the same way.
+  const footer = `${t(language, columns < 40 ? follow && live ? 'followShortOn' : 'followShortOff' :
+    follow && live ? 'followOn' : 'followOff')} · ${t(language, source)}`;
   const lines = [...top, ...ask, ...visible,
     ...(error ? [paint(fit(t(language, 'readError', { error: clean(error) }), columns), 'error', color)] : []),
-    paint(fit(footer, columns), live ? 'accent' : 'warning', color)].slice(0, rows);
+    divider, paint(fit(footer, columns), live ? 'accent' : 'warning', color)].slice(0, rows);
   return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll,
-    bodyStart: top.length + ask.length, bodyRows, askRows, closedRange };
+    bodyStart: top.length + ask.length, bodyRows, askRows, closedRange, foldRanges };
 }
 
 export const render = (snapshot, options) => renderFrame(snapshot, options).text;

@@ -475,7 +475,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
       } else {
         const row = mouse.y - 1 - (lastFrame?.bodyStart ?? 0) + scroll;
         if (mouse.y - 1 >= lastFrame?.bodyStart && mouse.y - 1 < lastFrame.bodyStart + lastFrame.bodyRows &&
-          lastFrame?.closedRange && row >= lastFrame.closedRange.start && row < lastFrame.closedRange.end)
+          [lastFrame?.closedRange, ...(lastFrame?.foldRanges ?? [])].some(range => range && row >= range.start && row < range.end))
           prefs.completedExpanded = !prefs.completedExpanded;
       }
       dragY = mouse.y;

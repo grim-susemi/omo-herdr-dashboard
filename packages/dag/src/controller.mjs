@@ -239,7 +239,10 @@ function planBandMigration(layout, ids) {
 // names to the tab ids of its list rows and whether it is authoritatively gone.
 // A role is
 // - silent: no record naming a pane, and no registration or one whose pane is gone;
-// - closed: a valid record whose pane, like any registered one, is gone;
+// - closed: a valid record whose pane, like any registered one, is gone - or a
+//   malformed one (e.g. written by an older generation's viewer) that names a pane
+//   and every pane it or the registration names is authoritatively gone: nothing
+//   is left open to verify;
 // - consistent: a valid open record in the parent's tab, registered with the same
 //   pane (or, while its launch is still pending, with no registration at all or one
 //   whose pane is authoritatively gone, so an interrupted creation or reopening
@@ -247,18 +250,26 @@ function planBandMigration(layout, ids) {
 // - otherwise unverified.
 // FRESH (null) needs a readable list, the parent's tab and only silent roles, or
 // closed ones on an explicit /dashboard: an automatic pass never reopens a
-// dashboard this conversation's owner closed. INHERITED ({ layout }) needs
+// dashboard this conversation's owner closed; panes that died with an earlier
+// host lifetime (a restart) come back as { waiting, reopen: true }. INHERITED ({ layout }) needs
 // consistent roles sharing one 'band' or 'columns' claim, the rest silent or
 // closed. Everything else is WAIT ({ waiting }), never a throw: a throw latches
 // recovery (IS-10, G4).
-export function decideRegion({ tabId, readable, roles, explicit = false }) {
+export function decideRegion({ tabId, readable, roles, explicit = false, lifetimeId }) {
   if (!readable || !tabId) return { waiting: unverifiedRegion };
   const layouts = new Set();
-  let closed = false;
+  let closed = false, died = true;
   for (const { record, registered, panes } of Object.values(roles)) {
     const named = [record.paneId, registered].filter(id => id !== undefined);
-    if (['absent', 'valid'].includes(record.state) && named.every(id => panes.get(id).gone)) {
-      closed ||= record.paneId !== undefined;
+    if ((['absent', 'valid'].includes(record.state) || record.state === 'malformed' && record.paneId !== undefined) &&
+      named.every(id => panes.get(id).gone)) {
+      if (record.paneId !== undefined) {
+        closed = true;
+        // Died, not closed: claimed by an earlier host lifetime and never closed by
+        // the owner (q or an observed absence marks manualClose).
+        died &&= record.manualClose !== true && typeof lifetimeId === 'string' &&
+          typeof record.lifetimeId === 'string' && record.lifetimeId !== lifetimeId;
+      }
       continue;
     }
     const rows = panes.get(record.paneId)?.rows;
@@ -267,7 +278,7 @@ export function decideRegion({ tabId, readable, roles, explicit = false }) {
       rows?.length !== 1 || rows[0] !== tabId) return { waiting: unverifiedRegion };
     layouts.add(record.layout);
   }
-  if (!layouts.size) return closed && !explicit ? { waiting: closedWaiting } : null;
+  if (!layouts.size) return closed && !explicit ? { waiting: closedWaiting, ...(died ? { reopen: true } : {}) } : null;
   const [layout] = layouts;
   return layouts.size === 1 && ['band', 'columns'].includes(layout) ? { layout } : { waiting: claimWaiting };
 }
@@ -608,12 +619,37 @@ export function parseLaunchCommand(command) {
   }
   return argv;
 }
-async function nativeShellProcesses(pid) {
+async function queryShellProcesses(pid) {
   const { stdout } = await executeProcessQuery('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $ErrorActionPreference = 'Stop'; $rows = @(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid} OR ParentProcessId = ${pid}" | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},@{Name='Birth';Expression={$h=[Diagnostics.Process]::GetProcessById($_.ProcessId);try{$null=$h.Handle;$h.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}finally{$h.Dispose()}}}); ConvertTo-Json -InputObject $rows -Compress`],
-  { timeout: 5000, maxBuffer: 65536 });
+  { timeout: 30000, maxBuffer: 65536 }); // was 5 s, same as the Todo process query
   return JSON.parse(stdout);
 }
+// Process identity rows, cached per pid. Layout passes ask about the same pane shells, this
+// process and its ancestors every few seconds, and each uncached ask starts a PowerShell + WMI
+// query; at several per second that made the whole terminal stutter. A row set is reused for
+// SHELL_QUERY_TTL_MS unless a pane mutation or a viewer register/close happened since. The epoch
+// is shared through globalThis so the Todo and DAG controllers in one OmO process clear each other.
+const PROCESS_QUERY_EPOCH = Symbol.for('omo-herdr-dashboard.processQueryEpoch');
+export const SHELL_QUERY_TTL_MS = 10000;
+export function bumpProcessQueryEpoch() {
+  globalThis[PROCESS_QUERY_EPOCH] = (globalThis[PROCESS_QUERY_EPOCH] ?? 0) + 1;
+}
+export function cachedProcessQuery(query, { ttlMs = SHELL_QUERY_TTL_MS, now = Date.now } = {}) {
+  const entries = new Map();
+  return async pid => {
+    const at = now(), epoch = globalThis[PROCESS_QUERY_EPOCH] ?? 0;
+    let entry = entries.get(pid);
+    if (!entry || entry.epoch !== epoch || at - entry.at >= ttlMs) {
+      for (const [key, old] of entries) if (old.epoch !== epoch || at - old.at >= ttlMs) entries.delete(key);
+      const created = entry = { at, epoch, promise: query(pid) };
+      entries.set(pid, created);
+      created.promise.catch(() => { if (entries.get(pid) === created) entries.delete(pid); });
+    }
+    return structuredClone(await entry.promise);
+  };
+}
+const nativeShellProcesses = cachedProcessQuery(queryShellProcesses);
 export async function observePaneShell(info, record, inspect = nativeShellProcesses) {
   const pid = info?.process_info?.shell_pid;
   if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid < 1 ||
@@ -679,6 +715,10 @@ export async function canCleanupPane(info, record, inspect) {
   return pathKey(child.ExecutablePath) === pathKey(record.nodePath) && argv !== null &&
     Boolean(processMatch({ process_info: { foreground_processes: [{ pid: child.ProcessId, argv }] } }, record));
 }
+
+// A viewer must report 'created' within this window. 10 s was too short on a loaded host:
+// the viewer started but registered late, the run settled EFFECT_UNKNOWN and latched the actor.
+const launchConfirmationMs = 30000;
 
 export class FixedDagPane extends DagPane {
   constructor(options) {
@@ -873,17 +913,23 @@ export class FixedDagPane extends DagPane {
     }
     return actual;
   }
+  // A pane mutation changes which processes run where: cached identity rows are dropped before and after.
   async mutate(role, type, paneId, args, effect, check) {
-    if (!this.managedAvailable) return this.herdr(...args);
+    bumpProcessQueryEpoch();
+    try {
+    if (!this.managedAvailable) return await this.herdr(...args);
     if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
     const record = await readJson(this.paneFile(role));
     const target = record?.paneId === paneId ? await this.nativeTarget(record) : await this.coordinator.target(paneId);
-    return this.coordinator.mutate(role, type, target, args, effect, undefined, check);
+    return await this.coordinator.mutate(role, type, target, args, effect, undefined, check);
+    } finally { bumpProcessQueryEpoch(); }
   }
   async handleControl(message, socket) {
     if (this.stopped && !(this.managedAvailable && message?.type === 'register' && this.pendingLaunches.has(message.launchToken)) ||
       !['dag', 'workers'].includes(message?.role) ||
       !['register', 'close'].includes(message.type)) return socket.destroy();
+    // A viewer that registers or closes has just started or is about to stop: read fresh rows.
+    bumpProcessQueryEpoch();
     const role = message.role;
     const record = await readJson(this.paneFile(role));
     const state = await readJson(this.roleFile(role));
@@ -1190,15 +1236,17 @@ export class FixedDagPane extends DagPane {
       typeof value.paneId === 'string' && value.paneId && value.paneId !== this.parentPane) &&
       (claim === undefined || claim !== null && typeof claim === 'object' && !Array.isArray(claim))
       ? { state: 'valid', paneId: value.paneId, tabId: value.tabId, manualClose: value.manualClose === true,
-        layout: claim?.layout ?? 'columns', pending: value.ready !== true }
-      : { state: 'malformed', paneId: typeof value.paneId === 'string' && value.paneId ? value.paneId : undefined };
+        layout: claim?.layout ?? 'columns', pending: value.ready !== true, lifetimeId: claim?.lifetimeId }
+      : { state: 'malformed', paneId: typeof value.paneId === 'string' && value.paneId ? value.paneId : undefined,
+        manualClose: value.manualClose === true,
+        lifetimeId: claim !== null && typeof claim === 'object' ? claim.lifetimeId : undefined };
   }
   async ownedRegion(options) {
     const evidence = await this.regionEvidence(options);
     return evidence.input ? decideRegion(evidence.input) : evidence;
   }
   // The gathering half of ownedRegion: { input } for decideRegion, or { waiting }.
-  async regionEvidence({ explicit = false } = {}) {
+  async regionEvidence({ explicit = false, lifetimeId } = {}) {
     const panes = await this.herdr('list').then(result => result?.panes, () => undefined);
     const readable = Array.isArray(panes) && panes.every(pane => typeof pane?.pane_id === 'string' && pane.pane_id);
     const listed = id => Array.isArray(panes) ? panes.filter(pane => pane?.pane_id === id) : [];
@@ -1222,7 +1270,7 @@ export class FixedDagPane extends DagPane {
         rows: listed(id).map(pane => pane.tab_id),
         gone: await this.paneGone(id, readable ? panes : null) });
     }
-    return { input: { tabId: parents.length === 1 ? parents[0].tab_id : undefined, readable, roles, explicit } };
+    return { input: { tabId: parents.length === 1 ? parents[0].tab_id : undefined, readable, roles, explicit, lifetimeId } };
   }
   // Authoritative absence: a fully readable list has no row for the pane and
   // Herdr answers pane_not_found for it.
@@ -1446,7 +1494,7 @@ export class FixedDagPane extends DagPane {
     const role = record.role, launchToken = record.launchToken;
     const abort = new AbortController();
     const creation = once(this.roleEvents, `created:${launchToken}`,
-      { signal: AbortSignal.any([abort.signal, ...(this.managedAvailable ? [] : [this.stopSignal.signal]), AbortSignal.timeout(10000)]) });
+      { signal: AbortSignal.any([abort.signal, ...(this.managedAvailable ? [] : [this.stopSignal.signal]), AbortSignal.timeout(launchConfirmationMs)]) });
     creation.catch(() => {});
     this.pendingLaunches.add(launchToken);
     try {

@@ -342,12 +342,37 @@ export function parseLaunchCommand(command) {
   }
   return argv;
 }
-async function nativeShellProcesses(pid) {
+async function queryShellProcesses(pid) {
   const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $ErrorActionPreference = 'Stop'; $rows = @(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid} OR ParentProcessId = ${pid}" | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},@{Name='Birth';Expression={$h=[Diagnostics.Process]::GetProcessById($_.ProcessId);try{$null=$h.Handle;$h.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}finally{$h.Dispose()}}}); ConvertTo-Json -InputObject $rows -Compress`],
-  { timeout: 5000, maxBuffer: 65536 });
+  { timeout: 30000, maxBuffer: 65536 }); // was 5 s: killed (SIGTERM) while OmO was starting, so the claim failed
   return JSON.parse(stdout);
 }
+// Process identity rows, cached per pid. Layout passes ask about the same pane shells, this
+// process and its ancestors every few seconds, and each uncached ask starts a PowerShell + WMI
+// query; at several per second that made the whole terminal stutter. A row set is reused for
+// SHELL_QUERY_TTL_MS unless a pane mutation or a viewer register/close happened since. The epoch
+// is shared through globalThis so the Todo and DAG controllers in one OmO process clear each other.
+const PROCESS_QUERY_EPOCH = Symbol.for('omo-herdr-dashboard.processQueryEpoch');
+export const SHELL_QUERY_TTL_MS = 10000;
+export function bumpProcessQueryEpoch() {
+  globalThis[PROCESS_QUERY_EPOCH] = (globalThis[PROCESS_QUERY_EPOCH] ?? 0) + 1;
+}
+export function cachedProcessQuery(query, { ttlMs = SHELL_QUERY_TTL_MS, now = Date.now } = {}) {
+  const entries = new Map();
+  return async pid => {
+    const at = now(), epoch = globalThis[PROCESS_QUERY_EPOCH] ?? 0;
+    let entry = entries.get(pid);
+    if (!entry || entry.epoch !== epoch || at - entry.at >= ttlMs) {
+      for (const [key, old] of entries) if (old.epoch !== epoch || at - old.at >= ttlMs) entries.delete(key);
+      const created = entry = { at, epoch, promise: query(pid) };
+      entries.set(pid, created);
+      created.promise.catch(() => { if (entries.get(pid) === created) entries.delete(pid); });
+    }
+    return structuredClone(await entry.promise);
+  };
+}
+const nativeShellProcesses = cachedProcessQuery(queryShellProcesses);
 // An explicit /dashboard only reconciles unresolved operations; it cannot
 // rebuild a blocked actor. Restarting the OmO window releases and re-claims it.
 const managedUnavailable = 'managed controller or lease unavailable; restart this OmO window, then run /dashboard in this tab if the dashboard does not return';
@@ -1402,9 +1427,12 @@ export class TodoPane {
           participants !== JSON.stringify(actor.snapshot.participants)) throw blocked('arrange source lifetime changed');
       } };
   }
+  // A pane mutation changes which processes run where: cached identity rows are dropped before and after.
   async mutate(role, type, target, args, observedEffect, beforeSubmit, check) {
-    if (!this.managed) return this.herdr(...args);
-    return this.perform(role, type, target, async ({ operation, authorize }) => {
+    bumpProcessQueryEpoch();
+    try {
+    if (!this.managed) return await this.herdr(...args);
+    return await this.perform(role, type, target, async ({ operation, authorize }) => {
       let resolve, reject;
       const effects = new Promise((done, fail) => { resolve = done; reject = fail; });
       effects.catch(() => {});
@@ -1458,6 +1486,7 @@ export class TodoPane {
       }
       finally { arrange?.close(); }
     }, check);
+    } finally { bumpProcessQueryEpoch(); }
   }
   registerManagedRole(role, readTarget) {
     return this.managedWrite(async actor => {
@@ -1748,6 +1777,8 @@ export class TodoPane {
     }
     if (!['register', 'close'].includes(message?.type) ||
       this.stopped && !(this.managed && message.type === 'register' && this.pendingLaunches.has(message.launchToken))) return socket.destroy();
+    // A viewer that registers or closes has just started or is about to stop: read fresh rows.
+    bumpProcessQueryEpoch();
     const registration = this.roleWrite(async () => {
       const record = await readJson(this.recordFile);
       const state = await readRoleState(this.stateFile);
@@ -2174,6 +2205,7 @@ export class TodoPane {
   schedule({ forceRoles = [] } = {}) {
     const closureVersions = new Map(this.closureVersions);
     const pass = async () => {
+      if (this.restartReopening && !forceRoles.length) return;
       const forceCurrent = role => forceRoles.includes(role) &&
         (closureVersions.get(role) ?? 0) === (this.closureVersions.get(role) ?? 0);
       if (this.managed) {
@@ -2263,9 +2295,20 @@ export class TodoPane {
       // managed pass decides it, a live Todo's evidence included (r4 B2); the gate
       // decides again before each mutation (r4 B3).
       const region = this.managed && provider.ownedRegion
-        ? await provider.ownedRegion({ explicit: forceCurrent('todo') }) : null;
+        ? await provider.ownedRegion({ explicit: forceCurrent('todo'), lifetimeId: this.lifetimeId }) : null;
       const inherited = !record && Boolean(region);
       if (region && !region.layout) {
+        // Panes that died with the previous host (not closed by the owner) are
+        // reopened once per lifetime, as an explicit /dashboard would.
+        if (region.reopen && !forceRoles.length && !this.restartReopened) {
+          this.restartReopened = true;
+          // Queued automatic passes step aside so the reopen runs next and no
+          // stale 'panes were closed' notice is shown meanwhile.
+          this.restartReopening = true;
+          void this.schedule({ forceRoles: ['dag', 'workers', 'todo'] })
+            .finally(() => { this.restartReopening = false; }).catch(() => {});
+          return;
+        }
         this.bandWaiting(region.waiting, forceRoles.length > 0);
         return;
       }
@@ -2500,7 +2543,7 @@ export class TodoPane {
     const launchToken = record.launchToken;
     const abort = new AbortController();
     const creation = once(this.events, `created:${launchToken}`,
-      { signal: AbortSignal.any([abort.signal, ...(this.managed ? [] : [this.stopSignal.signal]), AbortSignal.timeout(10000)]) });
+      { signal: AbortSignal.any([abort.signal, ...(this.managed ? [] : [this.stopSignal.signal]), AbortSignal.timeout(30000)]) }); // was 10 s: a late but live viewer settled EFFECT_UNKNOWN
     creation.catch(() => {});
     this.pendingLaunches.add(launchToken);
     try {

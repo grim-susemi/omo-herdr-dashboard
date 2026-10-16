@@ -49,7 +49,7 @@ export const messages = {
   ko: {
     subtask: '하위', subtasksCount: '하위 작업 ({count})',
     completedTasks: '완료 작업 ({count})',
-    followShortOn: '추적 ON', followShortOff: '추적 OFF', liveShort: '연결', offlineShort: '오프라인',
+    followShortOn: '추적 ON', followShortOff: '추적 OFF', liveShort: '연결됨', offlineShort: '오프라인',
     workerGroupKeys: 'j/k c 완료작업', dagGroupKeys: 'j/k ←→ c 완료실행', detailCloseKeys: 'd 상세 q 닫기',
     workerControls: 'j/k 이동  c 완료 작업  d 상세  q 닫기',
     workerControlsNarrow: 'j/k c완료 d상세 q닫기',
