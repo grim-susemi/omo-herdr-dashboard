@@ -1,5 +1,33 @@
 # Current dashboard verification
 
+## 2026-10-16 worker-update masking repair
+
+Ordinary worker content updates no longer invalidate healthy viewer offers or
+briefly restore native widgets. Connection and DAG coverage changes still require
+fresh paint. Bounded diagnostics record readiness reasons, sequence and publication
+I/O stage without session content or paths. Compact ordinary worker cards omit
+the redundant reported-cost badge while retaining amounts, estimated/unknown
+information and verbose detail quality.
+
+Focused checks passed: 73 core tests, 7 metric tests and 1 actual worker PTY test.
+An owned native SDK component host with real Herdr viewers kept native widgets
+hidden during task-file updates. Identity-guarded suspension caused genuine
+heartbeat expiry and native restoration; resuming the same viewer hid them again.
+One independent reviewer approved the frozen candidate by inspecting code and
+evidence, without rerunning the tests.
+
+Production installation retained the prior generation. All 30 installed `.mjs`
+files matched the approved build, and a fresh Node process imported the installed
+entry successfully. Already-running conversations were not restarted; module
+import is not proof that their in-memory controllers have changed.
+
+Limits: manual close followed by dashboard recreation failed in a separate
+experiment, with attribution unproven. Default cold-start timing and the full
+OmO application remain unverified. SDK graceful shutdown exceeded its cap; owned
+servers were explicitly stopped instead. The large placement matrix did not
+finish and is not counted as a pass. These results do not establish the sole
+cause of the original production report or universal lifecycle recovery.
+
 ## Band layout source candidate
 
 New managed dashboards use the band layout. Todo spans the top of the dashboard
