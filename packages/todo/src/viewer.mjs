@@ -81,7 +81,8 @@ export async function startViewer(options, { input = process.stdin, output = pro
   let state = null, snapshot = null, availability = 'waiting', error = '';
   let client = null, message = null, generation = 0, observation = 0, validatedObservation = -1;
   let invalidState = false;
-  let prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: false }, scroll = 0, target = null;
+  // Every phase is listed by default; c folds closed phases away.
+  let prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: true }, scroll = 0, target = null;
   let refreshing = null, dirty = false, closing = false, closeJob;
   let painting = Promise.resolve(), saving = Promise.resolve(), lastFrame;
   let resolveClosed;
@@ -290,15 +291,17 @@ export async function startViewer(options, { input = process.stdin, output = pro
     });
   }
   async function preferences(next, epoch) {
-    prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: false }; scroll = 0; target = null;
+    prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: true }; scroll = 0; target = null;
     try {
       const value = JSON.parse(await readFile(next.prefsPath, 'utf8'));
       if (epoch === generation && value.schema === 'omo-herdr-todo/view/1' && sameSnapshotScope(value, next) &&
         [value.scroll, value.askScroll].every(number => Number.isSafeInteger(number) && number >= 0) &&
         (value.follow === undefined || typeof value.follow === 'boolean') &&
-        (value.completedExpanded === undefined || typeof value.completedExpanded === 'boolean')) {
+        (value.completedExpanded === undefined || typeof value.completedExpanded === 'boolean') &&
+        (value.closedFolded === undefined || typeof value.closedFolded === 'boolean')) {
+        // Only an explicit fold (c) is restored; preferences saved under the old folded default are not.
         prefs = { scroll: value.scroll, askScroll: value.askScroll, follow: true,
-          completedExpanded: value.completedExpanded ?? false };
+          completedExpanded: typeof value.closedFolded === 'boolean' ? !value.closedFolded : true };
         scroll = prefs.scroll;
       }
     } catch (cause) {
@@ -390,7 +393,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   }
   function savePreferences() {
     const value = { schema: 'omo-herdr-todo/view/1', ownerKey: state.ownerKey,
-      sessionId: state.sessionId, scopeEpoch: state.scopeEpoch, ...prefs };
+      sessionId: state.sessionId, scopeEpoch: state.scopeEpoch, ...prefs, closedFolded: !prefs.completedExpanded };
     const epoch = generation, path = state.prefsPath;
     saving = saving.then(async () => {
       if (closing || epoch !== generation) return;

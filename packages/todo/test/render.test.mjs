@@ -44,7 +44,8 @@ test('grapheme width, truncation and wrapping retain independently expected cell
 for (const [columns, rows, bodyRows] of [[80, 24, 15], [40, 16, 7], [24, 8, 2],
   [52, 23, 14], [34, 18, 9], [51, 46, 37], [12, 4, 0], [1, 1, 0]]) {
   test(`${columns}x${rows}: visible bounded frame without ask starving current work`, () => {
-    const frame = renderFrame(mixed(), { columns, rows, revealTarget: true, color: false });
+    const snapshot = mixed();
+    const frame = renderFrame(snapshot, { columns, rows, revealTarget: true, color: false });
     assert.equal(frame.lines.length, rows);
     assert.equal(frame.bodyRows, bodyRows);
     assert.ok(frame.lines.some(line => line.length > 0));
@@ -53,7 +54,9 @@ for (const [columns, rows, bodyRows] of [[80, 24, 15], [40, 16, 7], [24, 8, 2],
     if (bodyRows > 0) {
       assert.ok(frame.lines.some(line => line.includes('>[•] ')), 'actual target remains visible');
       assert.ok(frame.askRows <= 2);
-      assert.equal(frame.lines[frame.bodyStart], frame.bodyLines[frame.scroll]);
+      // The first body row is the scrolled row, or the followed phase's title pinned over it.
+      const phaseTitle = frame.bodyLines[frame.taskRanges[snapshot.target.key].phaseStart];
+      assert.ok([frame.bodyLines[frame.scroll], phaseTitle].includes(frame.lines[frame.bodyStart]));
       assert.equal(frame.bodyStart + frame.bodyRows + 1, rows);
       assert.doesNotMatch(frame.text, /j\/k|a\/z|^f /m);
     }
@@ -195,7 +198,7 @@ test('reference hierarchy emphasizes active work and exposes body-relative click
   const active = frame.taskRanges[snapshot.target.key];
   assert.ok(frame.bodyLines[active.start].startsWith('\x1b[1;36m'));
   const done = frame.taskRanges[snapshot.phaseSummaries[0].taskKeys[0]];
-  assert.ok(frame.bodyLines[done.start].startsWith('\x1b[9;90m'));
+  assert.ok(frame.bodyLines[done.start].startsWith('\x1b[9;2;32m'));
   assert.equal(frame.lines[frame.bodyStart + active.start - frame.scroll], frame.bodyLines[active.start]);
   assert.ok(frame.bodyLines.includes(''));
   assert.equal(renderFrame(project([]), { color: false }).closedRange, null);
@@ -209,4 +212,35 @@ test('read errors remain pinned while closed summaries retain stable click coord
   assert.match(frame.lines.at(-2), /READ_FAILURE/);
   assert.equal(frame.bodyStart + frame.bodyRows + 2, frame.lines.length);
   assert.ok(frame.lines.every(line => width(line) < 34));
+});
+
+test('following pins the phase holding current work to the first body row', () => {
+  const snapshot = project([
+    { name: 'Done', tasks: [{ content: 'D1', status: 'completed' }, { content: 'D2', status: 'abandoned' }] },
+    { name: 'Now', tasks: [{ content: 'N1', status: 'completed' }, { content: 'N2', status: 'in_progress' }] },
+    { name: 'Next', tasks: [{ content: 'X1', status: 'pending' }] }]);
+  const followed = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true, revealTarget: true });
+  assert.match(followed.lines[followed.bodyStart], /─ Now /);
+  assert.ok(followed.lines.some(line => line.includes('>[•] N2')));
+  assert.ok(followed.lines.some(line => line.includes('X1')));
+  const paused = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true });
+  assert.match(paused.lines[paused.bodyStart], /─ Done /);
+});
+
+test('a phase longer than the pane keeps its title on top while the current work scrolls under it', () => {
+  const snapshot = project([{ name: 'Long', tasks: Array.from({ length: 20 }, (_, index) => ({
+    content: `ROW_${index}`, status: index === 15 ? 'in_progress' : 'pending' })) }]);
+  const frame = renderFrame(snapshot, { columns: 40, rows: 10, color: false, revealTarget: true });
+  assert.match(frame.lines[frame.bodyStart], /─ Long /);
+  assert.match(frame.lines[frame.bodyStart + 1], />\[•\] ROW_15/);
+  assert.ok(!frame.lines.some(line => /ROW_0\b/.test(line)));
+});
+
+test('done and dropped rows carry different colours', () => {
+  const snapshot = project([{ name: 'Mixed', tasks: [{ content: 'DONE', status: 'completed' },
+    { content: 'DROP', status: 'abandoned' }, { content: 'LIVE', status: 'in_progress' }] }]);
+  const frame = renderFrame(snapshot, { columns: 40, rows: 12, color: true, completedExpanded: true });
+  const row = text => frame.bodyLines.find(line => line.includes(text));
+  assert.ok(row('DONE').startsWith('\x1b[9;2;32m'), JSON.stringify(row('DONE')));
+  assert.ok(row('DROP').startsWith('\x1b[2;31m'), JSON.stringify(row('DROP')));
 });

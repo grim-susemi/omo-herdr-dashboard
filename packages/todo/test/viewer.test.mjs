@@ -474,19 +474,20 @@ test('closed phase c persists manual expansion only in its validated scope', asy
   const f=await fixture(t);const phases=[{name:'Closed',tasks:[{content:'COMPLETED_DETAIL',status:'completed'},{content:'DROPPED_DETAIL',status:'abandoned'}]},{name:'Empty',tasks:[]}];
   const publish=()=>f.presence.publish({...projectNativeTodo([{type:'custom',customType:'senpi.todo-state',data:{schema:'v2',phases}}]),...f.presence.getOwner()});
   await publish();const ack=signal(f.presence.events,'event',v=>v.type==='ack');let viewer=await f.start();await ack;
-  assert.doesNotMatch(viewer.frame.text,/COMPLETED_DETAIL|DROPPED_DETAIL/);
-  const prefs=signal(viewer.events,'preferences',v=>v.completedExpanded&&!v.follow);viewer.key('c');await prefs;
+  // Every phase is listed by default; c folds the closed ones and that fold is what persists.
   assert.match(viewer.frame.text,/COMPLETED_DETAIL/);assert.match(viewer.frame.text,/DROPPED_DETAIL/);
+  const prefs=signal(viewer.events,'preferences',v=>!v.completedExpanded&&v.closedFolded&&!v.follow);viewer.key('c');await prefs;
+  assert.doesNotMatch(viewer.frame.text,/COMPLETED_DETAIL|DROPPED_DETAIL/);
   const saved=await fs.readFile(f.state.prefsPath,'utf8');
   const updated=signal(viewer.events,'frame',v=>v.sequence===2);await publish();await updated;
-  f.output.columns=24;f.output.rows=8;await viewer.draw();assert.equal(viewer.state.completedExpanded,true);
+  f.output.columns=24;f.output.rows=8;await viewer.draw();assert.equal(viewer.state.completedExpanded,false);
   assert.equal(await fs.readFile(f.state.prefsPath,'utf8'),saved);await viewer.close(false);
   const restarted=signal(f.presence.events,'event',v=>v.type==='ack');viewer=await f.start();await restarted;
-  assert.equal(viewer.state.completedExpanded,true);assert.equal(viewer.state.follow,true);
+  assert.equal(viewer.state.completedExpanded,false);assert.equal(viewer.state.follow,true);
   const owner=f.presence.getOwner();await f.presence.rebase({...owner,scopeEpoch:2});
   const rebound=signal(viewer.events,'registered',v=>v.scope.scopeEpoch===2);
   await f.writeState({...f.state,scopeEpoch:2,presenceOffer:f.presence.offer('todo'),controlOffer:{...f.state.controlOffer,scopeEpoch:2}});await rebound;
-  assert.equal(viewer.state.completedExpanded,false);assert.equal(viewer.state.follow,true);
+  assert.equal(viewer.state.completedExpanded,true);assert.equal(viewer.state.follow,true);
 });
 
 test('same-scope source error, disconnect and reattach retain an active target without revealing it offline', async t => {

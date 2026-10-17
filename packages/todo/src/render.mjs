@@ -20,7 +20,8 @@ import { t } from './i18n.mjs';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 // Terminal primitives: one-cell inset, semantic ANSI colors and bounded ask.
-const style = { accent: '36', phase: '35', muted: '90', completed: '90', abandoned: '90',
+// Finished rows are told apart by colour: done is dim green and struck through, dropped is dim red.
+const style = { accent: '36', phase: '35', muted: '90', completed: '2;32', abandoned: '2;31',
   in_progress: '36', warning: '33', error: '31', activePhase: '33' };
 const layout = { taskInset: 5, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
 const marks = { pending: '[ ]', in_progress: '[•]', completed: '[✓]', abandoned: '[×]', cancelled: '[×]' };
@@ -36,7 +37,7 @@ function completedLine(text, count, color) {
   if (!color) return text;
   if (count === undefined) return paint(text, 'completed', true);
   const chars = [...text], split = Math.min(chars.length, Math.max(0, count));
-  return `\x1b[90m${split ? `\x1b[9m${chars.slice(0, split).join('')}\x1b[29m` : ''}${chars.slice(split).join('')}\x1b[0m`;
+  return `\x1b[${style.completed}m${split ? `\x1b[9m${chars.slice(0, split).join('')}\x1b[29m` : ''}${chars.slice(split).join('')}\x1b[0m`;
 }
 export const clean = value => stripVTControlCharacters(String(value ?? ''))
   .replace(/\r\n?/g, '\n').replaceAll('\t', ' ')
@@ -207,12 +208,17 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   askScroll = 0;
   const bodyRows = Math.max(0, room - ask.length);
   const active = taskRanges[target?.key];
-  if (revealTarget && active && bodyRows > 0 &&
-    (active.start < scroll || active.start + Math.min(active.end - active.start, bodyRows) > scroll + bodyRows)) {
-    scroll = active.start - active.phaseStart < bodyRows ? active.phaseStart : active.start;
-  }
-  scroll = clamp(scroll, bodyLines.length - bodyRows);
+  // Following pins the phase that holds the current work to the first body row. A phase too long
+  // for the pane keeps its title row on top while the rows under it scroll to the current work.
+  let pinned;
+  if (revealTarget && active && bodyRows > 0) {
+    const fits = active.end - active.phaseStart <= bodyRows;
+    scroll = fits ? active.phaseStart : Math.max(active.phaseStart, active.start - 1);
+    if (!fits && scroll > active.phaseStart) pinned = active.phaseStart;
+    scroll = Math.min(scroll, Math.max(0, bodyLines.length - 1));
+  } else scroll = clamp(scroll, bodyLines.length - bodyRows);
   const visible = bodyLines.slice(scroll, scroll + bodyRows);
+  if (pinned !== undefined) visible[0] = bodyLines[pinned];
   while (visible.length < bodyRows) visible.push('');
   const live = !error && ['current', 'empty'].includes(availability);
   // Below 40 columns every pane shortens the follow label the same way.
