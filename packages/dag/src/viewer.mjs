@@ -171,8 +171,8 @@ function bindPresence() {
     presenceMessage = undefined; presenceNotice = 'Disconnected; last-known; not live'; draw();
   });
 }
-function isActive(run) { return run.status === 'running' || run.nodes.some(node => node.state === 'running'); }
-function selectableRuns() { return (state?.runs ?? []).filter(run => isActive(run) || completedExpanded); }
+// With no run list on screen, ←→ walks every run; the footer's Run i/n counts the same list.
+function selectableRuns() { return state?.runs ?? []; }
 async function restorePreferences() {
   const scope = fixedView ? state : undefined;
   try { viewState = await loadViewState(file, state?.sessionId, scope); viewError = ''; }

@@ -108,38 +108,26 @@ test('standalone tasks are separate from every DAG, respect explicit folds, and 
   }
 });
 
-test('multi-run summaries expose immutable counts, active selection identity, and collapsed completed group', () => {
+test('several runs show no run list; the footer names the selected run position', () => {
   const state = { connected: true, runs: [
     { id: 'active', name: 'ACTIVE_RUN', status: 'running', nodes: [
       { id: 'a', label: 'A', state: 'running' }, { id: 'b', label: 'B', state: 'pending' }, { id: 'c', label: 'C', state: 'completed' }], edges: [] },
     { id: 'done', name: 'DONE_RUN', status: 'completed', nodes: [
       { id: 'd', label: 'D', state: 'completed' }], edges: [] },
   ] };
+  const foot = frame => frame.text.split('\n').at(-1);
   const frame = renderFrame(state, { columns: 54, rows: 40, color: false, runIndex: 0 });
   assert.match(frame.text, /ACTIVE_RUN/);
-  assert.match(frame.text, /3 total/);
-  assert.match(frame.text, /1 running/);
-  assert.match(frame.text, /1 waiting/);
-  assert.match(frame.text, /Active runs: 1/);
-  assert.match(frame.text, /Completed runs \(1\)/);
-  assert.doesNotMatch(frame.text, /1\/2/);
-});
-
-test('run selector shows at most five rows while keeping the selected run visible', () => {
-  const runs = Array.from({ length: 12 }, (_, index) => ({
-    id: `run-${index}`, name: `RUN_${index}`, status: 'running',
-    nodes: [{ id: 'node', label: `NODE_${index}`, state: 'running' }], edges: [],
-  }));
-  const state = { connected: true, runs };
-  const summaries = text => text.split('\n').filter(line => /^\s*>? RUN_\d+  /.test(line));
-  const first = renderFrame(state, { columns: 80, rows: 40, color: false, runIndex: 0 });
-  assert.deepEqual(summaries(first.text), ['> RUN_0  0/1 total · 1 running · 0 waiting', '  RUN_1  0/1 total · 1 running · 0 waiting',
-    '  RUN_2  0/1 total · 1 running · 0 waiting', '  RUN_3  0/1 total · 1 running · 0 waiting', '  RUN_4  0/1 total · 1 running · 0 waiting']);
-  const middle = renderFrame(state, { columns: 80, rows: 40, color: false, runIndex: 8 });
-  assert.equal(summaries(middle.text).length, 5);
-  assert.ok(summaries(middle.text).some(line => line.startsWith('> RUN_8  ')));
-  assert.ok(middle.text.includes('RUN_4') && middle.text.includes('RUN_7'));
-  assert.doesNotMatch(middle.text, /^\s+RUN_9  /m);
+  assert.doesNotMatch(frame.text, /Active runs|Completed runs|total ·/);
+  assert.match(foot(frame), /Run 1\/2$/);
+  assert.match(foot(renderFrame(state, { columns: 54, rows: 40, color: false, runIndex: 1 })), /Run 2\/2$/);
+  assert.doesNotMatch(renderFrame({ connected: true, runs: [state.runs[0]] }, { columns: 54, rows: 40, color: false }).text, /Run 1\/1/);
+  const many = { connected: true, runs: Array.from({ length: 12 }, (_, index) => ({ id: `run-${index}`, name: `RUN_${index}`,
+    status: 'running', nodes: [{ id: 'node', label: `NODE_${index}`, state: 'running' }], edges: [] })) };
+  const middle = renderFrame(many, { columns: 80, rows: 40, color: false, runIndex: 8 });
+  assert.match(middle.text, /RUN_8/);
+  assert.doesNotMatch(middle.text, /RUN_7|RUN_9/);
+  assert.match(foot(middle), /Run 9\/12$/);
 });
 
 test('compact cards share content-height safe lines, localized counts, selected-only detail, and temporary collapse override', () => {
@@ -351,8 +339,9 @@ test('navigation keeps a selected detail header visible and scrolling remains bo
   const runs = sessionRuns(payload(), sessionId);
   const state = { runs, connected: true };
   const frame = renderFrame(state, { rows: 14, columns: 54, selectedNodeId: 'verify', revealSelection: true, color: false, viewState: { expanded: { [JSON.stringify([runs[0].id, 'verify'])]: true } } });
-  assert.ok(frame.scroll > 0);
-  assert.ok(frame.text.includes(`> ○ ${runs[0].nodes.find(node => node.id === 'verify').label}`));
+  const card = frame.nodeRanges.verify;
+  assert.ok(card.start >= frame.scroll && card.start < frame.scroll + frame.bodyRows);
+  assert.ok(frame.text.includes(`>○ ${runs[0].nodes.find(node => node.id === 'verify').label}`));
   const end = renderFrame(state, { rows: 14, scroll: 99999, color: false });
   assert.ok(end.scroll < 99999);
 });

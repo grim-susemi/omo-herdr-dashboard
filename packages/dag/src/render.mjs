@@ -114,76 +114,125 @@ export function runningTarget(state, previous) {
     (previous?.taskId ? targets.find(target => target.taskId === previous.taskId) : undefined) ?? targets[0];
 }
 
-export function graphLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], now = Date.now(), graphRanges, drawnEdges, frame = 0 } = {}) {
-  const output = [];
-  const rows = layers(run, language);
-  let previous = [];
-  const glyphs = { 1: '│', 2: '─', 3: '└', 4: '│', 5: '│', 6: '┌', 7: '├', 8: '─', 9: '┘', 10: '─', 11: '┴', 12: '┐', 13: '┤', 14: '┬', 15: '┼' };
-  // Compact connectors: the source box's bottom border carries the drop (┬), so
-  // only the turn row and the arrow row remain, and straight edges need just the arrow.
-  function connectors(current) {
-    const grid = Array(columns).fill(0);
-    const targets = new Set();
-    let turns = false;
-    for (const edge of run.edges) {
-      const from = previous.find(n => n.id === edge.from), to = current.find(n => n.id === edge.to);
-      if (!from || !to) continue;
-      const a = from.center, b = to.center;
-      grid[a] |= 1;
-      if (a < b) { for (let x = a; x < b; x++) { grid[x] |= 2; grid[x + 1] |= 8; } }
-      if (a > b) { for (let x = b; x < a; x++) { grid[x] |= 2; grid[x + 1] |= 8; } }
-      grid[b] |= 4; targets.add(b); turns ||= a !== b;
-      drawnEdges?.add(edge);
+// A run is drawn as a lane graph (as git log --graph): one vertical lane per open branch, a status-coloured
+// dot where a node sits on its lane, and a stage header row ("Step 2 0/2 ───") before each dependency stage,
+// joined onto the fork or merge row when there is one. Open (running or manually expanded) nodes keep a
+// worker-pane card beside their lane: a status bar (▌), the spinner by the name and detail rows under it.
+// A faint dotted row parts two neighbouring cards. No node is drawn as a box.
+function partsLine(parts, columns, color) {
+  let used = 0, out = '';
+  for (const part of parts) {
+    const room = columns - used;
+    if (room <= 0 || !part.text) continue;
+    const text = width(part.text) > room ? fit(part.text, room) : part.text;
+    out += paint(text, part.color, color, part.bold);
+    used += width(text);
+  }
+  return out;
+}
+function durationText(task, timing, status, language) {
+  const duration = task ? elapsedTime(task, timing, status) : null;
+  return duration ? `${timeMark} ${compactDuration(language, duration.split(':').reduce((total, part) => total * 60 + Number(part), 0) * 1000)}` : '';
+}
+// Title row: marker, status icon, node label, task description (shrinks first) and elapsed time.
+function nodeTitle(node, task, language, timing, room, color, selected) {
+  const status = node.state;
+  const label = clean(node.label ?? node.id), description = clean(task?.description ?? '');
+  const time = durationText(task, timing, status, language);
+  const head = `${selected ? '>' : ' '}${statusIcon(status, timing.frame)} ${label}`;
+  const tail = time ? [{ text: ` · ${time}`, color: status === 'running' ? roleColors.time : roleColors.counts }] : [];
+  const descRoom = room - width(head) - tail.reduce((sum, part) => sum + width(part.text), 0) - 2;
+  const desc = description && description !== label && descRoom >= 4 ? { text: `  ${fit(description, descRoom)}` } : null;
+  return partsLine([{ text: head, color: colors[status], bold: status === 'running' }, desc, ...tail].filter(Boolean), room, color);
+}
+// Card rows under the title: role and model, live activity or progress, counts and cost, then subtasks.
+function nodeDetail(task, tasks, language, timing, room, color) {
+  if (!task) return [];
+  const rows = [];
+  const identity = [task.agent, task.category].map(part => clean(part).trim()).filter(Boolean).join('/');
+  const badge = identity ? `[${identity}]` : '', model = task.model ? modelLabel(task) : '';
+  if (badge || model) rows.push(partsLine([badge && { text: badge, color: roleColors.badge },
+    model && { text: `${badge ? ' ' : ''}${model}`, color: roleColors.model }].filter(Boolean), room, color));
+  const activity = timing.connected ? activitySummary(task, language, timing.now) : null;
+  if (activity) rows.push(partsLine([{ text: activity.head, color: activity.stalled ? colors.paused : undefined },
+    activity.text && { text: ` · ${fitTail(activity.text, Math.max(1, room - width(activity.head) - 3))}`, color: dim }].filter(Boolean), room, color));
+  else if (task.progress) rows.push(partsLine([{ text: clean(task.progress), color: dim }], room, color));
+  const counts = [['turns', 'compactTurns'], ['toolCalls', 'compactTools']].flatMap(([key, label]) =>
+    task[key] !== undefined && task[key] !== null ? [t(language, label, { count: clean(task[key]) })] : []).join(' · ');
+  const cost = task.metrics ? metricSummary(task, language, false) : '';
+  if (counts || cost) rows.push(partsLine([{ text: [counts, cost].filter(Boolean).join(' · '), color: roleColors.counts }], room, color));
+  for (const { task: child } of taskDescendants(task, tasks)) {
+    const time = foldedStatuses.has(child.status) ? '' : durationText(child, timing, child.status, language);
+    rows.push(partsLine([{ text: `↳ ${statusIcon(child.status, timing.frame)} ${clean(child.description)}`, color: colors[child.status] },
+      time && { text: ` · ${time}`, color: roleColors.time }].filter(Boolean), room, color));
+  }
+  return rows;
+}
+export function laneLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 } } = {}) {
+  const out = [], ranges = Object.create(null);
+  const steps = layers(run, language);
+  const stageOf = new Map(steps.flatMap((step, index) => step.map(node => [node.id, index])));
+  const firstOf = new Set(steps.map(step => step[0]?.id));
+  const line = text => paint(text, dim, color);
+  const lanes = [];
+  const laneCells = (own, glyph) => lanes.map((id, lane) => lane === own ? glyph : id ? line('│') : ' ').join(' ');
+  const openLanes = () => lanes.map(id => id ? line('│') : ' ').join(' ');
+  const lanesWidth = () => lanes.length ? 2 * lanes.length - 1 : 0;
+  // A fork or merge row: two cells per lane, built plain and trimmed before it is dimmed as a whole.
+  const connector = (own, joined, last, end) => line(lanes.map((id, lane) => lane === own ? `├${lane < last ? '─' : ' '}` :
+    joined.includes(lane) ? `${lane === last ? end : end === '┘' ? '┴' : '┬'}${lane < last ? '─' : ' '}` :
+    lane > own && lane < last ? `${id ? '┼' : '─'}─` : `${id ? '│' : ' '} `).join('').trimEnd());
+  let lastConnector = -1, cardOpen = false;
+  const push = (text, joinable = false) => { out.push(text); lastConnector = joinable ? out.length - 1 : -1; if (joinable) cardOpen = false; };
+  const header = index => {
+    cardOpen = false;
+    const step = steps[index], active = step.some(node => node.state === 'running');
+    const label = t(language, 'stage', { index: index + 1 }) + ` ${step.filter(node => node.state === 'completed').length}/${step.length}`;
+    const tail = at => `${paint(label, active ? roleColors.time : dim, color, active)}${line(` ${'─'.repeat(Math.max(0, columns - at - width(label) - 1))}`)}`;
+    if (lastConnector >= 0 && lastConnector === out.length - 1) {
+      const used = width(out[lastConnector]), at = Math.max(used + 2, lanesWidth() + 2);
+      out[lastConnector] += `${' '.repeat(at - used)}${tail(at)}`; lastConnector = -1;
+    } else if (lanes.some(Boolean)) push(`${openLanes()}  ${tail(lanesWidth() + 2)}`);
+    else push(`${line('─ ')}${tail(2)}`);
+  };
+  for (const node of steps.flat()) {
+    const stage = stageOf.get(node.id), first = firstOf.has(node.id);
+    if (first && stage === 0) header(0);
+    let mine = lanes.flatMap((id, lane) => id === node.id ? [lane] : []);
+    if (!mine.length) { const free = lanes.indexOf(null); mine = [free >= 0 ? free : lanes.length]; lanes[mine[0]] = node.id; }
+    const own = mine[0];
+    if (mine.length > 1) {
+      push(connector(own, mine.slice(1), mine.at(-1), '┘'), true);
+      for (const lane of mine.slice(1)) lanes[lane] = null;
+      while (lanes.length > own + 1 && lanes.at(-1) === null) lanes.pop();
     }
-    if (!targets.size) return [];
-    const arrows = paint(grid.map((_, x) => targets.has(x) ? '▼' : ' ').join('').trimEnd(), accent, color);
-    return turns ? [paint(grid.map(bits => glyphs[bits] ?? ' ').join('').trimEnd(), accent, color), arrows] : [arrows];
+    if (first && stage > 0) header(stage);
+    const open = isExpanded(viewState, run.id, node.id, node.state);
+    const bar = open ? paint('▌', colors[node.state], color) : ' ';
+    const room = columns - lanesWidth() - 2;
+    if (cardOpen) push(`${openLanes()} ${line('┈'.repeat(Math.max(0, columns - lanesWidth() - 1)))}`);
+    cardOpen = false;
+    const start = out.length, task = tasks.find(task => task.id === node.taskId);
+    push(`${laneCells(own, paint('•', colors[node.state], color))} ${bar}${nodeTitle(node, task, language, timing, room, color, node.id === selectedNodeId)}`);
+    const kids = run.edges.filter(edge => edge.from === node.id).map(edge => edge.to);
+    if (open) {
+      const under = laneCells(own, kids.length ? line('│') : ' ');
+      for (const row of nodeDetail(task, tasks, language, timing, room - 3, color)) push(`${under} ${bar}   ${row}`);
+      cardOpen = true;
+    }
+    lanes[own] = kids[0] ?? null;
+    const opened = [];
+    for (const kid of kids.slice(1)) {
+      if (lanes.includes(kid)) continue;
+      const free = lanes.findIndex((id, lane) => id === null && lane > own);
+      const lane = free >= 0 ? free : lanes.length;
+      lanes[lane] = kid; opened.push(lane);
+    }
+    if (opened.length) push(connector(own, opened, Math.max(...opened), '┐'), true);
+    while (lanes.length && lanes.at(-1) === null) lanes.pop();
+    ranges[node.id] = { start, end: out.length };
   }
-  // Frontiers keep 20-cell boxes, but two boxes may shrink to 18 cells so a narrow pane still shows a fork side by side.
-  const perRow = Math.max(1, Math.floor((columns + 2) / 22), Math.min(2, Math.floor((columns + 2) / 20)));
-  const groups = rows.flatMap(row => Array.from({ length: Math.ceil(row.length / perRow) },
-    (_, index) => ({ nodes: row.slice(index * perRow, (index + 1) * perRow), wraps: (index + 1) * perRow < row.length })));
-  // Exact incoming labels and the edge list disambiguate crossings and edges which
-  // skip a frontier. Wide frontiers wrap without changing their dependencies.
-  for (const [index, { nodes: group, wraps }] of groups.entries()) {
-    const boxWidth = Math.min(34, Math.floor((columns - 2 * (group.length - 1)) / group.length));
-    const inner = Math.max(1, boxWidth - 4);
-    const left = Math.floor((columns - (boxWidth * group.length + 2 * (group.length - 1))) / 2);
-    const prefix = ' '.repeat(left);
-    const positions = group.map((node, i) => ({ id: node.id, center: left + i * (boxWidth + 2) + Math.floor(boxWidth / 2) }));
-    if (index) output.push(...connectors(positions));
-    const start = output.length;
-    const next = new Set(groups[index + 1]?.nodes.map(node => node.id) ?? []);
-    const boxes = group.map(node => {
-      const task = tasks.find(task => task.id === node.taskId);
-      const activity = node.state === 'running' ? activitySummary(task, language, now) : null;
-      const incoming = run.edges.filter(e => e.to === node.id).map(e => clean(e.from));
-      const from = incoming.length ? `← ${incoming.join(', ')}` : '';
-      const span = task ? elapsedTime(task, { now, connected: true }, node.state) : null;
-      const elapsed = span ? `${timeMark} ${compactDuration(language, span.split(':').reduce((total, part) => total * 60 + Number(part), 0) * 1000)}` : '';
-      const status = `${statusIcon(node.state, frame)} ${t(language, node.state)}`;
-      let first = activity ? `${status} ${activity.head}` : node.error ? `${status} · ${clean(node.error)}` : status;
-      if (activity?.text && inner - width(first) - 1 >= 4) first = `${first} ${fitTail(activity.text, inner - width(first) - 1)}`;
-      let second = [elapsed, from].filter(Boolean).join(' · ');
-      if (second && width(`${first} · ${second}`) <= inner) { first = `${first} · ${second}`; second = ''; }
-      const title = fit(`${node.id === selectedNodeId ? '> ' : ''}[${isExpanded(viewState, run.id, node.id, node.state) ? '-' : '+'}] ${clean(node.label)}`, Math.max(1, boxWidth - 6));
-      const half = Math.floor(boxWidth / 2);
-      return { node, stalled: activity?.stalled, rows: [fit(first, inner, true), fit(second, inner, true)],
-        top: `╭─ ${title} ${'─'.repeat(Math.max(0, boxWidth - 5 - width(title)))}╮`,
-        bottom: run.edges.some(e => e.from === node.id && next.has(e.to)) && boxWidth >= 4 ?
-          `╰${'─'.repeat(half - 1)}┬${'─'.repeat(boxWidth - half - 2)}╯` : `╰${'─'.repeat(Math.max(0, boxWidth - 2))}╯` };
-    });
-    output.push(prefix + boxes.map(box => paint(box.top, colors[box.node.state], color)).join('  '));
-    // The second row is dropped when no box of the group has a time or dependency to show.
-    const contentRows = boxes.some(box => box.rows[1].trim()) ? 2 : 1;
-    for (let line = 0; line < contentRows; line++) output.push(prefix + boxes.map(box =>
-      `${paint('│', colors[box.node.state], color)} ${paint(box.rows[line], line === 0 && box.stalled ? colors.paused : line === 0 ? colors[box.node.state] : undefined, color)} ${paint('│', colors[box.node.state], color)}`).join('  '));
-    output.push(prefix + boxes.map(box => paint(box.bottom, colors[box.node.state], color)).join('  '));
-    if (graphRanges) for (const node of group) graphRanges[node.id] = { start, end: output.length };
-    if (wraps) output.push(`  · ${t(language, 'sameFrontier')}`);
-    previous = positions;
-  }
-  return output;
+  return { rows: out, ranges };
 }
 
 // Continuation rows keep the hanging indent; the wrap mark sits inside it when it fits.
@@ -369,12 +418,16 @@ export function completedTasks(state) {
       terminal.has(child.status) && !['failed', 'error', 'lost'].includes(child.status)));
 }
 
+const foldedStatuses = new Set(['completed', 'cancelled', 'skipped', 'interrupted']);
 function descendantLines(task, tasks, language, timing, columns, color) {
   const descendants = taskDescendants(task, tasks);
   const title = fit(`─ ${t(language, 'subtasksCount', { count: descendants.length })} `, columns - 4);
   return descendants.length ? [title + '─'.repeat(Math.max(0, columns - 4 - width(title))),
-    ...descendants.flatMap(({ task: child, depth }) =>
-      compactTaskLines(child, language, timing, columns, { depth, color }))] : [];
+    // A finished subtask folds to its title row; failed, blocked and running ones keep their details.
+    ...descendants.flatMap(({ task: child, depth }) => {
+      const lines = compactTaskLines(child, language, timing, columns, { depth, color });
+      return foldedStatuses.has(child.status) ? lines.slice(0, 1) : lines;
+    })] : [];
 }
 
 function detailBox(text, columns, color, status, label) {
@@ -425,24 +478,6 @@ const separator = (columns, color, label) => {
   return paint(title + '─'.repeat(Math.max(0, columns - width(title))), dim, color);
 };
 
-const RUN_SELECTOR_LIMIT = 5;
-
-function visibleRunSelector(runs, selectedId) {
-  if (runs.length <= RUN_SELECTOR_LIMIT) return runs;
-  const selected = Math.max(0, runs.findIndex(run => run.id === selectedId));
-  const start = Math.min(Math.max(0, selected - RUN_SELECTOR_LIMIT + 1), runs.length - RUN_SELECTOR_LIMIT);
-  return runs.slice(start, start + RUN_SELECTOR_LIMIT);
-}
-
-function runSummary(run, language, columns, selected) {
-  const total = run.nodes.length;
-  const running = run.nodes.filter(node => node.state === 'running').length;
-  const waiting = run.nodes.filter(node => !terminalState(node.state) && node.state !== 'running').length;
-  const completed = run.nodes.filter(node => node.state === 'completed').length;
-  const marker = selected ? '>' : ' ';
-  return fit(`${marker} ${run.name}  ${completed}/${total} ${t(language, 'total')} · ${t(language, 'runningCount', { count: running })} · ${t(language, 'waitingCount', { count: waiting })}`, columns);
-}
-function terminalState(status) { return terminal.has(status); }
 
 export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scroll = 0, color = true, error = '', language = state?.language ?? 'en',
   selectedNodeId, selectedTaskId, view, viewState, verbose = false, revealSelection = false, notice = '', now = Date.now(), completedExpanded = false,
@@ -453,8 +488,6 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
   const roots = standaloneTasks(state);
   const tasksView = view === 'tasks' || !all.length;
-  const activeRuns = all.filter(candidate => candidate.status === 'running' || candidate.nodes.some(node => node.state === 'running'));
-  const completedRuns = all.filter(candidate => !activeRuns.includes(candidate));
   // One header row "name [done/total]  summary" under which a divider runs, the same shape as the Todo pane.
   const headLine = (name, done, total, detail) => {
     const tally = `[${done}/${total}]`, rest = columns - width(`${name} ${tally}`) - 2;
@@ -490,14 +523,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     }
     if (!roots.length) body.push(t(language, 'none'));
   } else if (run && !tasksView) {
-    if (all.length > 1) {
-      body.push(paint(t(language, 'activeRuns', { count: activeRuns.length }), accent, color));
-      const showCompleted = completedExpanded || !activeRuns.includes(run);
-      const selectorRuns = visibleRunSelector([...activeRuns, ...(showCompleted ? completedRuns : [])], run.id);
-      for (const candidate of selectorRuns) body.push(paint(runSummary(candidate, language, columns, candidate.id === run.id), candidate.id === run.id ? accent : undefined, color));
-      if (completedRuns.length) body.push(`${t(language, 'completedRuns', { count: completedRuns.length })} ${showCompleted ? '[-]' : '[+]'}`);
-      body.push('');
-    }
+    // No run list above the flow: ←→ switches runs and the footer names the position (Run 1/7).
     const done = run.nodes.filter(n => n.state === 'completed').length;
     const failed = run.nodes.filter(n => n.state === 'failed').length;
     // Run name, status and progress share one row; the graph and its ← labels carry the dependencies.
@@ -508,25 +534,21 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     const runRoom = columns - width(`DAG [${done}/${run.nodes.length}]`) - 2;
     head[0] = headLine('DAG', done, run.nodes.length,
       all.length > 1 && width(prefixed) <= runRoom ? prefixed : `${clean(run.name)}${runTail}`);
-    const drawnEdges = new Set();
+    const timing = { now, connected: state?.connected, updatedAt: state?.updatedAt, frame };
     try {
-      const ranges = Object.create(null), start = body.length;
-      body.push(...graphLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.connected ? state.tasks ?? [] : [], now, graphRanges: ranges, drawnEdges, frame }));
-      for (const [id, range] of Object.entries(ranges)) graphRanges[id] = { start: start + range.start, end: start + range.end };
+      const { rows: flow, ranges } = laneLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.tasks ?? [], timing });
+      const start = body.length;
+      body.push(...flow);
+      for (const [id, range] of Object.entries(ranges)) graphRanges[id] = nodeRanges[id] = { start: start + range.start, end: start + range.end };
     }
     catch (error) { body.push(t(language, 'graphError', { error: clean(error.message) })); }
-    // Connectors draw edges between neighbouring frontiers; any other edge keeps an exact listed row.
-    const undrawn = run.edges.filter(edge => !drawnEdges.has(edge));
-    if (undrawn.length) body.push(separator(columns, color, t(language, 'dependencies')),
-      ...undrawn.map(edge => `  ${clean(edge.from)} → ${clean(edge.to)}`));
-    // Each detail card sits under a separator that names its node, as the old box border did.
-    for (const node of run.nodes) {
-      body.push(separator(columns, color, clean(node.label ?? node.id)));
+    // d still opens the full detail of the selected node, under the cards.
+    const inspected = verbose && run.nodes.find(node => node.id === selectedNodeId);
+    if (inspected) {
       const start = body.length;
-      body.push(...taskCard(state?.tasks?.find(task => task.id === node.taskId), state?.tasks ?? [], columns, color, language,
-        { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },
-        { selected: node.id === selectedNodeId, expanded: isExpanded(viewState, run.id, node.id, node.state), verbose, node }));
-      nodeRanges[node.id] = { start, end: body.length };
+      body.push(...taskCard(state?.tasks?.find(task => task.id === inspected.taskId), state?.tasks ?? [], columns, color, language,
+        timing, { selected: true, expanded: true, verbose, node: inspected }));
+      nodeRanges[inspected.id] = { start, end: body.length };
     }
     for (const node of run.nodes) if (node.error) body.push('', `× ${clean(node.id)}: ${node.error}`);
   } else {
@@ -558,7 +580,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       run.nodes.find(node => node.id === selectedNodeId) ?? run.nodes[0];
     if (node) visible[0] = fit(`${statusIcon(node.state, frame)} ${clean(node.label ?? node.id)}`, columns);
   }
-  const range = body.length > available ? ` · ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : '';
+  const runPosition = !tasksView && run && all.length > 1 ? ` · ${t(language, 'runPosition', { index: all.indexOf(run) + 1, total: all.length })}` : '';
+  const range = `${runPosition}${body.length > available ? ` · ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : ''}`;
   const live = state?.connected && !error;
   const source = offline || !state?.connected ? t(language, !state?.connected && !narrow ? 'disconnected' : 'offlineShort') :
     t(language, error ? 'error' : 'liveShort');

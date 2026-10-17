@@ -93,30 +93,29 @@ test('new running tasks and DAGs arrive after empty state and linked targets tra
   assert.equal(runningTarget(state, target), undefined);
 });
 
-test('follow reveals offscreen graph boxes rather than details, leaves visible targets still and preserves narrow CJK widths', () => {
+test('follow reveals the running card, leaves visible targets still and preserves narrow CJK widths', () => {
   const nodes = Array.from({ length: 10 }, (_, i) => ({
     id: `n${i}`, label: i === 8 ? 'TARGET_한글中文' : `NODE_${i}`, state: i === 8 ? 'running' : 'completed', taskId: `t${i}`,
   }));
   const state = { connected: true, runs: [{ id: 'r', name: 'Run', status: 'running', nodes,
     edges: nodes.slice(1).map((node, i) => ({ from: nodes[i].id, to: node.id })) }],
   tasks: nodes.map(node => ({ id: node.taskId, status: node.state, description: `DETAIL_${node.id}`, progress: 'TOKEN_HEAD' })) };
+  const shown = (frame, range) => range.start >= frame.scroll && range.end <= frame.scroll + frame.bodyRows;
   for (const language of ['en', 'ko', 'zh-cn']) for (const columns of [12, 20, 35, 54, 81]) {
     const options = { columns, rows: 18, color: true, language, selectedNodeId: 'n0', runningNodeId: 'n8' };
     const frame = renderFrame(state, options);
-    assert.equal(frame.scroll, frame.graphRanges.n8.start);
-    assert.ok(frame.scroll < frame.nodeRanges.n8.start);
-    assert.ok(!frame.text.includes('DETAIL_n8'));
+    assert.ok(shown(frame, frame.graphRanges.n8), `${language} ${columns} running card on screen`);
     assert.ok(frame.text.split('\n').every(line => width(line) < columns));
-    const visibleScroll = frame.scroll - 1;
-    assert.equal(renderFrame(state, { ...options, scroll: visibleScroll }).scroll, visibleScroll);
+    if (frame.scroll > 0 && shown({ ...frame, scroll: frame.scroll - 1 }, frame.graphRanges.n8)) {
+      assert.equal(renderFrame(state, { ...options, scroll: frame.scroll - 1 }).scroll, frame.scroll - 1);
+    }
     state.tasks[8].progress = 'TOKEN_TAIL';
     assert.equal(renderFrame(state, { ...options, scroll: frame.scroll }).scroll, frame.scroll);
     const manual = renderFrame(state, { ...options, follow: false, scroll: 0 });
     assert.equal(manual.scroll, 0);
-    const detail = renderFrame(state, { ...options, selectedNodeId: 'n8', revealSelection: true });
-    assert.ok(detail.scroll > detail.graphRanges.n8.end);
-    assert.ok(detail.scroll <= detail.nodeRanges.n8.start);
-    if (columns >= 20) assert.ok(detail.text.includes('DETAIL_n8'));
+    const detail = renderFrame(state, { ...options, selectedNodeId: 'n8', revealSelection: true, verbose: true });
+    assert.ok(detail.nodeRanges.n8.start >= detail.scroll && detail.nodeRanges.n8.start < detail.scroll + detail.bodyRows);
+    if (columns >= 35) assert.ok(detail.text.includes('DETAIL_n8'));
   }
 });
 

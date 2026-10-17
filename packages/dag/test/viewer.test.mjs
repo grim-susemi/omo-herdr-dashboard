@@ -499,7 +499,7 @@ test('real viewer follows newly active runs and manual run selection survives la
   state.runs.unshift({ id: 'r-later', name: 'LATER_RUN', status: 'running', nodes: [
     { id: 'c', label: 'LATER_NODE', state: 'running' },
   ], edges: [] });
-  await viewer.frame(text => text.includes('LATER_RUN') && text.includes('Selected run: OLD_RUN'), () => writeJson(file, state));
+  await viewer.frame(text => /Run 3\/3/.test(text) && text.includes('Selected run: OLD_RUN'), () => writeJson(file, state));
   await viewer.close();
   console.log('PTY evidence: new run auto-followed once; manual run selection pins the pane across later arrivals.');
 });

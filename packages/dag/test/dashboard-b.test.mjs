@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { stripVTControlCharacters } from 'node:util';
 import { messages, t } from '../src/i18n.mjs';
-import { graphLines, renderFrame, spinnerFrames, width } from '../src/render.mjs';
+import { laneLines, renderFrame, spinnerFrames, width } from '../src/render.mjs';
 import { TaskData, normalizeTask } from '../src/task-data.mjs';
 import { createAnimation, createReadGrace, renderFixedFrame } from '../src/viewer.mjs';
 
@@ -124,7 +124,8 @@ test('all ten width-one frames reach running root, descendants, graph and detail
     const run = { id: 'run', name: 'RUN', status: 'running',
       nodes: [{ id: 'node', label: 'NODE', state: 'running', taskId: 'st_root' }], edges: [] };
     const dag = renderFrame({ ...state, runs: [run] }, { ...options, selectedNodeId: 'node', verbose: true }).text;
-    assert.equal(dag.split(`${glyph} ${messages.en.running}`).length - 1, 2);
+    assert.ok(dag.includes(`${glyph} NODE`), 'flow line and card carry the spinner');
+    assert.equal(dag.split(`${glyph} ${messages.en.running}`).length - 1, 1);
     assert.doesNotMatch(workers + dag, /●/);
   }
   assert.deepEqual(state, before);
@@ -201,7 +202,7 @@ const cardRun = { id: 'run', name: 'RUN', status: 'running', edges: [],
 const cardLines = (frame, range) => frame.text.split('\n')
   .slice(frame.bodyStart + range.start - frame.scroll, frame.bodyStart + range.end - frame.scroll);
 
-test('approved child cards retain their group and arrows without extra indentation or losing metadata', () => {
+test('approved child cards retain their group and arrows without extra indentation; a finished child folds to its title', () => {
   const state = cardState();
   Object.assign(state.tasks[0], { agent: 'deep-low', turns: 41, toolCalls: 11 });
   Object.assign(state.tasks[1], { agent: 'unspecified-low', model: 'claude-sonnet-5-5',
@@ -216,6 +217,12 @@ test('approved child cards retain their group and arrows without extra indentati
         now: cardNow, view, selectedTaskId: 'root', selectedNodeId: 'node' };
       const frame = renderFrame(source, options);
       const lines = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
+      if (view === 'dag') {
+        // A DAG card lists every subtask as one arrow row; the finished child shows no metadata.
+        assert.ok(lines.some(line => line.includes('↳ ✓ CHILD_TITLE')) && lines.some(line => line.includes('↳ ○ GRAND_TITLE')));
+        assert.ok(!lines.some(line => line.includes('$0.1242')));
+        continue;
+      }
       const group = t(language, 'subtasksCount', { count: 2 });
       assert.equal(lines.filter(line => line.includes(group)).length, 1);
       const childAt = lines.findIndex(line => line.includes('↳ ✓ CHILD_TITLE'));
@@ -224,26 +231,15 @@ test('approved child cards retain their group and arrows without extra indentati
       const contentAt = lines.find(line => line.includes('[deep-low]')).indexOf('[');
       assert.equal(lines[childAt].indexOf('↳'), contentAt);
       assert.equal(lines[grandAt].indexOf('↳'), contentAt);
+      // The completed child is one title row: its role, cost and time rows fold away.
       const child = lines.slice(childAt, grandAt);
-      const badge = child.find(line => line.includes('['));
+      assert.equal(child.length, 1, `${language} ${columns} ${view}`);
+      assert.ok(!child.some(line => /\$0\.1242|⧖|unspecified-low/.test(line)));
+      // The pending grandchild keeps its metadata, aligned under the arrows.
+      const badge = lines.slice(grandAt + 1).find(line => line.includes('['));
       assert.equal(badge.indexOf('['), contentAt);
-      const money = child.find(line => line.includes('$0.1242'));
-      assert.equal(money.indexOf('$'), contentAt);
-      assert.ok(money.includes('604 tok/s'));
-      const timed = child.find(line => line.includes('⧖'));
-      assert.equal(timed.indexOf('⧖'), contentAt);
-      assert.ok(timed.includes(t(language, 'compactSeconds', { count: 28 })));
-      assert.ok(timed.includes(t(language, 'compactTurns', { count: 5 })));
-      if (columns >= 32) {
-        assert.ok(badge.includes('[unspecified-low]'));
-        if (columns === 32) {
-          const model = child.find(line => line.includes('claude-sonnet-5-5:medium'));
-          assert.ok(model, 'the existing full model row survives removing the indent');
-          assert.equal(model.indexOf('claude'), contentAt);
-        }
-        assert.ok(timed.includes(t(language, 'compactTools', { count: 3 })));
-      }
-      for (const line of child) assert.ok(!line.includes(`↳ ${messages[language].subtask}`));
+      if (columns >= 32) assert.ok(badge.includes('[quick]'));
+      for (const line of lines.slice(childAt)) assert.ok(!line.includes(`↳ ${messages[language].subtask}`));
       assert.ok(frame.text.split('\n').every(line => width(line) < columns));
       const colored = renderFrame(source, { ...options, color: true });
       assert.equal(stripVTControlCharacters(colored.text), frame.text);
@@ -372,37 +368,41 @@ test('a populated role or category keeps its coloured badge before the model at 
   assert.match(long[3], /^│ gpt-6\.1-sol:xhigh +│$/);
 });
 
-test('DAG graph node boxes have no all-blank interior row and keep alignment, ranges and connectors', () => {
-  const nodes = (...specs) => specs.map(([id, state, label]) => ({ id, state, label: label ?? id.toUpperCase() }));
-  const blankRow = line => /^\s*(?:[│]\s*[│]\s*)+$/u.test(stripVTControlCharacters(line));
+test('DAG runs draw no boxes: a lane graph with stage headers and a barred card per open node', () => {
+  const nodes = (...specs) => specs.map(([id, state, label]) => ({ id, state, label: label ?? id.toUpperCase(), taskId: `t_${id}` }));
   const cases = {
     single: { id: 'r', status: 'running', nodes: nodes(['n', 'running']), edges: [] },
     wideFrontier: { id: 'r', status: 'running', nodes: nodes(['a', 'completed'], ['b', 'running'], ['c', 'pending']), edges: [] },
     cjk: { id: 'r', status: 'running', nodes: nodes(['n', 'running', '한글中文タイトル'.repeat(8)]), edges: [] },
     chain: { id: 'r', status: 'running', nodes: nodes(['a', 'completed'], ['b', 'running'], ['c', 'pending']),
       edges: [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }] },
-    mixed: { id: 'r', status: 'running', nodes: nodes(['a', 'completed'], ['b', 'completed'], ['c', 'running'], ['d', 'pending']),
-      edges: [{ from: 'a', to: 'c' }, { from: 'b', to: 'd' }] },
+    merge: { id: 'r', status: 'running', nodes: nodes(['a', 'completed'], ['b', 'completed'], ['c', 'running'], ['d', 'pending']),
+      edges: [{ from: 'a', to: 'c' }, { from: 'b', to: 'c' }, { from: 'c', to: 'd' }] },
   };
+  const timing = { now: cardNow, connected: true, frame: 0 };
   for (const [name, run] of Object.entries(cases)) for (const columns of [39, 79]) {
-    const ranges = {};
-    const lines = graphLines(run, columns, false, 'en', { graphRanges: ranges });
-    const colored = graphLines(run, columns, true, 'en');
-    assert.equal(colored.map(stripVTControlCharacters).join('\n'), lines.join('\n'), `${name} colour ${columns}`);
-    assert.ok(lines.every(line => width(line) <= columns), `${name} width ${columns}`);
+    const { rows, ranges } = laneLines(run, columns, false, 'en', { timing });
+    const colored = laneLines(run, columns, true, 'en', { timing }).rows;
+    assert.equal(colored.map(stripVTControlCharacters).join('\n'), rows.join('\n'), `${name} colour ${columns}`);
+    assert.ok(rows.every(line => width(line) <= columns), `${name} width ${columns}`);
+    assert.ok(!rows.some(line => /[╭╮╰╯▼]/u.test(line)), `${name} draws no box ${columns}`);
     for (const node of run.nodes) {
-      const box = lines.slice(ranges[node.id].start, ranges[node.id].end);
-      assert.match(box[0], /^\s*╭/u); assert.match(box.at(-1), /╯$/u);
-      assert.ok(box.slice(1, -1).every(line => !blankRow(line)), `${name} blank interior ${columns}`);
-      assert.equal(new Set(box.map(width)).size, 1, `${name} aligned ${columns}`);
-      const incoming = run.edges.some(edge => edge.to === node.id);
-      assert.equal(box.length, incoming ? 5 : 4, `${name} ${node.id} height`);
+      const title = rows[ranges[node.id].start];
+      // The lane carries a dot; an open (running) node keeps its card bar and the spinner beside the name.
+      assert.match(title, /^[│ ]*•/u, `${name} ${node.id} dot`);
+      if (node.state === 'running') assert.ok(title.includes(`▌ ${spinnerFrames[0]} `), `${name} card`);
+      else assert.ok(!title.includes('▌'), `${name} ${node.id} has no card`);
     }
-    // Connector rows between frontiers stay (a wrapped narrow frontier only links its neighbouring group).
-    if (columns === 79 || name === 'chain') assert.equal(lines.some(line => line.includes('▼')), run.edges.length > 0, name);
   }
+  const chain = laneLines(cases.chain, 79, false, 'en', { timing }).rows;
+  assert.match(chain[0], /^─ Step 1 1\/1 ─+$/u);
+  assert.equal(chain.filter(row => /Step \d [01]\/1 ─/u.test(row)).length, 3);
+  const merge = laneLines(cases.merge, 79, false, 'en', { timing }).rows;
+  assert.ok(merge.some(row => /^├─┘ +Step 2 0\/1 ─+$/u.test(row)), 'the merge row carries the stage header');
+  const pair = laneLines({ id: 'r', status: 'running', nodes: nodes(['a', 'running'], ['b', 'running']), edges: [] }, 40, false, 'en', { timing }).rows;
+  assert.ok(pair.some(row => /┈{10}/u.test(row)), 'neighbouring cards are parted by a dotted row');
   const frame = renderFrame({ connected: true, runs: [cases.single], tasks: [] }, { columns: 40, rows: 60, color: false, frame: 0, now: cardNow, view: 'dag' });
-  assert.equal(frame.graphRanges.n.end - frame.graphRanges.n.start, 4);
+  assert.equal(frame.graphRanges.n.start, 1, 'stage header, then the running node');
 });
 
 test('a card one column narrower than its longest line truncates with an ellipsis instead of overflowing', () => {
