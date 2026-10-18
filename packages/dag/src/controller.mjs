@@ -51,6 +51,16 @@ export const BAND_LAYOUT = Object.freeze({
 // Band shape: parent on the left; Todo spans the rest of the width on top; workers (left) and DAG
 // (right) share the row below it. Shape only, ratios are ignored.
 export function isBandDashboard(layout, ids) {
+  // Decision #185: a recorded collaboration pane directly left of workers joins the lower row.
+  if (ids?.coordination !== undefined) {
+    const { coordination, ...roles } = ids, panes = layout?.panes ?? [];
+    const collab = panes.filter(pane => pane?.pane_id === coordination), workers = panes.find(pane => pane?.pane_id === roles.workers);
+    if (collab.length !== 1 || !workers || Object.values(roles).includes(coordination)) return false;
+    const [c, w] = [collab[0].rect, workers.rect];
+    if (c?.y !== w?.y || c?.height !== w?.height || c?.x + c?.width !== w?.x) return false;
+    return isBandDashboard({ ...layout, panes: panes.filter(pane => pane !== collab[0] && pane !== workers)
+      .concat({ ...workers, rect: { ...w, x: c.x, width: c.width + w.width } }) }, roles);
+  }
   if (!layout?.area || !Array.isArray(layout.panes) || layout.panes.length !== 4 || !ids || new Set(Object.values(ids)).size !== 4) return false;
   const rects = Object.fromEntries(Object.entries(ids).map(([role, id]) => {
     const matches = layout.panes.filter(pane => pane?.pane_id === id);
@@ -1540,6 +1550,10 @@ export class FixedDagPane extends DagPane {
       const ids = { parent: this.parentPane, todo: todo.paneId, workers: pair.workers.paneId, dag: pair.dag.paneId };
       const geometry = async () => (await this.herdr('layout', '--pane', this.parentPane))?.layout;
       let layout = await geometry();
+      // Decision #185: the collaboration pane recorded for this chat is owned while it is in this tab.
+      const collab = process.env.OMO_HERDR_COORDINATION_STATE_DIR && await readJson(join(process.env.OMO_HERDR_COORDINATION_STATE_DIR,
+        `${String(this.parentPane).replace(/[^A-Za-z0-9_-]/g, '_')}.pane.json`)).catch(() => null);
+      if (collab?.paneId && layout?.panes?.some(pane => pane?.pane_id === collab.paneId)) ids.coordination = collab.paneId;
       // A matching shape is left as it is (G9): the band under a band claim, judged
       // within the owned panes' own rectangle so a pane the owner opened elsewhere
       // in the tab does not make a correct band look wrong; and unmanaged columns
@@ -1549,7 +1563,7 @@ export class FixedDagPane extends DagPane {
       const [left, top] = [0, 1].map(index => Math.min(...edges.map(edge => edge[index])));
       const [right, bottom] = [2, 3].map(index => Math.max(...edges.map(edge => edge[index])));
       const ownedArea = { x: left, y: top, width: right - left, height: bottom - top };
-      const ownedBand = owned.length === 4 && isBandDashboard({ area: ownedArea, panes: owned }, ids);
+      const ownedBand = owned.length === Object.keys(ids).length && isBandDashboard({ area: ownedArea, panes: owned }, ids);
       if (claimed === 'band' ? ownedBand : !this.managedAvailable && isColumnDashboard(layout, ids)) return;
       // The single mutation gate, asked before the placement journal or any move:
       // an automatic pass never rearranges (r4) and keeps a live columns

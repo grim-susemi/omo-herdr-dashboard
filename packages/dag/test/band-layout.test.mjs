@@ -202,3 +202,34 @@ test('BAND_LAYOUT is the single place for the band constants and carries the mea
   });
   assert.equal(Object.isFrozen(BAND_LAYOUT), true);
 });
+
+// Decision #185: the lower row may hold a recorded collaboration pane left of workers (28 | 28 | 30).
+const collabLayout = () => ({
+  area: { x: 0, y: 0, width: 172, height: 46 },
+  panes: [
+    { pane_id: 'parent', rect: { x: 0, y: 0, width: 86, height: 46 } },
+    { pane_id: 'todo', rect: { x: 86, y: 0, width: 86, height: 16 } },
+    { pane_id: 'collab', rect: { x: 86, y: 16, width: 28, height: 30 } },
+    { pane_id: 'workers', rect: { x: 114, y: 16, width: 28, height: 30 } },
+    { pane_id: 'dag', rect: { x: 142, y: 16, width: 30, height: 30 } },
+  ],
+});
+
+test('band dashboard accepts a recorded collaboration pane leftmost in the lower row', () => {
+  assert.equal(isBandDashboard(collabLayout(), { ...ids, coordination: 'collab' }), true);
+  // The four-pane band without a collaboration pane still passes.
+  assert.equal(isBandDashboard(layoutOf(TARGETS['172x46']), ids), true);
+});
+
+test('band dashboard refuses the collaboration pane unless recorded and directly left of workers', () => {
+  assert.equal(isBandDashboard(collabLayout(), ids), false, 'unrecorded fifth pane is foreign');
+  const moved = collabLayout();
+  [moved.panes[2].rect.x, moved.panes[3].rect.x] = [114, 86];
+  assert.equal(isBandDashboard(moved, { ...ids, coordination: 'collab' }), false, 'right of workers');
+  const short = collabLayout();
+  short.panes[2].rect.height = 29;
+  assert.equal(isBandDashboard(short, { ...ids, coordination: 'collab' }), false, 'not the same row');
+  const extra = collabLayout();
+  extra.panes.push({ pane_id: 'foreign', rect: { x: 0, y: 0, width: 1, height: 1 } });
+  assert.equal(isBandDashboard(extra, { ...ids, coordination: 'collab' }), false, 'foreign extra pane');
+});
