@@ -50,11 +50,12 @@ test('single extension migration backs up managed entries, preserves state, upda
   await assert.rejects(readFile(join(first.integration, 'todo/src/parent-slot.mjs')), { code: 'ENOENT' });
   assert.equal(typeof (await import('../dist/extension.mjs')).default, 'function');
   const commands = new Map(), events = [];
-  const previousState = Object.fromEntries(['OMO_HERDR_DAG_STATE_DIR', 'OMO_HERDR_TODO_STATE_DIR'].map(key => [key, process.env[key]]));
+  const previousState = Object.fromEntries(['OMO_HERDR_DAG_STATE_DIR', 'OMO_HERDR_TODO_STATE_DIR', 'OMO_HERDR_COORDINATION_STATE_DIR'].map(key => [key, process.env[key]]));
   try {
     (await import('../dist/extension.mjs')).default({ cwd: fixture, on(name, callback) { events.push([name, callback]); }, registerCommand(name, command) { commands.set(name, command); } });
     assert.deepEqual([...commands.keys()], ['dashboard']);
-    assert.equal(events.filter(([name]) => name === 'session_start').length, 2);
+    // Todo, DAG and the collaboration pane each start with the session.
+    assert.equal(events.filter(([name]) => name === 'session_start').length, 3);
   } finally { for (const [key, value] of Object.entries(previousState)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   await writeFile(join(agent, 'extensions/omo-herdr-todo.js'), 'foreign');
   const before = await readFile(next.extension, 'utf8');

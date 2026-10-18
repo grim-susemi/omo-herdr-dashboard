@@ -11,10 +11,14 @@ for (const component of ['todo', 'dag']) {
   await rm(join(dist, component), { recursive: true, force: true });
   await cp(join(root, 'packages', component, 'dist'), join(dist, component), { recursive: true });
 }
+// The collaboration pane has no build step of its own: its sources ship as they are.
+await rm(join(dist, 'coordination'), { recursive: true, force: true });
+for (const part of ['extension.mjs', 'src']) await cp(join(root, 'packages/coordination', part), join(dist, 'coordination', part), { recursive: true });
 for (const file of ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md']) await cp(join(root, file), join(dist, file));
 await cp(join(root, 'scripts/install.mjs'), join(dist, 'install.mjs'));
 for (const file of ['extension.mjs', 'install.mjs', 'todo/extension.mjs', 'dag/extension.mjs',
-  'todo/src/parent-slot.mjs', 'todo/src/terminal-input.mjs', 'dag/src/terminal-input.mjs']) {
+  'todo/src/parent-slot.mjs', 'todo/src/terminal-input.mjs', 'dag/src/terminal-input.mjs', 'coordination/extension.mjs',
+  'coordination/src/controller.mjs', 'coordination/src/viewer.mjs']) {
   await readFile(join(dist, file));
   execFileSync(process.execPath, ['--check', join(dist, file)], { stdio: 'inherit' });
 }

@@ -38,7 +38,8 @@ export async function install(args) {
   if (entries.length && await text(join(container, '.installed-by')) !== marker) throw Error('Unmanaged dashboard installation');
   const previous = pointerBefore === undefined ? undefined : JSON.parse(pointerBefore).generation;
   if (previous !== undefined && (!/^generation-\d{6}$/.test(previous) || await text(join(container, previous, '.installed-by')) !== marker)) throw Error('Invalid previous generation');
-  const runtime = ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'todo/extension.mjs', 'dag/extension.mjs',
+  const runtime = ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'todo/extension.mjs', 'dag/extension.mjs', 'coordination/extension.mjs',
+    ...['activity', 'controller', 'i18n', 'render', 'viewer'].map(file => `coordination/src/${file}.mjs`),
     ...['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => `todo/src/${file}.mjs`),
     ...['controller', 'herdr', 'i18n', 'model', 'render', 'retention', 'runtime', 'storage', 'stream-tap', 'task-data', 'terminal-input', 'view-state', 'viewer'].map(file => `dag/src/${file}.mjs`)];
   for (const file of runtime) await readFile(join(source, file));
@@ -68,7 +69,7 @@ export async function install(args) {
   let promoted = false, switched = false;
   try {
     await mkdir(staged, { mode: 0o700 });
-    for (const component of ['todo', 'dag']) {
+    for (const component of ['todo', 'dag', 'coordination']) {
       await cp(join(source, component), join(staged, component), { recursive: true });
       await writeFile(join(staged, component, 'locale.json'), JSON.stringify({ language }) + '\n');
     }
