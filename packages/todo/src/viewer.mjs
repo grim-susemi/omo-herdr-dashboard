@@ -221,7 +221,9 @@ export async function startViewer(options, { input = process.stdin, output = pro
       availability };
     painting = painting.then(async () => {
       if (closing || captured.generation !== generation) return;
-      const raw = interactive ? frame.lines.map((line, index) =>
+      // This viewer's PowerShell helpers re-title the shared console when they start, so every
+      // frame sets the role title again (decision: unified pane titles).
+      const raw = interactive ? `\x1b]0;${t(state?.language, 'paneTitle')}\x07` + frame.lines.map((line, index) =>
         `\x1b[${index + 1};1H\x1b[2K${line}`).join('') : `${frame.text}\n`;
       try {
         await write(raw);
@@ -507,7 +509,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
         });
         void draw();
       });
-      output.write(`\x1b[?1049h\x1b[?25l${enablePointer}`);
+      output.write(`\x1b[?1049h\x1b[?25l${enablePointer}\x1b]0;${t(state?.language, 'paneTitle')}\x07`);
       input.setRawMode?.(true); input.resume?.();
       disposeInput = terminalInput(input, { key: keypress, pointer, focus });
       output.on?.('resize', resize);

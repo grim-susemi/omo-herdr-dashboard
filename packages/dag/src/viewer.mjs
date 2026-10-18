@@ -259,7 +259,7 @@ async function refresh() {
   if (again) { again = false; void refresh(); }
 }
 if (process.argv.includes('--once') || !interactive) { draw(); process.exit(0); }
-process.stdout.write(`\x1b[?1049h\x1b[?25l${enablePointer}\x1b]0;OmO DAG\x07`);
+process.stdout.write(`\x1b[?1049h\x1b[?25l${enablePointer}\x1b]0;${fixedView === 'tasks' ? `OmO ${t(state?.language, 'tasks')}` : 'OmO DAG'}\x07`);
 process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
