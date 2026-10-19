@@ -1,5 +1,62 @@
 # Current dashboard verification
 
+## 2026-10-19 marker-free rows and four-row worker cards (generation 28)
+
+Four changes shipped together. The reserved `>` marker column is gone from worker
+cards, DAG node titles and Todo task rows, and selection is shown only by a bold
+title (status colours are unchanged); every worker and DAG bar-card body row also
+starts directly after the `▌` bar (owner reply #230). Healthy worker cards are four
+rows and keep a message/activity row only while stalled, retrying or paused. Both
+`width()` copies count text-presentation pictographs (▶ ⚙ ⚠) as one cell. Both
+process-query copies reject a non-positive/non-integer PID without launching
+PowerShell, re-query one empty stdout once, and fail closed if it stays empty.
+
+The comparator against the d399730 baseline reports 0 new failures, 0 removed
+tests, 0 new timeouts and no flaky keys (the two baseline runs were identical).
+After this generation the buckets are root 749 pass/11 fail, dag 220/44, todo unit
+33/0, todo 122/21 and coordination 14/0; the 55-file inventory has two not-covered
+host tests (`host/display-bridge-host.test.mjs`, `host/native-host.test.mjs`). The
+pre-existing 11 root, 44 dag and 21 todo failures remain disclosed; they include
+stale frame expectations and are not new. The change added 18 passing test statuses.
+
+Real-pane scope: the candidate was captured before/after in an owned Herdr pane for
+workers, DAG and Todo at 171x46 (the owner's tabs were never touched). The installed
+generation 28 worker list was then run in a separate owned `--no-focus` tab and read
+in a 170-column frame: no `>` column, exactly four rows for the healthy card
+(`▌⠋ …`, `▌[deep-low] …`, `▌$…`, `▌⧖ …`), and the stall/retry warning rows were
+still present; `q` exited 0 and the tab was closed. The installed generation was not
+re-checked in a Todo or DAG pane; those live views rest on the candidate captures.
+
+Owner decision #239=A (2026-10-19T16:23:01.540Z) approved installation. The installer
+created generation 000028 with generation 000027 as its backup and no legacy
+wrappers. The post-install preservation compare found 0 drift: the 804 CUTOVER paths
+and every pre-existing generation (including 25, 26 and 27, 46 files each) kept
+their bytes; only the wrapper, current.json and the new generation-000028 folder
+changed. settings.json and models.json were unchanged. All 41 installed runtime
+files match E/task-14/candidate-manifest.json, each locale.json is
+`{"language":"ko"}`, and a fresh Node process imported generation 000028's
+`extension.mjs` with exit 0. The altered-hash QA on a copy of the pre snapshot
+reported exactly 1 drift and exit 1 without touching the real files.
+
+Rollback: copy `E/task-10/rollback/omo-herdr-dashboard.js` back to
+`C:/Users/USER/.omo-stable-500/home/.omo/agent/extensions/omo-herdr-dashboard.js`
+and `E/task-10/rollback/current.json` back to
+`C:/Users/USER/.omo-stable-500/home/.omo/agent/herdr-dashboard/integration/current.json`
+byte-for-byte; that points at generation 000027 again. Do not rerun the installer to
+roll back, because it would create generation 000029. Existing conversations keep
+their loaded generation; this generation applies from a new conversation or a
+deliberate `/reload`.
+
+Limits: a colourless terminal has no selection distinction. The cause of an empty
+process query is still unknown; two consecutive empty outputs or a missing PID can
+still print a short warning. The same warning text can also come from the briefing
+extension (`herdr-tab.mjs:17`), which this change does not touch. The width fix was
+the measured `apply` result. Todo live capture exists only for the candidate, not
+for the installed generation 28. The event-loop freeze investigation remains out of
+scope.
+
+Korean summary: 표시 칸이 사라지고 선택은 굵기로만 보이며, 정상 작업자 카드는 4줄입니다. 새 세대 28을 설치했고 25·26·27은 그대로 보존했습니다. 기존 테스트 실패는 위에 적은 그대로입니다.
+
 ## 2026-10-17 compact child-card alignment
 
 Compact worker and DAG child cards retain the localized counted group heading and
