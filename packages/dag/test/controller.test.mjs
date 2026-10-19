@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DagPane, dagTitle, isDagViewerPane } from '../src/controller.mjs';
+import { DagPane, dagTitle, isDagViewerPane, queryShellProcesses, cachedProcessQuery } from '../src/controller.mjs';
 import { readJson, writeJson } from '../src/storage.mjs';
 import { payload, sessionId } from './fixtures.mjs';
 import { normalizeRun } from '../src/model.mjs';
@@ -344,4 +344,44 @@ test('task-only events update snapshots; reload restores completed details witho
   assert.deepEqual((await readJson(reloaded.stateFile)).tasks, snapshot.tasks);
   await reloaded.stop();
   assert.equal((await readJson(reloaded.stateFile)).connected, false);
+});
+
+test('process query fails closed on invalid PIDs and re-queries one empty output', async () => {
+  const runner = outputs => {
+    const calls = [];
+    const run = async (...args) => { calls.push(args); return { stdout: outputs[Math.min(calls.length - 1, outputs.length - 1)] }; };
+    run.calls = calls; return run;
+  };
+  // (a) an invalid pid never reaches PowerShell
+  for (const pid of [undefined, null, NaN, Infinity, 0, -1, 1.5, '42']) {
+    const run = runner(['[]']);
+    await assert.rejects(queryShellProcesses(pid, run), { code: 'SHELL_QUERY_INVALID_PID' });
+    assert.equal(run.calls.length, 0);
+  }
+  // (b) one empty output is re-queried once
+  const second = runner(['', '[{"ProcessId":42}]']);
+  assert.deepEqual(await queryShellProcesses(42, second), [{ ProcessId: 42 }]);
+  assert.equal(second.calls.length, 2);
+  // (c) two empty outputs fail as an empty query, not as a JSON syntax error
+  const empty = runner(['']);
+  await assert.rejects(queryShellProcesses(42, empty), error => error.code === 'SHELL_QUERY_EMPTY' && !/Unexpected end of JSON input/.test(error.message));
+  assert.equal(empty.calls.length, 2);
+  // (d) whitespace-only output counts as empty
+  const blank = runner(['\r\n']);
+  await assert.rejects(queryShellProcesses(42, blank), { code: 'SHELL_QUERY_EMPTY' });
+  assert.equal(blank.calls.length, 2);
+  // (e) a good first output is not re-queried
+  const good = runner(['[{"ProcessId":42}]']);
+  assert.deepEqual(await queryShellProcesses(42, good), [{ ProcessId: 42 }]);
+  assert.equal(good.calls.length, 1);
+  // (f) malformed JSON still rejects, without a re-query
+  const broken = runner(['[{']);
+  await assert.rejects(queryShellProcesses(42, broken), SyntaxError);
+  assert.equal(broken.calls.length, 1);
+  // (g) the cache evicts a rejected query and asks again
+  const cachedRun = runner(['']);
+  const cached = cachedProcessQuery(pid => queryShellProcesses(pid, cachedRun));
+  await assert.rejects(cached(42), { code: 'SHELL_QUERY_EMPTY' });
+  await assert.rejects(cached(42), { code: 'SHELL_QUERY_EMPTY' });
+  assert.equal(cachedRun.calls.length, 4);
 });

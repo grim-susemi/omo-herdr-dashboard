@@ -629,11 +629,18 @@ export function parseLaunchCommand(command) {
   }
   return argv;
 }
-async function queryShellProcesses(pid) {
-  const { stdout } = await executeProcessQuery('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+export async function queryShellProcesses(pid, run = executeProcessQuery) {
+  // Fail as a query failure without starting PowerShell: an empty row list would be read by
+  // observePreviousProducer as proof that the producer died.
+  if (!Number.isSafeInteger(pid) || pid < 1) throw Object.assign(new Error('process query skipped: invalid pid'), { code: 'SHELL_QUERY_INVALID_PID' });
+  for (let attempt = 0; attempt < 2; attempt++) {
+  const { stdout } = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $ErrorActionPreference = 'Stop'; $rows = @(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid} OR ParentProcessId = ${pid}" | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},@{Name='Birth';Expression={$h=[Diagnostics.Process]::GetProcessById($_.ProcessId);try{$null=$h.Handle;$h.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}finally{$h.Dispose()}}}); ConvertTo-Json -InputObject $rows -Compress`],
   { timeout: 30000, maxBuffer: 65536 }); // was 5 s, same as the Todo process query
-  return JSON.parse(stdout);
+  if (stdout.trim()) return JSON.parse(stdout);
+  }
+  // Empty output is a failed query, not an empty list.
+  throw Object.assign(new Error('process query returned no output'), { code: 'SHELL_QUERY_EMPTY' });
 }
 // Process identity rows, cached per pid. Layout passes ask about the same pane shells, this
 // process and its ancestors every few seconds, and each uncached ask starts a PowerShell + WMI

@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TodoPane, dashboardChannels, readRoleState, registerRoleViewer, requestRoleClose, viewerProcess, paneViewerProcess, canCleanupPane, parseLaunchCommand } from '../src/controller.mjs';
+import { TodoPane, dashboardChannels, readRoleState, registerRoleViewer, requestRoleClose, viewerProcess, paneViewerProcess, canCleanupPane, parseLaunchCommand, queryShellProcesses, cachedProcessQuery } from '../src/controller.mjs';
 import net from 'node:net';
 import extension from '../extension.mjs';
 
@@ -435,4 +435,58 @@ test('a non-transient error replacing the Todo state file is not retried', async
   assert.deepEqual(fault.attempts, ['ENOSPC']);
   assert.equal(await readFile(f.controller.stateFile, 'utf8'), before);
   assert.deepEqual(await noTemporaries(f.controller), []);
+});
+
+test('process query fails closed on invalid PIDs and re-queries one empty output', async () => {
+  const runner = outputs => {
+    const calls = [];
+    const run = async (...args) => { calls.push(args); return { stdout: outputs[Math.min(calls.length - 1, outputs.length - 1)] }; };
+    run.calls = calls; return run;
+  };
+  // (a) an invalid pid never reaches PowerShell
+  for (const pid of [undefined, null, NaN, Infinity, 0, -1, 1.5, '42']) {
+    const run = runner(['[]']);
+    await assert.rejects(queryShellProcesses(pid, run), { code: 'SHELL_QUERY_INVALID_PID' });
+    assert.equal(run.calls.length, 0);
+  }
+  // (b) one empty output is re-queried once
+  const second = runner(['', '[{"ProcessId":42}]']);
+  assert.deepEqual(await queryShellProcesses(42, second), [{ ProcessId: 42 }]);
+  assert.equal(second.calls.length, 2);
+  // (c) two empty outputs fail as an empty query, not as a JSON syntax error
+  const empty = runner(['']);
+  await assert.rejects(queryShellProcesses(42, empty), error => error.code === 'SHELL_QUERY_EMPTY' && !/Unexpected end of JSON input/.test(error.message));
+  assert.equal(empty.calls.length, 2);
+  // (d) whitespace-only output counts as empty
+  const blank = runner(['\r\n']);
+  await assert.rejects(queryShellProcesses(42, blank), { code: 'SHELL_QUERY_EMPTY' });
+  assert.equal(blank.calls.length, 2);
+  // (e) a good first output is not re-queried
+  const good = runner(['[{"ProcessId":42}]']);
+  assert.deepEqual(await queryShellProcesses(42, good), [{ ProcessId: 42 }]);
+  assert.equal(good.calls.length, 1);
+  // (f) malformed JSON still rejects, without a re-query
+  const broken = runner(['[{']);
+  await assert.rejects(queryShellProcesses(42, broken), SyntaxError);
+  assert.equal(broken.calls.length, 1);
+  // (g) the cache evicts a rejected query and asks again
+  const cachedRun = runner(['']);
+  const cached = cachedProcessQuery(pid => queryShellProcesses(pid, cachedRun));
+  await assert.rejects(cached(42), { code: 'SHELL_QUERY_EMPTY' });
+  await assert.rejects(cached(42), { code: 'SHELL_QUERY_EMPTY' });
+  assert.equal(cachedRun.calls.length, 4);
+});
+
+test('an empty or invalid process query is never read as a dead previous producer', async t => {
+  const f = await fixture(t);
+  const empty = async () => ({ stdout: '' });
+  f.controller.inspectShell = pid => queryShellProcesses(pid, empty);
+  await assert.rejects(f.controller.observePreviousProducer({ pid: 4242, birth: '1' }), { code: 'SHELL_QUERY_EMPTY' });
+  let spawned = 0;
+  const forbidden = async () => { spawned++; throw new Error('must not run'); };
+  f.controller.inspectShell = pid => queryShellProcesses(pid, forbidden);
+  await assert.rejects(f.controller.observePreviousProducer({ pid: undefined, birth: '1' }), { code: 'SHELL_QUERY_INVALID_PID' });
+  assert.equal(spawned, 0);
+  f.controller.inspectShell = async () => [];
+  assert.deepEqual(await f.controller.observePreviousProducer({ pid: 4242, birth: '1' }), { identity: { pid: 4242, birth: '1' }, state: 'dead' });
 });
