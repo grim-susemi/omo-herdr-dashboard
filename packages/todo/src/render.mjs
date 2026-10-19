@@ -83,7 +83,12 @@ export function wrap(text, columns) {
         if (space > 0 && part !== ' ') {
           result.push(line.slice(0, space));
           line = line.slice(space + 1);
-        } else { result.push(line.trimEnd()); line = ''; }
+        } else {
+          result.push(line.trimEnd());
+          line = '';
+          // A separator that lands on the wrap boundary is consumed by the break.
+          if (part === ' ') continue;
+        }
         if (width(line + part) > columns) { result.push(line); line = ''; }
       }
       line += part;

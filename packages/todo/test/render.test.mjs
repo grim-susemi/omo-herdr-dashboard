@@ -295,3 +295,22 @@ test('width matches measured Herdr cells for informative sequences', () => {
   for (const [glyph, expected] of cells) assert.equal(width(glyph), expected, JSON.stringify(glyph));
 });
 
+test('wrapped task continuations keep the four-cell text inset', () => {
+  // E/fixtures/fixtures.mjs T4 content: at width 28 a wrap boundary falls right before a separator space.
+  const content = 'T4 폭 계산을 실제 Herdr pane 칸 수와 맞추고 오른쪽 테두리와 말줄임이 어긋나지 않는지 확인한다';
+  for (const columns of [28, 40, 80]) {
+    const snapshot = project([{ name: '구현', tasks: [{ content, status: 'pending' }] }]);
+    const frame = renderFrame(snapshot, { columns, rows: 24, color: false });
+    const range = frame.taskRanges[snapshot.phaseSummaries[0].taskKeys[0]];
+    const rows = frame.bodyLines.slice(range.start, range.end).map(line => stripVTControlCharacters(line));
+    assert.ok(rows.length > 1, `the task wraps at ${columns}`);
+    assert.match(rows[0], /^\[ \] \S/, `the first row keeps the mark at ${columns}`);
+    for (const row of rows.slice(1)) {
+      assert.equal(row.search(/\S/), 4, `continuation starts at cell 4 at ${columns}: ${JSON.stringify(row)}`);
+    }
+    // Wrap points may replace a separator space with the line break; no other character may change.
+    const joined = `${rows[0].slice(4)}${rows.slice(1).map(row => row.slice(4)).join('')}`.replace(/\s+/g, '');
+    assert.equal(joined, content.replace(/\s+/g, ''), `task text survives wrapping at ${columns}`);
+  }
+});
+
