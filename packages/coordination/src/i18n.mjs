@@ -17,7 +17,7 @@ export const messages = {
     baseline: ' baseline {hash}…', noBaseline: ' baseline 미확인', recent: '최근 흐름',
     emptyFlow: ' (아직 협업 없음)', advisor: '어드바이저', advisorOn: '● on', advisorOff: '○ off',
     advisorNone: '○ 기록 없음', consults: '자문 {count}', stops: ' 열린 STOP {count}', last: ' · {time}',
-    followOn: '추적 ON', followOff: '추적 OFF', note: '노트',
+    followOn: 'Follow ON', followOff: 'Follow OFF', note: '노트',
   },
   'zh-cn': {
     title: 'OmO 协作', header: '协作 · 顾问', healthy: '●正常', attention: '⚠检查',

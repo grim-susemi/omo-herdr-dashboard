@@ -1,6 +1,6 @@
 // Pure frame of the OmO collaboration pane (design v4): header, connection and
 // baseline, the recent flow (scrollable, newest at the bottom), the advisor and
-// the unified footer `추적 ON · start–end/total`.
+// the unified footer `Follow ON · start–end/total`.
 import { fit, width } from '../../dag/src/render.mjs';
 import { t } from './i18n.mjs';
 

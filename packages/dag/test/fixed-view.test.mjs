@@ -86,7 +86,9 @@ for (const view of ['dag', 'tasks']) test(`managed ${view} has a fixed header, a
     assert.doesNotMatch(frame, /ORDINARY_ROOT/);
   } else {
     assert.match(frame, /ORDINARY_ROOT/);
-    assert.match(frame, /\$0\.4493.*21 tok\/s/);
+    // The compact card shows the speed; the cost is left to the d detail view.
+    assert.match(frame, /21 tok\/s/);
+    assert.doesNotMatch(frame, /\$0\.4493/);
     assert.doesNotMatch(frame, /ACTUAL_DAG|DAG_LINKED_DETAIL|Runs/);
   }
 });

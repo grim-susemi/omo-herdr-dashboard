@@ -219,23 +219,24 @@ test('approved child cards retain their group and arrows without extra indentati
       const frame = renderFrame(source, options);
       const lines = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
       if (view === 'dag') {
-        // A DAG card lists every subtask as one arrow row; the finished child shows no metadata.
-        assert.ok(lines.some(line => line.includes('↳ ✓ CHILD_TITLE')) && lines.some(line => line.includes('↳ ○ GRAND_TITLE')));
+        // A DAG card lists the subtasks as the worker card does; the finished child shows no role or cost.
+        assert.ok(lines.some(line => line.includes('↳ ✓ CHILD')) && lines.some(line => line.includes('↳ ○ GRAND')));
         assert.ok(!lines.some(line => line.includes('$0.1242')));
         continue;
       }
       const group = t(language, 'subtasksCount', { count: 2 });
       assert.equal(lines.filter(line => line.includes(group)).length, 1);
-      const childAt = lines.findIndex(line => line.includes('↳ ✓ CHILD_TITLE'));
-      const grandAt = lines.findIndex(line => line.includes('↳ ○ GRAND_TITLE'));
+      // A narrow title gives way to the elapsed time at its end, so match the start of each name.
+      const childAt = lines.findIndex(line => line.includes('↳ ✓ CHILD'));
+      const grandAt = lines.findIndex(line => line.includes('↳ ○ GRAND'));
       assert.ok(childAt >= 0 && grandAt > childAt);
       const contentAt = lines.find(line => line.includes('[deep-low]')).indexOf('[');
       assert.equal(lines[childAt].indexOf('↳'), contentAt);
       assert.equal(lines[grandAt].indexOf('↳'), contentAt);
-      // The completed child is one title row: its role, cost and time rows fold away.
+      // The completed child is one title row: its role and cost fold away and its elapsed time ends the title.
       const child = lines.slice(childAt, grandAt);
       assert.equal(child.length, 1, `${language} ${columns} ${view}`);
-      assert.ok(!child.some(line => /\$0\.1242|⧖|unspecified-low/.test(line)));
+      assert.ok(!child.some(line => /\$0\.1242|unspecified-low/.test(line)));
       // The pending grandchild keeps its metadata, aligned under the arrows.
       const badge = lines.slice(grandAt + 1).find(line => line.includes('['));
       assert.equal(badge.indexOf('['), contentAt);
@@ -407,6 +408,71 @@ test('DAG runs draw no boxes: a lane graph with stage headers and a barred card 
   assert.ok(pair.some(row => /┈{10}/u.test(row)), 'neighbouring cards are parted by a dotted row');
   const frame = renderFrame({ connected: true, runs: [cases.single], tasks: [] }, { columns: 40, rows: 60, color: false, frame: 0, now: cardNow, view: 'dag' });
   assert.equal(frame.graphRanges.n.start, 1, 'stage header, then the running node');
+});
+
+test('the DAG pane lists each stage under its header, so a wide parallel stage keeps a one-cell margin', () => {
+  const nodes = (...specs) => specs.map(([id, state, label]) => ({ id, state, label: label ?? id.toUpperCase(), taskId: `t_${id}` }));
+  const draw = (run, columns) => renderFrame({ connected: true, runs: [run], tasks: [] },
+    { columns, rows: 200, color: false, frame: 0, now: cardNow, view: 'dag' });
+  const title = (frame, id) => frame.text.split('\n')[frame.bodyStart + frame.graphRanges[id].start - frame.scroll];
+  // 23 parallel nodes merging into one: as lanes they took 45 cells of a 34-column pane and hid the names.
+  const roots = Array.from({ length: 23 }, (_, i) => [`h${i + 1}`, i < 4 ? 'completed' : 'pending', `harvest i${i + 1}`]);
+  const fanIn = { id: 'r', status: 'running', nodes: nodes(...roots, ['syn', 'pending', 'synthesize']),
+    edges: roots.map(([id]) => ({ from: id, to: 'syn' })) };
+  const wide = draw(fanIn, 34);
+  for (const node of fanIn.nodes) {
+    assert.match(title(wide, node.id), /^[├└] [✓○] /u, `${node.id} sits one cell in`);
+    assert.ok(title(wide, node.id).includes(node.label), `${node.id} keeps its whole name`);
+  }
+  assert.ok(title(wide, 'h22').startsWith('├') && title(wide, 'h23').startsWith('└'), 'the last node closes its stage');
+  assert.ok(!title(wide, 'syn').includes('←'), 'a node fed by its whole previous stage needs no hint');
+  assert.ok(wide.text.split('\n').every(line => width(line) <= 34));
+  // Eight pairs a→b plus one node fed by two of the eight: each names the parent it waits for.
+  const pairs = Array.from({ length: 8 }, (_, i) => i + 1);
+  const chains = { id: 'r', status: 'running', nodes: nodes(...pairs.map(k => [`a${k}`, 'running']), ...pairs.map(k => [`b${k}`, 'pending']), ['m', 'pending']),
+    edges: [...pairs.map(k => ({ from: `a${k}`, to: `b${k}` })), { from: 'a1', to: 'm' }, { from: 'a2', to: 'm' }] };
+  const narrow = draw(chains, 27);
+  for (const k of pairs) assert.ok(title(narrow, `b${k}`).includes(`B${k}  ← A${k}`), title(narrow, `b${k}`));
+  assert.ok(title(narrow, 'm').includes('M  ← A1 +1'), title(narrow, 'm'));
+  assert.ok(narrow.text.split('\n').every(line => width(line) <= 27));
+  // Neighbouring open (running) nodes keep their bar and the dotted parting row.
+  const rows = narrow.text.split('\n');
+  assert.match(title(narrow, 'a1'), /^├▌/u);
+  assert.match(rows[narrow.bodyStart + narrow.graphRanges.a1.end - narrow.scroll], /^│ ┈{10}/u);
+});
+
+test('worker and DAG cards share three rows, and role and model split onto two whole rows when they do not fit one', () => {
+  const make = (agent, model, reasoningEffort) => ({ id: 'w', status: 'running', description: 'WORK', agent, model, reasoningEffort,
+    startedAt: new Date(cardNow - 125000).toISOString(), turns: 12, toolCalls: 30,
+    metrics: { tokens_per_second: 80, cost_usd: 0.0123, cost_status: 'reported' } });
+  const run = { id: 'r', status: 'running', edges: [], nodes: [{ id: 'n', label: 'NODE', state: 'running', taskId: 'w' }] };
+  const draw = (task, view, columns) => {
+    const frame = renderFrame({ connected: true, runs: view === 'dag' ? [run] : [], tasks: [task] },
+      { columns, rows: 60, color: false, frame: 0, now: cardNow, view, language: 'ko' });
+    const range = view === 'dag' ? frame.graphRanges.n : frame.taskRanges.w;
+    const lines = frame.text.split('\n').slice(frame.bodyStart + range.start - frame.scroll, frame.bodyStart + range.end - frame.scroll);
+    // Strip the card bar (worker) or the tree mark and bar (DAG) to compare the card contents.
+    return { frame, rows: lines.map(line => line.slice(view === 'dag' ? 2 : 1).trimEnd()) };
+  };
+  const short = make('quick', 'gpt-6.1-sol', 'low'), long = make('unspecified-high', 'claude-opus-5-5', 'xhigh');
+  for (const columns of [28, 34, 54]) for (const [task, split] of [[short, false], [long, columns < 54]]) {
+    const cards = { tasks: draw(task, 'tasks', columns), dag: draw(task, 'dag', columns) };
+    for (const [view, { frame, rows }] of Object.entries(cards)) {
+      const at = `${view} ${columns} ${task.agent}`;
+      assert.equal(rows.length, split ? 4 : 3, `${at}: ${rows.join(' / ')}`);
+      assert.ok(rows[0].endsWith('⧖ 2m 5s'), `${at}: ${rows[0]}`);
+      if (split) {
+        assert.equal(rows[1], `[${task.agent}]`, at);
+        assert.equal(rows[2], `${task.model}:${task.reasoningEffort}`, at);
+      } else assert.equal(rows[1], `[${task.agent}] ${task.model}:${task.reasoningEffort}`, at);
+      assert.ok(rows.at(-1).startsWith('80 tok/s · 12 turns'), `${at}: ${rows.at(-1)}`);
+      assert.ok(!rows.some(row => row.includes('$')), at);
+      assert.ok(frame.text.split('\n').every(line => width(line) < columns), at);
+      assert.ok(frame.text.includes('Follow ON · LIVE'), at);
+    }
+    if (columns === 54) assert.deepEqual(cards.dag.rows.slice(1), cards.tasks.rows.slice(1), 'the same rows under the title');
+    assert.ok(cards.tasks.frame.text.startsWith('Workers [0/1]  run 1'), cards.tasks.frame.text.split('\n')[0]);
+  }
 });
 
 test('a card one column narrower than its longest line truncates with an ellipsis instead of overflowing', () => {

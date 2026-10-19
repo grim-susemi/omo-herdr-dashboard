@@ -46,45 +46,52 @@ test('negative nonfinite fractional token counts and arbitrary quality are not m
   assert.equal(task.metrics, undefined);
 });
 
-test('compact cost distinguishes unknown estimated and reported including genuine zero and tiny positives', () => {
+test('compact cards leave the cost out; the detail view distinguishes unknown estimated and reported including genuine zero and tiny positives', () => {
   for (const [cost, quality, expected] of [
     [0, 'reported', '$0.0000'], [0.4493, 'reported', '$0.4493'],
     [0.000001, 'reported', '<$0.0001'], [1, 'estimated', '$1.0000 [estimated]'],
     [1, undefined, '$1.0000 [Unknown]'] ]) {
-    const text = frame(normalizeTask(record({ ...stats, cost_usd: cost, cost_status: quality })));
+    const task = normalizeTask(record({ ...stats, cost_usd: cost, cost_status: quality }));
+    const compact = frame(task);
+    assert.ok(compact.includes('388 tok/s'), compact);
+    assert.doesNotMatch(compact, /\$|Cost:/);
+    const text = frame(task, { verbose: true });
     assert.ok(text.includes(expected), text);
-    assert.ok(text.includes('388 tok/s'));
-    if (quality === 'reported') assert.doesNotMatch(text, /\[reported\]/);
     assert.doesNotMatch(text, /free|273 tok\/s/i);
   }
   for (const quality of ['unavailable', 'invalid']) {
-    const text = frame(normalizeTask(record({ ...stats, cost_status: quality })));
+    const text = frame(normalizeTask(record({ ...stats, cost_status: quality })), { verbose: true });
     assert.match(text, /Cost: Unknown/);
     assert.doesNotMatch(text, /\$0\.0000/);
   }
 });
 
-test('Korean ordinary worker cost omits reported badge but keeps the amount and detail quality', () => {
+test('Korean worker cards leave the cost to the detail view, which keeps the amount and its quality', () => {
   const task = normalizeTask(record({ ...stats, cost_usd: 0.4493 }));
-  const compact = frame(task, { language: 'ko' });
-  assert.match(compact, /\$0\.4493/);
-  assert.doesNotMatch(compact, /\[보고됨\]/);
-  assert.match(frame(task, { language: 'ko', verbose: true }), /reported/);
+  assert.doesNotMatch(frame(task, { language: 'ko' }), /\$0\.4493/);
+  const detail = frame(task, { language: 'ko', verbose: true });
+  assert.match(detail, /\$0\.4493/);
+  assert.match(detail, /reported/);
 });
 
 test('generation rate prefers native values and only falls back to positive generation time', () => {
   const fallback = { ...stats, tokens_per_second: undefined };
-  assert.match(frame(normalizeTask(record(fallback))), /388 tok\/s \[estimated\]/);
+  const detail = task => frame(task, { verbose: true });
+  assert.match(detail(normalizeTask(record(fallback))), /388 tok\/s \[estimated\]/);
+  // The compact card shows the same rate without its quality badge.
+  const compact = frame(normalizeTask(record(fallback)));
+  assert.match(compact, /388 tok\/s/);
+  assert.doesNotMatch(compact, /\[estimated\]/);
   assert.match(frame(normalizeTask(record({ ...stats, tokens_per_second: 21 }))), /21 tok\/s/);
   assert.match(frame(normalizeTask(record({ ...stats, tokens_per_second: 2.5 }))), /2\.5 tok\/s/);
   assert.match(frame(normalizeTask(record({ ...stats, tokens_per_second: 0 }))), /0 tok\/s/);
   for (const generation_ms of [0, -1, NaN, Infinity, undefined]) {
-    const text = frame(normalizeTask(record({ ...fallback, generation_ms })));
-    assert.match(text, /tok\/s: Unknown/);
-    assert.doesNotMatch(text, /273 tok\/s|388 tok\/s|0 tok\/s/);
+    const task = normalizeTask(record({ ...fallback, generation_ms }));
+    assert.match(detail(task), /tok\/s: Unknown/);
+    for (const text of [frame(task), detail(task)]) assert.doesNotMatch(text, /273 tok\/s|388 tok\/s|0 tok\/s/);
   }
-  assert.match(frame(normalizeTask(record({ ...fallback, output_tokens: 0 }))), /0 tok\/s \[estimated\]/);
-  assert.match(frame(normalizeTask(record({ runtime_ms: 102917, output_tokens: 28087 }))), /tok\/s: Unknown/);
+  assert.match(detail(normalizeTask(record({ ...fallback, output_tokens: 0 }))), /0 tok\/s \[estimated\]/);
+  assert.match(detail(normalizeTask(record({ runtime_ms: 102917, output_tokens: 28087 }))), /tok\/s: Unknown/);
 });
 
 test('ordinary and DAG details expose the same recorded metrics and report quality while disconnected', () => {
@@ -122,7 +129,8 @@ test('metrics-only disk and RPC changes invalidate snapshot signatures and survi
   await writeJson(file, record({ ...stats, cost_usd: 0.4493 }));
   const changed = await data.refresh();
   assert.notDeepEqual(before, changed);
-  assert.notEqual(frame(before[0]), frame(changed[0]));
+  // A cost-only change shows in the detail view, where the cost lives.
+  assert.notEqual(frame(before[0], { verbose: true }), frame(changed[0], { verbose: true }));
   data.receive({ parent_session_id: 'metrics', tasks: [record({ ...stats, output_tokens: 7 })] });
   assert.equal(data.snapshot()[0].metrics.output_tokens, 7);
   const pane = new DagPane({ cwd, sessionId: 'metrics', parentPane: 'none', socket: 'none',

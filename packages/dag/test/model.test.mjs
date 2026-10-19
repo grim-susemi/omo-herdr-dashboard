@@ -374,7 +374,9 @@ test('missing task metadata is explicit, cyclic subtasks terminate, and text can
   assert.ok(missing.includes(`${messages.en.task}: ${messages.en.noData}`));
   const linked = render(state, { rows: 200, color: false, selectedNodeId: 'linked', verbose: true });
   assert.ok(linked.includes(`${messages.en.agent}: ${messages.en.noData}`));
-  assert.ok(text.includes('SAFE_PROGRESS'));
+  // The progress sentence shows in the selected node's detail view, cleaned of terminal controls.
+  assert.ok(linked.includes('SAFE_PROGRESS'));
+  assert.ok(!linked.includes('\x1b'));
   assert.equal(text.match(/CHILD_ONCE/g)?.length, 1);
   assert.ok(!text.includes('\x1b'));
 });
@@ -457,7 +459,7 @@ test('DAG colors use theme ANSI and not fixed light-gray indexes', () => {
   assert.equal(render(state, { columns: 80, rows: 40, color: false, selectedNodeId: 'wait' }).includes(esc), false);
 });
 
-test('healthy worker cards have four rows; stalls, retries and paused tasks keep the message row', () => {
+test('healthy worker cards have three rows (four when the model takes its own row); stalls, retries and paused tasks keep the message row', () => {
   const now = Date.parse('2026-10-19T00:10:00Z');
   const activity = (phase, extra = {}, age = 0, span = age) => ({ phase, since: now - span, lastAt: now - age, ...extra });
   const base = { id: 'st_card', status: 'running', description: 'CARD_TITLE', agent: 'worker', category: 'visual-engineering',
@@ -474,25 +476,28 @@ test('healthy worker cards have four rows; stalls, retries and paused tasks keep
     return card;
   };
   for (const columns of [28, 40, 80]) {
-    // At 28 columns the role badge crowds out model:effort, so the model takes its own row.
-    const rows = columns === 28 ? 5 : 4;
+    // The role badge and the whole model:effort share a row only when both fit (80 columns here);
+    // otherwise the model takes its own row instead of being cut short.
+    const split = columns < 80, rows = split ? 4 : 3;
     const healthy = own(base, columns);
     assert.equal(healthy.length, rows, `${columns}: ${healthy.join(' / ')}`);
-    assert.doesNotMatch(healthy.join('\n'), /HEALTHY_PROGRESS|HEALTHY_TAIL|✎/);
-    assert.match(healthy[0], /⠋ CARD_TITLE/);
-    if (columns === 28) assert.match(healthy[2], /gpt-5\.4/);
+    assert.doesNotMatch(healthy.join('\n'), /HEALTHY_PROGRESS|HEALTHY_TAIL|✎|\$0\.5/);
+    assert.match(healthy[0], /⠋ CARD_TITLE · ⧖ 10m 0s/);
+    if (split) assert.ok(healthy[2].includes('gpt-5.4:xhigh') && !healthy[2].includes('…'), healthy[2]);
+    else assert.ok(healthy[1].includes('[worker/visual-engineering] gpt-5.4:xhigh'), healthy[1]);
+    assert.match(healthy[rows - 1], /12 tok\/s · 3 turns/);
     const stalled = own({ ...base, activity: activity('text', { text: 'STALL_TAIL' }, 45000) }, columns);
     assert.equal(stalled.length, rows + 1, `${columns}: ${stalled.join(' / ')}`);
-    assert.match(stalled[rows - 2], /⚠/);
+    assert.match(stalled[rows - 1], /⚠/);
     const retry = own({ ...base, activity: activity('retry', { attempt: 2, maxAttempts: 3 }, 4000) }, columns);
     assert.equal(retry.length, rows + 1, `${columns}: ${retry.join(' / ')}`);
-    assert.match(retry[rows - 2], /↻/);
+    assert.match(retry[rows - 1], /↻/);
     const offline = own(base, columns, { state: { connected: false } });
     assert.equal(offline.length, rows, `${columns}: ${offline.join(' / ')}`);
     assert.doesNotMatch(offline.join('\n'), /HEALTHY_PROGRESS|HEALTHY_TAIL/);
     const paused = own({ ...base, status: 'paused', progress: 'PAUSED_SENTENCE' }, columns);
     assert.equal(paused.length, rows + 1, `${columns}: ${paused.join(' / ')}`);
-    assert.match(paused[rows - 2], /PAUSED/);
+    assert.match(paused[rows - 1], /PAUSED/);
     // The selected detail view still shows a healthy card's progress sentence.
     const detail = renderFrame({ connected: true, runs: [], tasks: [base] },
       { rows: 80, columns, color: false, now, viewState, selectedTaskId: 'st_card', verbose: true }).text;

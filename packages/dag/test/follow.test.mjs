@@ -147,15 +147,15 @@ test('titles start without a marker column and only the selected title is bold',
   for (const color of [false, true]) {
     const graph = renderFrame({ connected: true, runs: [run], tasks }, { columns: 40, rows: 60, color, frame: 0, view: 'dag', selectedNodeId: 'b' });
     const graphRow = id => graph.text.split('\n')[graph.bodyStart + graph.graphRanges[id].start - graph.scroll];
-    // Collapsed nodes on one lane: the status icon follows the lane dot and its gap directly, selected or not.
-    assert.ok(stripVTControlCharacters(graphRow('b')).startsWith('•  ✓ N_B'), graphRow('b'));
-    assert.ok(stripVTControlCharacters(graphRow('a')).startsWith('•  × N_A'), graphRow('a'));
+    // Collapsed nodes in the stage list: the status icon follows the tree mark and the blank bar cell, selected or not.
+    assert.ok(stripVTControlCharacters(graphRow('b')).startsWith('└ ✓ N_B'), graphRow('b'));
+    assert.ok(stripVTControlCharacters(graphRow('a')).startsWith('└ × N_A'), graphRow('a'));
     assert.ok(stripVTControlCharacters(graphRow('c')).includes('⠋ N_C'), graphRow('c'));
     const workers = renderFrame({ connected: true, runs: [], tasks }, { columns: 40, rows: 60, color, frame: 0, view: 'tasks', selectedTaskId: 'tb' });
     const workerRow = id => workers.text.split('\n')[workers.bodyStart + workers.taskRanges[id].start - workers.scroll];
     // One cell of bar (or its blank) and then the status icon, for the selected and the unselected cards alike.
-    assert.ok(stripVTControlCharacters(workerRow('tb')).slice(1).startsWith('✓ [+] T_B'), workerRow('tb'));
-    assert.ok(stripVTControlCharacters(workerRow('ta')).slice(1).startsWith('× [+] T_A'), workerRow('ta'));
+    assert.ok(stripVTControlCharacters(workerRow('tb')).slice(1).startsWith('✓ ▸ T_B'), workerRow('tb'));
+    assert.ok(stripVTControlCharacters(workerRow('ta')).slice(1).startsWith('× ▸ T_A'), workerRow('ta'));
     assert.ok(stripVTControlCharacters(workerRow('tc')).slice(1).startsWith('⠋ T_C'), workerRow('tc'));
     if (!color) {
       assert.ok(!graph.text.includes('\x1b') && !workers.text.includes('\x1b'));
@@ -164,8 +164,8 @@ test('titles start without a marker column and only the selected title is bold',
     assert.ok(graphRow('b').includes('\x1b[1;32m✓ N_B'), graphRow('b'));
     assert.ok(graphRow('a').includes('\x1b[31m× N_A') && !graphRow('a').includes('\x1b[1;'), graphRow('a'));
     assert.ok(graphRow('c').includes('\x1b[36m⠋ N_C') && !graphRow('c').includes('\x1b[1;'), graphRow('c'));
-    assert.ok(workerRow('tb').includes('\x1b[1;32m✓ [+] T_B'), workerRow('tb'));
-    assert.ok(workerRow('ta').includes('\x1b[31m× [+] T_A') && !workerRow('ta').includes('\x1b[1;'), workerRow('ta'));
+    assert.ok(workerRow('tb').includes('\x1b[1;32m✓ ▸ T_B'), workerRow('tb'));
+    assert.ok(workerRow('ta').includes('\x1b[31m× ▸ T_A') && !workerRow('ta').includes('\x1b[1;'), workerRow('ta'));
     assert.ok(workerRow('tc').includes('\x1b[36m⠋ T_C') && !workerRow('tc').includes('\x1b[1;'), workerRow('tc'));
   }
 });

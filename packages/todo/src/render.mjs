@@ -150,7 +150,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     const folded = !completedExpanded && phase.tasks.length > 0 && !isClosedPhase(phase) && !openPhases.has(phaseIndex);
     const start = bodyLines.length;
     const count = counts(phase.tasks);
-    const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}${folded ? ' [+]' : ''}`;
+    const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}${folded ? ' ▸' : ''}`;
     // Each phase title is a divider row "─ name n/m ───"; only the phase holding the current work keeps a colour.
     const nameRoom = columns - width(summary) - 5;
     const label = fit(nameRoom > 0 ? `${fit(phase.name, nameRoom)} ${summary}` : summary, Math.max(1, columns - 3));

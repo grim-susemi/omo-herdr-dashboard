@@ -169,7 +169,7 @@ test('a 28x30 frame shows connection, baseline, flow, advisor and the unified fo
   assert.equal(frame.plain[5], '08:22 리드→워커A ❓ ⏳');
   assert.equal(frame.plain[6], ' "레인2 상태 어때?"');
   assert.equal(frame.plain[7], '08:22 워커A→리드 ✅ 3s');
-  assert.equal(frame.plain.at(-1), '추적 ON · 1–2/2');
+  assert.equal(frame.plain.at(-1), 'Follow ON · 1–2/2');
   assert.ok(frame.plain.includes('어드바이저 ● on · 자문 2'));
 });
 
@@ -177,7 +177,7 @@ test('an empty or unknown state renders the empty frame without an error', () =>
   const frame = renderFrame({ status: null, events: [], advisor: undefined }, { columns: 28, rows: 30, language: 'ko', color: false });
   assert.equal(frame.plain[2], '코디네이션 ○ 확인 중');
   assert.ok(frame.plain.includes(' (아직 협업 없음)'));
-  assert.equal(frame.plain.at(-1), '추적 ON · 0–0/0');
+  assert.equal(frame.plain.at(-1), 'Follow ON · 0–0/0');
   assert.match(frame.plain[0], /⚠확인$/);
 });
 
@@ -185,7 +185,7 @@ test('scrolling up pauses follow and the counter names the events shown', () => 
   const events = Array.from({ length: 20 }, (_, index) => ({ ...reply, id: `q-${index}` }));
   const frame = renderFrame({ events }, { columns: 28, rows: 16, language: 'ko', color: false, follow: false, offset: 4 });
   // 16 rows leave 6 flow rows = 3 events; 4 rows up from the newest ends at event 18.
-  assert.equal(frame.plain.at(-1), '추적 OFF · 16–18/20');
+  assert.equal(frame.plain.at(-1), 'Follow OFF · 16–18/20');
 });
 
 test('the lower row splits 86 columns into the measured 28 | 28 | 30', () => {

@@ -134,10 +134,11 @@ function durationText(task, timing, status, language) {
   const duration = task ? elapsedTime(task, timing, status) : null;
   return duration ? `${timeMark} ${compactDuration(language, duration.split(':').reduce((total, part) => total * 60 + Number(part), 0) * 1000)}` : '';
 }
-// Title row: status icon, node label, task description (shrinks first) and elapsed time; only the selected title is bold.
-function nodeTitle(node, task, language, timing, room, color, selected) {
+// Title row: status icon, node label, a dependency hint or else the task description (shrinks first) and elapsed
+// time; only the selected title is bold.
+function nodeTitle(node, task, language, timing, room, color, selected, hint = '') {
   const status = node.state;
-  const label = clean(node.label ?? node.id), description = clean(task?.description ?? '');
+  const label = clean(node.label ?? node.id), description = hint || clean(task?.description ?? '');
   const time = durationText(task, timing, status, language);
   const head = `${statusIcon(status, timing.frame)} ${label}`;
   const tail = time ? [{ text: ` · ${time}`, color: status === 'running' ? roleColors.time : roleColors.counts }] : [];
@@ -234,6 +235,40 @@ export function laneLines(run, columns, color = true, language = 'en', { selecte
   }
   return { rows: out, ranges };
 }
+// The DAG pane draws a run as a stage list: the stage header rows of the lane graph, and under each one its
+// nodes listed one per row behind a single tree mark (├, └ for the last), so the left margin stays one cell
+// however many nodes run in parallel (23 parallel nodes took 45 cells of lanes). A node fed by only part of
+// the previous stage names its first parent (← a +2). Open nodes keep the bar card and dotted parting row.
+export function stageLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 } } = {}) {
+  const out = [], ranges = Object.create(null);
+  const steps = layers(run, language);
+  const line = text => paint(text, dim, color);
+  const labels = new Map(run.nodes.map(node => [node.id, node.label ?? node.id]));
+  steps.forEach((step, index) => {
+    const active = step.some(node => node.state === 'running');
+    const label = t(language, 'stage', { index: index + 1 }) + ` ${step.filter(node => node.state === 'completed').length}/${step.length}`;
+    out.push(`${line('─ ')}${paint(label, active ? roleColors.time : dim, color, active)}${line(` ${'─'.repeat(Math.max(0, columns - width(label) - 3))}`)}`);
+    const previous = new Set(index ? steps[index - 1].map(node => node.id) : []);
+    let cardOpen = false;
+    step.forEach((node, at) => {
+      const last = at === step.length - 1, open = isExpanded(viewState, run.id, node.id, node.state);
+      const bar = open ? paint('▌', colors[node.state], color) : ' ';
+      const parents = run.edges.filter(edge => edge.to === node.id).map(edge => edge.from);
+      const whole = parents.length === previous.size && parents.every(id => previous.has(id));
+      const hint = parents.length && !whole ? `← ${clean(labels.get(parents[0]))}${parents.length > 1 ? ` +${parents.length - 1}` : ''}` : '';
+      if (cardOpen) out.push(`${line('│')} ${line('┈'.repeat(Math.max(0, columns - 2)))}`);
+      cardOpen = open;
+      const start = out.length, task = tasks.find(task => task.id === node.taskId);
+      out.push(`${line(last ? '└' : '├')}${bar}${nodeTitle(node, task, language, timing, columns - 2, color, node.id === selectedNodeId, hint)}`);
+      // An open node's card rows are the worker pane's card rows under the title, subtasks included.
+      const detail = open && task ? [...compactTaskLines(task, language, timing, columns, { node, color, room: columns - 2, titleRow: false }).slice(1),
+        ...descendantLines(task, tasks, language, timing, columns + 2, color)] : [];
+      for (const row of detail) out.push(`${line(last ? ' ' : '│')}${bar}${row}`);
+      ranges[node.id] = { start, end: out.length };
+    });
+  });
+  return { rows: out, ranges };
+}
 
 // Continuation rows keep the hanging indent; the wrap mark sits inside it when it fits.
 const wrapLead = prefix => {
@@ -275,6 +310,13 @@ function elapsedTime(task, { now, connected, updatedAt }, status) {
 }
 
 const measured = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+// Tokens per second as reported, else derived from the output tokens over the generation time.
+function tokenRate(metrics) {
+  const native = measured(metrics?.tokens_per_second);
+  const derived = Number.isSafeInteger(metrics?.output_tokens) && metrics.output_tokens >= 0 &&
+    measured(metrics?.generation_ms) && metrics.generation_ms > 0;
+  return { native, rate: native ? metrics.tokens_per_second : derived ? metrics.output_tokens * 1000 / metrics.generation_ms : undefined };
+}
 function metricSummary(task, language, showReported = true) {
   const metrics = task?.metrics;
   const quality = metrics?.cost_status;
@@ -284,10 +326,7 @@ function metricSummary(task, language, showReported = true) {
   const cost = knownCost ? `${metrics.cost_usd > 0 && metrics.cost_usd < 0.0001 ?
     '<$0.0001' : `$${metrics.cost_usd.toFixed(4)}`}${badge}` :
     `${t(language, 'cost')}: ${t(language, 'metricUnknown')}`;
-  const native = measured(metrics?.tokens_per_second);
-  const derived = Number.isSafeInteger(metrics?.output_tokens) && metrics.output_tokens >= 0 &&
-    measured(metrics?.generation_ms) && metrics.generation_ms > 0;
-  const rate = native ? metrics.tokens_per_second : derived ? metrics.output_tokens * 1000 / metrics.generation_ms : undefined;
+  const { native, rate } = tokenRate(metrics);
   const speed = measured(rate) ? `${native ? rate : Math.round(rate)} tok/s${native ? '' : ` [${t(language, 'estimated')}]`}` :
     `tok/s: ${t(language, 'metricUnknown')}`;
   return `${cost} · ${speed}`;
@@ -333,7 +372,7 @@ function taskLines(task, language, timing, nodeStatus, columns) {
   return lines;
 }
 
-function compactTaskLines(task, language, timing, columns, { selected = false, node, depth = 0, collapsed = false, color = false, room: roomOverride } = {}) {
+function compactTaskLines(task, language, timing, columns, { selected = false, node, depth = 0, collapsed = false, color = false, room: roomOverride, titleRow = true } = {}) {
   const value = text => text === undefined || text === null || text === '' ? '-' : clean(text);
   const status = node?.state ?? task?.status;
   const duration = task ? elapsedTime(task, timing, status) : null;
@@ -355,15 +394,22 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   // Keep existing role/model wrapping while removing the visible child inset.
   const badge = identity ? `[${fit(identity, Math.max(1, room - depthColumns - 2))}]` : '';
   const modelRoom = room - depthColumns - (badge ? width(badge) + 1 : 0);
-  // If the role badge would crowd out model:effort, the badge keeps its own row and the model follows it.
-  const modelOwnRow = Boolean(task?.model) && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2;
+  // When the role badge and the whole model:effort do not fit on one row, the badge keeps its own row and the
+  // model follows it, so neither is cut short only to share a row.
+  const modelOwnRow = Boolean(task?.model) && Boolean(badge) && width(modelLabel(task)) > modelRoom;
   const metadata = modelOwnRow ? `${indent}${badge}` :
     `${indent}${[badge, task?.model ? modelLabel(task, modelRoom) : ''].filter(Boolean).join(' ')}`;
-  const titleText = `${indent}${depth ? '↳ ' : ''}${statusIcon(status, timing.frame)} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`;
-  // The elapsed time and the turn/tool counts take the card's last row, so neither the title
-  // nor the activity row gives up room to them in a narrow pane.
+  const titleText = `${indent}${depth ? '↳ ' : ''}${statusIcon(status, timing.frame)} ${collapsed ? '▸ ' : ''}${value(task?.description || node?.label)}`;
+  // Three rows: the title with its elapsed time, the role and model, then the speed with the turn and tool
+  // counts. The cost is left to the d detail view.
   const counts = stats.join(' · ');
-  const timeRow = [elapsed, counts].filter(Boolean).join(' · ');
+  const { native, rate } = tokenRate(task?.metrics);
+  // The elapsed time ends the title row unless the title would keep fewer than 10 cells beside it (a narrow
+  // pane or a long time); then it leads the speed row. A DAG node draws its own title row (titleRow false).
+  const timeInTitle = Boolean(elapsed) && room - width(elapsed) - 3 >= Math.min(width(titleText), 10);
+  const timeInStats = Boolean(elapsed) && !timeInTitle && titleRow;
+  const statRow = [timeInStats ? elapsed : '', measured(rate) ? `${native ? rate : Math.round(rate)} tok/s` : '', counts]
+    .filter(Boolean).join(' · ');
   // A healthy card drops its message row; a stall, a retry or a paused task keeps it.
   const live = timing.connected ? activitySummary(task, language, timing.now) : null;
   const alert = live && (live.stalled || task.activity.phase === 'retry') ? live : null;
@@ -372,8 +418,7 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
     titleText,
     metadata,
     `${indent}${held}`,
-    `${indent}${task?.metrics ? metricSummary(task, language, Boolean(node)) : ''}`,
-    `${indent}${timeRow}`,
+    `${indent}${statRow}`,
   ].map((line, index) => {
     const activity = index === 2 ? alert : null;
     if (!activity) return fit(line, room);
@@ -386,10 +431,16 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const modelText = !modelOwnRow && task?.model ? modelLabel(task, modelRoom) : '';
   lines[1] = paintAt(lines[1], indent.length + (badge ? badge.length + 1 : 0), modelText, roleColors.model, color && Boolean(modelText));
   lines[1] = paintAt(lines[1], indent.length, badge, roleColors.badge, color && Boolean(badge));
-  if (color && lines[4].trim()) {
-    const timed = elapsed && lines[4].startsWith(elapsed, indent.length);
-    const rest = lines[4].slice(indent.length + (timed ? elapsed.length : 0));
-    lines[4] = `${indent}${timed ? paint(elapsed, roleColors.time, true) : ''}${rest ? paint(rest, roleColors.counts, true) : ''}`;
+  const timeColor = status === 'running' ? roleColors.time : roleColors.counts;
+  if (color && lines[3].trim()) {
+    const timed = timeInStats && lines[3].startsWith(elapsed, indent.length);
+    const rest = lines[3].slice(indent.length + (timed ? elapsed.length : 0));
+    lines[3] = `${indent}${timed ? paint(elapsed, timeColor, true) : ''}${rest ? paint(rest, roleColors.counts, true) : ''}`;
+  }
+  if (timeInTitle) {
+    const head = fit(titleText, Math.max(1, room - width(elapsed) - 3));
+    lines[0] = color ? `${paint(head, colors[status], true, selected)}${paint(` · ${elapsed}`, timeColor, true)}` :
+      `${head} · ${elapsed}`;
   }
   if (modelOwnRow) {
     const ownModel = modelLabel(task, room - width(indent));
@@ -456,7 +507,8 @@ function detailBox(text, columns, color, status, label) {
 function barCard(lines, columns, color, status, selected = false) {
   const bar = lines.length > 1 ? paint('▌', colors[status], color) : ' ';
   // Rows after the title are already sized to columns - 1 (and may carry a coloured badge).
-  return lines.map((line, index) => `${bar}${index ? line : paint(fit(line, columns - 1), colors[status], color, selected)}`);
+  // A title row that compactTaskLines already coloured (title and elapsed time) keeps its colours.
+  return lines.map((line, index) => `${bar}${index || line.includes('\x1b[') ? line : paint(fit(line, columns - 1), colors[status], color, selected)}`);
 }
 
 function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
@@ -506,7 +558,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   if (tasksView && (roots.length || all.length)) {
     const completed = new Set(completedTasks(state).map(task => task.id));
     if (completed.size) head[0] = headLine(t(language, 'tasks'), rootsDone, roots.length,
-      `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })} · ${t(language, 'completedTasks', { count: completed.size })} ${completedExpanded ? '[-]' : '[+]'}${switchHint}`);
+      `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })} · ${t(language, 'completedTasks', { count: completed.size })} ${completedExpanded ? '▾' : '▸'}${switchHint}`);
     let cards = 0;
     for (const task of roots) {
       const compactCompleted = completed.has(task.id);
@@ -537,7 +589,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
       all.length > 1 && width(prefixed) <= runRoom ? prefixed : `${clean(run.name)}${runTail}`);
     const timing = { now, connected: state?.connected, updatedAt: state?.updatedAt, frame };
     try {
-      const { rows: flow, ranges } = laneLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.tasks ?? [], timing });
+      const { rows: flow, ranges } = stageLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.tasks ?? [], timing });
       const start = body.length;
       body.push(...flow);
       for (const [id, range] of Object.entries(ranges)) graphRanges[id] = nodeRanges[id] = { start: start + range.start, end: start + range.end };
