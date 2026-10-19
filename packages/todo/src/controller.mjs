@@ -380,6 +380,39 @@ export function cachedProcessQuery(query, { ttlMs = SHELL_QUERY_TTL_MS, now = Da
   };
 }
 const nativeShellProcesses = cachedProcessQuery(queryShellProcesses);
+// Herdr list/process-info reads are repeated by layout passes a few times per
+// second, and every uncached call synchronously spawns herdr on Windows. The
+// 1000 ms cache is cleared by the shared process epoch (any pane mutation, a
+// viewer register/close, or a DAG-side bump). Placement guards and final
+// authorizations run inside freshReads so their evidence is always new.
+const HERDR_READ_TTL_MS = 1000;
+const herdrReadVerbs = new Set(['list', 'process-info']);
+const herdrReadOnlyVerbs = new Set(['layout', 'get', 'neighbor']);
+let freshDepth = 0;
+export async function freshReads(job) {
+  freshDepth++;
+  try { return await job(); }
+  finally { freshDepth--; }
+}
+export function herdrRead(query, { ttlMs = HERDR_READ_TTL_MS, now = Date.now } = {}) {
+  const entries = new Map();
+  return async (...args) => {
+    if (!herdrReadVerbs.has(args[0])) {
+      try { return await query(...args); }
+      finally { if (!herdrReadOnlyVerbs.has(args[0])) bumpProcessQueryEpoch(); }
+    }
+    if (freshDepth > 0) return query(...args);
+    const key = args.join('\u0000'), at = now(), epoch = globalThis[PROCESS_QUERY_EPOCH] ?? 0;
+    let entry = entries.get(key);
+    if (!entry || entry.epoch !== epoch || at - entry.at >= ttlMs) {
+      for (const [older, value] of entries) if (value.epoch !== epoch || at - value.at >= ttlMs) entries.delete(older);
+      const created = entry = { at, epoch, promise: query(...args) };
+      entries.set(key, created);
+      created.promise.catch(() => { if (entries.get(key) === created) entries.delete(key); });
+    }
+    return structuredClone(await entry.promise);
+  };
+}
 // An explicit /dashboard only reconciles unresolved operations; it cannot
 // rebuild a blocked actor. Restarting the OmO window releases and re-claims it.
 const managedUnavailable = 'managed controller or lease unavailable; restart this OmO window, then run /dashboard in this tab if the dashboard does not return';
@@ -975,8 +1008,8 @@ export async function canCleanupPane(info, record, inspect) {
 export class TodoPane {
   constructor({ ctx, environment = process.env, stateDir, cwd, node = process.execPath,
     viewer, herdr = createDashboardHerdr(environment), inspectShell, language = 'en', notify = () => {}, managed = false,
-    retirementObservations = new Map(), retireViewer = retireVerifiedViewer }) {
-    Object.assign(this, { ctx, environment, stateDir, cwd, node, viewer, herdr, inspectShell, language, notify, managed, retireViewer });
+    retirementObservations = new Map(), retireViewer = retireVerifiedViewer, cacheReads = false }) {
+    Object.assign(this, { ctx, environment, stateDir, cwd, node, viewer, herdr: cacheReads ? herdrRead(herdr) : herdr, inspectShell, language, notify, managed, retireViewer });
     this.binding = { socketPath: environment.HERDR_SOCKET_PATH, parentPaneId: environment.HERDR_PANE_ID,
       sessionId: ctx.sessionManager.getSessionId() };
     this.binding.ownerKey = displayOwnerKey(this.binding.socketPath, this.binding.parentPaneId, this.binding.sessionId);
@@ -1178,7 +1211,7 @@ export class TodoPane {
     if (!this.managed || type === 'run' || type === 'retire' || type === 'close' && !pass || pass?.explicit) return () => undefined;
     const changed = 'layout-waiting: the dashboard panes changed during this pass; run /dashboard';
     if (type !== 'split' || !this.provider?.authorityEvidence) return () => changed;
-    const evidence = await this.provider.authorityEvidence();
+    const evidence = await freshReads(() => this.provider.authorityEvidence());
     const chat = target?.paneId === this.binding.parentPaneId;
     return () => this.provider.decideAuthority(evidence, { role, chat, claim: this.claim?.layout }) ?? undefined;
   }
@@ -1192,7 +1225,7 @@ export class TodoPane {
     // conditions (todo 7 A2: selection, chat, role identities, the tree it was
     // decided on): gathered here as well, after every actor preparation, and
     // decided in the same synchronous run.
-    const authorize = async () => {
+    const authorize = () => freshReads(async () => {
       let decide, step;
       try { decide = await this.layoutEvidence(role, type, target, pass); step = await check?.(); }
       catch (error) { decide = () => `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
@@ -1202,7 +1235,7 @@ export class TodoPane {
         catch (error) { refusal = `layout-waiting: the dashboard could not be verified (${error.message}); run /dashboard`; }
         if (refusal) throw Object.assign(new Error(refusal), { code: 'LAYOUT_WAIT', noEffect: true });
       };
-    };
+    });
     const result = this.managedWrite(async actor => {
       // Fast path only: the same gate, before the actor prepares anything.
       const refusal = await this.layoutGate(role, type, target, pass);
@@ -1811,7 +1844,7 @@ export class TodoPane {
       const state = await readRoleState(this.stateFile);
       if (!sameControl(message, state?.controlOffer) || message.scopeEpoch !== this.scopeEpoch ||
         !this.recordMatches(record) || record.launchToken !== message.launchToken ||
-        !Number.isSafeInteger(message.pid) || !(await this.verify(record, message.pid))) return socket.destroy();
+        !Number.isSafeInteger(message.pid) || !(await freshReads(() => this.verify(record, message.pid)))) return socket.destroy();
       if (message.scopeEpoch !== this.scopeEpoch) return socket.destroy();
       if (this.managed && message.type === 'register' && this.pendingLaunches.has(message.launchToken))
         this.launchRegistrations.set(message.launchToken, registration);

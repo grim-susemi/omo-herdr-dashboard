@@ -69,7 +69,7 @@ export default function extension(pi, { createController = options => new FixedD
     const current = generation;
     controller = createController({ sessionId: ctx.sessionManager.getSessionId(),
       parentPane: process.env.HERDR_PANE_ID, socket: process.env.HERDR_SOCKET_PATH,
-      stateDir, cwd: pi.cwd, node: () => resolveViewerNode({ language }), viewer, herdr: createHerdr(), language,
+      stateDir, cwd: pi.cwd, node: () => resolveViewerNode({ language }), viewer, herdr: createHerdr(), cacheReads: true, language,
       taskStateDir: process.env.OMO_HERDR_DAG_TASK_STATE_DIR,
       scopeEpoch: todo?.scopeEpoch, managedAvailable, managedStateDir,
       notify: message => ctx.ui.notify(message, 'warning') });

@@ -307,8 +307,8 @@ function missingPane(error) {
 }
 
 export class DagPane {
-  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250 }) {
-    Object.assign(this, { sessionId, parentPane, stateDir, cwd, node, viewer, herdr, notify });
+  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250, read = readJson, write = writeJson, now = () => new Date().toISOString(), cacheReads = false }) {
+    Object.assign(this, { sessionId, parentPane, stateDir, cwd, node, viewer, herdr: cacheReads ? herdrRead(herdr) : herdr, notify, read, write, now });
     this.language = languageOf(language);
     this.key = viewKey(socket, parentPane, sessionId);
     this.stateFile = join(stateDir, `${this.key}.json`);
@@ -322,8 +322,11 @@ export class DagPane {
     this.stopped = false;
     this.tasks = [];
     this.streams = new Map();
-    this.taskData = new TaskData({ cwd, sessionId, stateDir: taskStateDir, notify,
-      onChange: () => { if (!this.stopped) this.enqueue(() => this.save(true)); } });
+    this.stateSignature = undefined;
+    this.lastWrittenState = undefined;
+    this.written = new Map();
+    this.taskData = new TaskData({ cwd, sessionId, stateDir: taskStateDir, notify, read,
+      onChange: names => { if (!this.stopped) this.enqueue(() => this.save(true, 'changed')); } });
   }
 
   // An identical warning is shown once until a job succeeds or the text changes;
@@ -346,7 +349,7 @@ export class DagPane {
     return this.enqueue(async () => {
       // RPC replaces transient runs; durable runs omitted by a snapshot remain recoverable.
       await this.restoreRuns(runs, true);
-      await this.save(true);
+      await this.save(true, 'none');
     });
   }
 
@@ -363,15 +366,14 @@ export class DagPane {
       }
       this.taskData.start();
       await this.restoreRuns();
-      await this.save(true);
+      await this.save(true, 'full');
     });
   }
 
   receiveTasks(payload) {
     if (this.stopped) return Promise.resolve();
     return this.enqueue(async () => {
-      await this.taskData.refresh(this.runs);
-      if (this.taskData.receive(payload)) await this.save(true);
+      if (this.taskData.receive(payload)) await this.save(true, 'none');
     });
   }
 
@@ -394,7 +396,7 @@ export class DagPane {
     this.streamFlush = new Promise(resolve => {
       this.streamTimer = setTimeout(() => {
         this.streamTimer = undefined;
-        this.enqueue(() => this.save(true, false)).then(resolve, resolve);
+        this.enqueue(() => this.save(true, 'none')).then(resolve, resolve);
       }, this.streamDelay);
       this.streamTimer.unref?.();
     });
@@ -431,10 +433,27 @@ export class DagPane {
     this.runs = [...restored.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
-  async save(connected, refresh = true) {
-    if (refresh) this.tasks = await this.taskData.refresh(this.runs);
-    await writeJson(this.stateFile, { version: 1, sessionId: this.sessionId, connected, language: this.language,
-      updatedAt: new Date().toISOString(), runs: this.runs, tasks: this.withStreams(this.tasks, connected) });
+  async writeChanged(path, value) {
+    const serialized = JSON.stringify(value);
+    if (this.written.get(path) === serialized) {
+      try { await stat(path); return; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    await this.write(path, value);
+    this.written.set(path, serialized);
+  }
+
+  async save(connected, mode = 'full') {
+    if (mode === 'full') this.tasks = await this.taskData.refresh(this.runs);
+    else if (mode === 'changed') this.tasks = await this.taskData.refreshChanged();
+    else { await this.taskData.idle(); this.tasks = this.taskData.snapshot(); }
+    await this.taskData.idle();
+    const tasks = this.withStreams(this.tasks, connected);
+    const signature = JSON.stringify([this.runs, tasks, connected, this.language]);
+    if (signature !== this.stateSignature) { this.stateSignature = signature; this.updatedAt = this.now(); }
+    const payload = { version: 1, sessionId: this.sessionId, connected, language: this.language,
+      updatedAt: this.updatedAt, runs: this.runs, tasks };
+    await this.writeChanged(this.stateFile, payload);
     // All callers serialize saves through the queue, including task-only disk changes.
     if (connected && !this.stopped && (this.runs.length || this.tasks.length)) await this.ensure(false);
   }
@@ -449,7 +468,7 @@ export class DagPane {
         }
       }
       await this.restoreRuns();
-      await this.save(true);
+      await this.save(true, 'full');
       return this.ensure(true);
     });
   }
@@ -517,7 +536,7 @@ export class DagPane {
     clearTimeout(this.streamTimer);
     this.streams.clear();
     this.taskData.stop();
-    return this.enqueue(() => this.save(false));
+    return this.enqueue(() => this.save(false, 'none'));
   }
 }
 
@@ -662,6 +681,39 @@ export function cachedProcessQuery(query, { ttlMs = SHELL_QUERY_TTL_MS, now = Da
       const created = entry = { at, epoch, promise: query(pid) };
       entries.set(pid, created);
       created.promise.catch(() => { if (entries.get(pid) === created) entries.delete(pid); });
+    }
+    return structuredClone(await entry.promise);
+  };
+}
+// Herdr list/process-info reads are repeated by layout passes a few times per
+// second, and every uncached call synchronously spawns herdr on Windows. The
+// 1000 ms cache is cleared by the shared process epoch (any pane mutation, a
+// viewer register/close, or a Todo-side bump). Placement guards and final
+// authorizations run inside freshReads so their evidence is always new.
+const HERDR_READ_TTL_MS = 1000;
+const herdrReadVerbs = new Set(['list', 'process-info']);
+const herdrReadOnlyVerbs = new Set(['layout', 'get', 'neighbor']);
+let freshDepth = 0;
+export async function freshReads(job) {
+  freshDepth++;
+  try { return await job(); }
+  finally { freshDepth--; }
+}
+export function herdrRead(query, { ttlMs = HERDR_READ_TTL_MS, now = Date.now } = {}) {
+  const entries = new Map();
+  return async (...args) => {
+    if (!herdrReadVerbs.has(args[0])) {
+      try { return await query(...args); }
+      finally { if (!herdrReadOnlyVerbs.has(args[0])) bumpProcessQueryEpoch(); }
+    }
+    if (freshDepth > 0) return query(...args);
+    const key = args.join('\u0000'), at = now(), epoch = globalThis[PROCESS_QUERY_EPOCH] ?? 0;
+    let entry = entries.get(key);
+    if (!entry || entry.epoch !== epoch || at - entry.at >= ttlMs) {
+      for (const [older, value] of entries) if (value.epoch !== epoch || at - value.at >= ttlMs) entries.delete(older);
+      const created = entry = { at, epoch, promise: query(...args) };
+      entries.set(key, created);
+      created.promise.catch(() => { if (entries.get(key) === created) entries.delete(key); });
     }
     return structuredClone(await entry.promise);
   };
@@ -815,7 +867,7 @@ export class FixedDagPane extends DagPane {
         }
         this.taskData.start();
         await this.restoreRuns();
-        await this.save(true);
+        await this.save(true, 'full');
         if (!this.stopped) { this.sourceSaved(); this.status = 'layout-waiting'; }
       } catch (error) { this.sourceRejected(error); throw error; }
     });
@@ -835,13 +887,16 @@ export class FixedDagPane extends DagPane {
       this.control.once('error', reject); this.control.once('listening', resolve); this.control.listen(this.controlPath);
     });
   }
-  async save(connected, refresh = true) {
-    if (refresh) this.tasks = await this.taskData.refresh(this.runs);
+  async save(connected, mode = 'full') {
+    if (mode === 'full') this.tasks = await this.taskData.refresh(this.runs);
+    else if (mode === 'changed') this.tasks = await this.taskData.refreshChanged();
+    else { await this.taskData.idle(); this.tasks = this.taskData.snapshot(); }
+    await this.taskData.idle();
     if (this.stopped && connected) return;
     const signature = JSON.stringify([this.runs, this.tasks, connected]);
     const changed = signature !== this.sourceSignature;
-    if (changed) this.updatedAt = new Date().toISOString();
-    await writeJson(this.stateFile, { version: 1, ...this.binding, scopeEpoch: this.scopeEpoch,
+    if (changed) this.updatedAt = this.now();
+    await this.writeChanged(this.stateFile, { version: 1, ...this.binding, scopeEpoch: this.scopeEpoch,
       connected, language: this.language, updatedAt: this.updatedAt, runs: this.runs, tasks: this.tasks });
     await this.roleWrite(async () => {
       for (const [role, record] of this.records) {
@@ -850,8 +905,8 @@ export class FixedDagPane extends DagPane {
           const current = { ...record, scopeEpoch: this.scopeEpoch,
             manualClose: persisted?.launchToken === record.launchToken ? persisted.manualClose : record.manualClose };
           this.records.set(role, current);
-          await writeJson(this.paneFile(role), current);
-          await writeJson(this.roleFile(role), this.roleState(current, connected));
+          await this.writeChanged(this.paneFile(role), current);
+          await this.writeChanged(this.roleFile(role), this.roleState(current, connected));
         }
       }
     });
@@ -952,7 +1007,7 @@ export class FixedDagPane extends DagPane {
     const state = await readJson(this.roleFile(role));
     if (!sameControl(message, state?.controlOffer) || message.scopeEpoch !== this.scopeEpoch ||
       !this.recordMatches(record, role) || record.launchToken !== message.launchToken ||
-      !Number.isSafeInteger(message.pid) || !(await this.verify(record, message.pid))) return socket.destroy();
+      !Number.isSafeInteger(message.pid) || !(await freshReads(() => this.verify(record, message.pid)))) return socket.destroy();
     const registration = this.roleWrite(async () => {
       const current = await readJson(this.paneFile(role));
       if (current.launchToken !== record.launchToken || current.scopeEpoch !== message.scopeEpoch ||
@@ -1009,7 +1064,7 @@ export class FixedDagPane extends DagPane {
         if (epoch) this.scopeEpoch = epoch;
         this.offers = { ...offers };
       });
-      await this.save(true, false);
+      await this.save(true, 'none');
     });
   }
   async inspectPair() {
@@ -1096,7 +1151,7 @@ export class FixedDagPane extends DagPane {
           this.offers = offers;
         });
       }
-      await this.save(true, false);
+      await this.save(true, 'none');
       const parent = await this.membership(this.parentPane);
       if (claim && claim.tabId !== parent.tabId) return {};
       this.claim = claim ?? { ...this.binding, tabId: parent.tabId, lifetimeId: this.lifetimeId };
@@ -1209,8 +1264,10 @@ export class FixedDagPane extends DagPane {
   // current geometry is read first and the region evidence last, so a change
   // made while the geometry is read is seen. decideAuthority is phase (b).
   async authorityEvidence() {
-    const panes = await this.herdr('layout', '--pane', this.parentPane).then(result => result?.layout?.panes, () => undefined); const region = await this.regionEvidence({ explicit: false });
-    return { panes, region };
+    return freshReads(async () => {
+      const panes = await this.herdr('layout', '--pane', this.parentPane).then(result => result?.layout?.panes, () => undefined); const region = await this.regionEvidence({ explicit: false });
+      return { panes, region };
+    });
   }
   // Phase (b): synchronous, over that one snapshot; refusal text or null. FRESH
   // allows only Todo's chat split, within the 118x22 fresh minimum; INHERITED
@@ -1641,7 +1698,7 @@ export class FixedDagPane extends DagPane {
         return roots.length === 1 && roots[0].direction === 'right' && chat?.length === 1 &&
           Math.fround(roots[0].ratio) === Math.fround(share) && sameRect(childRects(current.area, 'right', roots[0].ratio)[0], chat[0].rect);
       };
-      const guard = async expected => {
+      const guard = expected => freshReads(async () => {
         if (this.stopped || await this.placementFocus(tabId, todo.paneId) !== selected)
           throw new Error('layout-waiting: input selection changed during placement');
         if (!await this.verify(pair.dag) || !await this.verify(pair.workers) ||
@@ -1659,12 +1716,12 @@ export class FixedDagPane extends DagPane {
           mapLeaves(expected, leaf => leaf.pane === temporaryLeaf ? { pane: temporaryPaneId } : leaf)))
           throw new Error('layout-waiting: the dashboard panes changed during placement');
         return current;
-      };
+      });
       // A2: the same conditions again inside the actor's final authorization,
       // after every asynchronous preparation (custody, journal, target reads):
       // every await here, then a synchronous decision over that snapshot. The
       // native tree must still be the one the step was decided on.
-      const stepCheck = expected => async () => {
+      const stepCheck = expected => () => freshReads(async () => {
         const settled = job => job().then(value => ({ value }), error => ({ error }));
         const focus = await settled(() => this.placementFocus(tabId, todo.paneId));
         const dag = await settled(() => this.verify(pair.dag)), workers = await settled(() => this.verify(pair.workers));
@@ -1678,7 +1735,7 @@ export class FixedDagPane extends DagPane {
           if (share !== undefined && !chatKept(current.value)) return 'layout-waiting: the chat pane changed during placement';
           if (!sameLayout(current.value, expected)) return 'layout-waiting: the dashboard panes changed during placement';
         };
-      };
+      });
       // One allowlisted blocked-diagnostics entry per placement wait (todo 8).
       const diagnosePlacement = code => this.coordinator.actor?.diagnose?.('placement', { code }, { role: 'dag' });
       // `phases` are the trees before the split, the swap and the close, and after the
@@ -2037,7 +2094,7 @@ export class FixedDagPane extends DagPane {
       // A2: at the final authorization the step's pane still has the focus and
       // the tree is the one this direction was read from.
       const pane = source;
-      const check = async () => {
+      const check = () => freshReads(async () => {
         const settled = job => job().then(value => ({ value }), error => ({ error }));
         const list = await settled(() => this.herdr('list')), current = await settled(() => this.herdr('layout', '--pane', pane));
         return () => {
@@ -2048,7 +2105,7 @@ export class FixedDagPane extends DagPane {
             return 'layout-waiting: input selection changed during placement';
           if (!sameLayout(current.value?.layout, layout)) return 'layout-waiting: the dashboard panes changed during placement';
         };
-      };
+      });
       await this.mutate('dag', 'arrange', source, ['focus', '--pane', source, '--direction', direction], undefined, check);
       source = next;
     }
@@ -2065,7 +2122,7 @@ export class FixedDagPane extends DagPane {
         this.scopeEpoch++;
         this.offers = {};
       });
-      await this.save(true, false);
+      await this.save(true, 'none');
     });
   }
   async stop() {
@@ -2087,7 +2144,7 @@ export class FixedDagPane extends DagPane {
       if (!this.managedAvailable || ownedClaim &&
         await coordinator.terminalAuthority('dag', this.lifetimeId,
           [...this.records.values()].filter(record => record.paneId && !record.manualClose)))
-        await this.save(false, false);
+        await this.save(false, 'none');
     }
     catch (error) { failure = error; }
     finally {

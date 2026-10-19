@@ -22,7 +22,7 @@ export default function extension(pi, { createController } = {}) {
   };
   const stateDir = process.env.OMO_HERDR_TODO_STATE_DIR ?? join(homedir(), '.omo', 'agent', 'herdr-todo');
   const service = registerManagedDashboard(pi, { stateDir,
-    createController: createController ?? (ctx => new TodoPane({ ctx, cwd: pi.cwd, stateDir, managed: true,
+    createController: createController ?? (ctx => new TodoPane({ ctx, cwd: pi.cwd, stateDir, managed: true, cacheReads: true,
       viewer: join(dirname(fileURLToPath(import.meta.url)), 'src/viewer.mjs'),
       node: () => resolveDashboardNode(),
       language: installedLanguage(),
