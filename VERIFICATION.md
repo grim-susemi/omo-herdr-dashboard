@@ -1,5 +1,69 @@
 # Current dashboard verification
 
+## 2026-10-20 Todo continuation inset (generation 29)
+
+One Todo renderer change shipped. When a task line wraps, the separator space at
+the wrap boundary is consumed with the completed line instead of starting the
+next line, so every continuation begins at the four-cell task text inset. Task
+content, status marks, selection weight and all other wrapping rules are
+unchanged. The source change is commit 6432bc0 (`packages/todo/src/render.mjs`
+`wrap`, plus the regression test in `packages/todo/test/render.test.mjs`).
+
+Origin: the final fidelity review (F4) found the T4 fixture continuation at width
+28 starting at cell 5 (`F4-IS1-CONTINUATION`); plan row 15 authorized this single
+wrap-edge correction. An independent gate reviewer passed row 15: the focused
+test went from the recorded red (`5 !== 4`) to green, and all 14 continuations
+across the six Todo frames at widths 28/40/80 start at cell 4.
+
+The comparator against the d399730 baseline reports 0 new failures, 0 removed
+tests, 0 new timeouts and no flaky keys. Buckets: root 749 pass/11 fail, dag
+220/44, todo unit 33/0, todo 123/21, coordination 14/0; the 55-file inventory has
+two not-covered host tests. The pre-existing 11 root, 44 dag and 21 todo failures
+remain disclosed and are not new. The candidate manifest has 42 pairs equal
+(dist and sources), and only `dist/todo/src/render.mjs` differs from the
+generation-28 candidate. Of 22 captured frames, 20 are byte-identical; only
+`todo-28-color` and `todo-28-plain` changed, each on one continuation line, by
+exactly one leading space.
+
+Owner decision #241=A (2026-10-19T17:21:54.648Z, "설치(새 대화창부터, 세대 28은
+보존)") approved installation. The dry run reported generation-000029 with
+generation-000028 as backup and no legacy wrappers; the install exited 0 with
+`installed: true`. The post-install preservation compare found 0 drift: the 804
+CUTOVER paths and every pre-existing generation kept their bytes (generations 25,
+26, 27 and 28 each 46 files); only the wrapper, current.json and the new
+generation-000029 folder changed. settings.json and models.json hashes were
+unchanged during the install (settings.json's mtime was already 17:17:59Z when
+the pre snapshot was taken). All 41 installed runtime files match
+`E/task-15/candidate-manifest.json`, each locale.json is `{"language":"ko"}`,
+and a fresh Node process imported generation 000029's `extension.mjs` with exit
+0. The altered-hash QA on a copy of the pre snapshot reported exactly 1 drift and
+exit 1 without touching the real files. The installed viewer rendered the T4 Todo
+fixture at width 28 with all four continuation rows starting at cell 4, the
+installed worker list still shows `▌[deep-low] …`, and generation 29's
+coordination files are byte-equal to generation 28's. An owned `--no-focus` tab
+ran the installed Todo viewer at 170 columns, showed the fixture and footer with
+no `>` column, `--once` exited 0, and the tab was closed; the owner's two tabs
+were unchanged before and after.
+
+Rollback: copy `E/task-15-install/rollback/omo-herdr-dashboard.js` back to
+`C:/Users/USER/.omo-stable-500/home/.omo/agent/extensions/omo-herdr-dashboard.js`
+and `E/task-15-install/rollback/current.json` back to
+`C:/Users/USER/.omo-stable-500/home/.omo/agent/herdr-dashboard/integration/current.json`
+byte-for-byte; that points at generation 000028 again. Do not rerun the installer
+to roll back, because it would create generation 000030. Existing conversations
+keep their loaded generation; this generation applies from a new conversation or
+a deliberate `/reload`.
+
+Limits: the 11 root, 44 dag and 21 todo baseline failures remain and are not
+fixed here. The width-28 continuation proof used the installed viewer in a
+non-TTY stream (plain, no colour); the real pane was 170 columns, where the T4
+line does not wrap, so continuation placement was not observable there. The
+installed generation was exercised only in the Todo view; worker and DAG views
+rest on the candidate captures and the worker-shape stdout check. Coordination
+behaviour is unchanged from generation 28.
+
+Korean summary: Todo 작업 줄이 줄바꿈될 때 이어지는 줄이 모두 4칸 들여쓰기에서 시작합니다. 세대 29를 설치했고 25·26·27·28은 그대로 보존했습니다. 기존 테스트 실패는 위에 적은 그대로입니다.
+
 ## 2026-10-19 marker-free rows and four-row worker cards (generation 28)
 
 Four changes shipped together. The reserved `>` marker column is gone from worker
