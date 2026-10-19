@@ -11,6 +11,16 @@ rows and keep a message/activity row only while stalled, retrying or paused. Bot
 process-query copies reject a non-positive/non-integer PID without launching
 PowerShell, re-query one empty stdout once, and fail closed if it stays empty.
 
+Provenance: conversation 01a154b7 installed generation 000027 at 2026-10-20
+00:31:53 KST under owner decision #231 A ("세션별로 고침 (대시보드 새 세대)").
+Generation 27 is generation 26 plus the coordination per-session flow fix (commit
+b5a2d7e on work/coord-session-flow). Owner decision #235 A ("합친 뒤 설치") ordered
+that fix merged before this install; plan row 14 cherry-picked it as 46f2d1a, and its
+coordination runtime files equal generation 27's when line endings are ignored.
+Generation 28 therefore contains plan rows 1-14 (including row 13, 64c6c22, from
+owner reply #230). It was installed under owner decision #239 A, with generation
+000027 as the backup and rollback target.
+
 The comparator against the d399730 baseline reports 0 new failures, 0 removed
 tests, 0 new timeouts and no flaky keys (the two baseline runs were identical).
 After this generation the buckets are root 749 pass/11 fail, dag 220/44, todo unit
