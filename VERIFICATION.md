@@ -1,5 +1,36 @@
 # Current dashboard verification
 
+## 2026-10-20 collaboration pane in the shared grammar (generation 31)
+
+The source change is commit 6e74414 on `work/dag-stage-list` (`packages/coordination/src/render.mjs`,
+`i18n.mjs` and the pane tests). The header is `Collab [done/total]` with a `×n · wait n` summary,
+the flow is a `─ Flow n ───` section of cards (an ask carries its reply on a `↳` row; a waiting
+ask has the running bar, spinner and elapsed time), the advisor is a `─ Advisor ● on HH:MM ───`
+section with one counts row, and the footer is `Follow ON · LIVE` or the link state; while scrolled
+it names the cards shown. The connection and baseline rows are gone, one-cell marks replace the
+emoji, and the header warns only when a card failed. Origin: owner decision #267=A (mockup A) and
+#269=A (commit, then install generation 31).
+
+Tests: coordination 14/0 and root 751/11 (the same 11 as before, no new failure). The build and
+`scripts/verify-package.mjs` exited 0, and the built renderer draws the mockup A frames byte for
+byte. The dry run reported generation-000031 with generation-000030 as backup and no legacy
+wrappers; the install exited 0 with `installed: true`. Generations 29 and 30 kept their bytes, the
+settings.json and models.json hashes did not change, all 41 runtime files equal the candidate
+dist, each locale.json is `{"language":"ko"}`, and a fresh Node process imported generation 31's
+`extension.mjs`. An owned `--no-focus` Herdr tab ran the installed collaboration viewer with
+`--once` at 26x28 on a fixture and showed the new header, flow cards, advisor section and footer;
+the tab was closed.
+
+Rollback: copy `install-rollback-31/omo-herdr-dashboard.js` and `install-rollback-31/current.json`
+from the evidence folder `기타 작업/.omo/evidence/dag-stage-list/` back over the wrapper and
+`herdr-dashboard/integration/current.json`; that points at generation 000030 again. Generation 31
+applies from a new conversation or a deliberate `/reload`.
+
+Limits: the live check used a fixture, not a real coordination session. The empty worker and DAG
+screens still carry Korean DAG wording (`DAG 대기 중`), left for a later round.
+
+Korean summary: 협업판을 다른 판과 같은 머리줄·구획·카드·바닥줄 규칙으로 바꿨습니다. 세대 31을 설치했고 29·30은 그대로 보존했습니다.
+
 ## 2026-10-20 stage list, shared three-row cards and English labels (generation 30)
 
 The source change is commit d9b131d on `work/dag-stage-list`. The DAG pane now lists each stage
