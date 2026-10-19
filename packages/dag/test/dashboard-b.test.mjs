@@ -439,3 +439,49 @@ test('consecutive worker cards and DAG detail cards are not separated by blank r
   assert.equal(dag.nodeRanges.two.start, dag.nodeRanges.one.end);
   assert.equal(dag.text.split('\n')[dag.bodyStart + dag.nodeRanges.one.start - 1], messages.en.details);
 });
+
+test('every row of a bar card starts right after the bar at every depth', () => {
+  const metrics = { tokens_per_second: 212, cost_usd: 0.0421, cost_status: 'reported' };
+  const tasks = [
+    { id: 'root', status: 'running', description: 'ROOT', agent: 'deep-low', model: 'gpt-6.1-sol',
+      reasoningEffort: 'medium', turns: 4, toolCalls: 7, metrics },
+    { id: 'child', parentTaskId: 'root', status: 'running', description: 'CHILD', agent: 'deep-low',
+      model: 'gpt-6.1-sol', reasoningEffort: 'medium', metrics },
+    { id: 'grand', parentTaskId: 'child', status: 'running', description: 'GRAND' },
+  ];
+  const run = { id: 'run', name: 'RUN', status: 'running', edges: [],
+    nodes: [{ id: 'node', label: 'NODE', state: 'running', taskId: 'root' }] };
+  const cardLines = (frame, range) => frame.text.split('\n')
+    .slice(frame.bodyStart + range.start - frame.scroll, frame.bodyStart + range.end - frame.scroll)
+    .map(stripVTControlCharacters);
+  const assertFlush = (lines, label) => {
+    for (const line of lines) {
+      const bar = line.indexOf('▌');
+      assert.ok(bar >= 0, `${label}: no bar in ${JSON.stringify(line)}`);
+      assert.notEqual(line[bar + 1], ' ', `${label}: indent after bar in ${JSON.stringify(line)}`);
+    }
+  };
+  for (const columns of [28, 40, 80]) for (const color of [false, true]) {
+    const workers = renderFrame({ connected: true, runs: [], tasks },
+      { columns, rows: 120, color, frame: 0, now: 0, selectedTaskId: 'root' });
+    const card = cardLines(workers, workers.taskRanges.root);
+    const divider = card.find(line => line.includes(t('en', 'subtasksCount', { count: 2 })));
+    const childTitle = card.find(line => line.includes('↳'));
+    assert.ok(divider && childTitle, `${columns} ${color}: divider and child title`);
+    assert.equal(divider.indexOf('─'), divider.indexOf('▌') + 1, `${columns} ${color}: divider follows the bar`);
+    assert.equal(childTitle.indexOf('↳'), childTitle.indexOf('▌') + 1, `${columns} ${color}: child follows the bar`);
+    assertFlush(card, `workers ${columns} ${color}`);
+    assert.doesNotMatch(card.join('\n'), /▌ +[^ ]/, `${columns} ${color}: no body indent`);
+    for (const line of workers.text.split('\n')) assert.ok(width(line) <= columns - 1, `${columns} ${color}: ${line}`);
+
+    const dag = renderFrame({ connected: true, runs: [run], tasks },
+      { columns, rows: 120, color, frame: 0, now: 0, view: 'dag', selectedNodeId: 'node' });
+    const dagCard = cardLines(dag, dag.nodeRanges.node);
+    assert.ok(dagCard.length > 1, `${columns} ${color}: DAG card rows`);
+    assert.equal(dagCard[0].indexOf('⠋'), dagCard[0].indexOf('▌') + 1, `${columns} ${color}: DAG title follows the bar`);
+    const badge = dagCard.find(line => line.includes('[deep-low]'));
+    assert.ok(badge, `${columns} ${color}: DAG badge row`);
+    assert.equal(badge.indexOf('['), badge.indexOf('▌') + 1, `${columns} ${color}: DAG badge follows the bar`);
+    assertFlush(dagCard, `dag ${columns} ${color}`);
+  }
+});

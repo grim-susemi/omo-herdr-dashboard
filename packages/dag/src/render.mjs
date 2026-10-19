@@ -217,7 +217,7 @@ export function laneLines(run, columns, color = true, language = 'en', { selecte
     const kids = run.edges.filter(edge => edge.from === node.id).map(edge => edge.to);
     if (open) {
       const under = laneCells(own, kids.length ? line('│') : ' ');
-      for (const row of nodeDetail(task, tasks, language, timing, room - 3, color)) push(`${under} ${bar}   ${row}`);
+      for (const row of nodeDetail(task, tasks, language, timing, room, color)) push(`${under} ${bar}${row}`);
       cardOpen = true;
     }
     lanes[own] = kids[0] ?? null;
@@ -455,16 +455,16 @@ function detailBox(text, columns, color, status, label) {
 // A compact card trades the box for a status-coloured bar: only the selected card's title row is bold, a one-row card has no bar, and only the verbose inspection keeps its box.
 function barCard(lines, columns, color, status, selected = false) {
   const bar = lines.length > 1 ? paint('▌', colors[status], color) : ' ';
-  // Rows after the title are already sized to columns - 3 (and may carry a coloured badge).
-  return lines.map((line, index) => `${bar}${index ? `  ${line}` : paint(fit(line, columns - 1), colors[status], color, selected)}`);
+  // Rows after the title are already sized to columns - 1 (and may carry a coloured badge).
+  return lines.map((line, index) => `${bar}${index ? line : paint(fit(line, columns - 1), colors[status], color, selected)}`);
 }
 
 function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
   const detailed = selected && verbose;
   const status = node?.state ?? task?.status;
   if (!detailed) {
-    const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded, color, room: columns - 3 });
-    const text = expanded ? [...compact, ...descendantLines(task, tasks, language, timing, columns + 1, color)] : compact.slice(0, 1);
+    const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded, color, room: columns - 1 });
+    const text = expanded ? [...compact, ...descendantLines(task, tasks, language, timing, columns + 3, color)] : compact.slice(0, 1);
     return barCard(compactCompleted && !expanded ? compact.slice(0, 1) : text, columns, color, status, selected);
   }
   const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: false, color });
