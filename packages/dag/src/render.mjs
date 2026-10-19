@@ -544,10 +544,12 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const dagRole = fixed && view === 'dag';
   const tasksView = view === 'tasks' || !all.length && !dagRole;
   // One header row "name [done/total]  summary" under which a divider runs, the same shape as the Todo pane.
+  // The header and footer rows sit one column in from the pane edge, as in every pane.
+  const inset = columns > 1 ? ' ' : '', room = columns - inset.length;
   const headLine = (name, done, total, detail) => {
-    const tally = `[${done}/${total}]`, rest = columns - width(`${name} ${tally}`) - 2;
-    if (rest < 0) return paint(fit(`${name} ${tally}`, columns), accent, color, true);
-    return `${paint(name, accent, color, true)} ${paint(tally, roleColors.time, color, true)}${rest >= 2 && detail ? `  ${paint(fit(detail, rest), dim, color)}` : ''}`;
+    const tally = `[${done}/${total}]`, rest = room - width(`${name} ${tally}`) - 2;
+    if (rest < 0) return inset + paint(fit(`${name} ${tally}`, room), accent, color, true);
+    return `${inset}${paint(name, accent, color, true)} ${paint(tally, roleColors.time, color, true)}${rest >= 2 && detail ? `  ${paint(fit(detail, rest), dim, color)}` : ''}`;
   };
   const rootsDone = roots.filter(task => task.status === 'completed').length;
   // The standalone viewer switches views with t, so it names the other view's count; a fixed role pane does not.
@@ -650,7 +652,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     ...(error ? [paint(fit(t(language, offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: clean(error) }), columns), colors.error, color)] : []),
     ...(notice ? [paint(fit(notice, columns), colors.paused, color)] : []),
     separator(columns, color),
-    paint(fit(status, columns), live ? accent : colors.paused, color),
+    inset + paint(fit(status, room), live ? accent : colors.paused, color),
   ];
   return { text: [...head, ...visible, ...foot].slice(0, rows).join('\n'), scroll: start,
     bodyStart: head.length, bodyRows: available, nodeRanges, taskRanges, graphRanges };

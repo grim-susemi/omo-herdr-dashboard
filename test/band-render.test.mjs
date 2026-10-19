@@ -32,7 +32,8 @@ function assertTodo(pane, language, label) {
   assert.ok(lines[frame.bodyStart + range.start - frame.scroll].startsWith(`[•] ${lead}`), `${label}: target row`);
   assert.ok(frame.lines[frame.bodyStart + range.start - frame.scroll].startsWith('\x1b[1;36m[•] '), `${label}: bold target row`);
   const footer = lines.at(-1);
-  assert.ok(['followOn', 'followShortOn'].some(key => footer.startsWith(todoText(language, key))) &&
+  // The footer sits one column in from the pane edge.
+  assert.ok(['followOn', 'followShortOn'].some(key => footer.startsWith(` ${todoText(language, key)}`)) &&
     footer.includes(todoText(language, 'current')), `${label}: footer ${footer}`);
 }
 
@@ -52,7 +53,7 @@ function assertRole(role, pane, language, label) {
   // Follow and live state; below 40 usable columns (the last cell stays free) in the narrow form.
   const narrow = pane.columns - 1 < 40;
   const footer = lines.at(-1);
-  assert.ok(footer.startsWith(`${dagText(language, narrow ? 'followShortOn' : 'followOn')} · ${dagText(language, 'liveShort')}`),
+  assert.ok(footer.startsWith(` ${dagText(language, narrow ? 'followShortOn' : 'followOn')} · ${dagText(language, 'liveShort')}`),
     `${label}: footer ${footer}`);
   return lines;
 }
@@ -87,6 +88,6 @@ test('a workers pane narrower than minWorkersColumns renders the narrow fallback
   for (const terminal of TERMINALS) for (const language of LANGUAGES) {
     const pane = { columns, rows: freshPanes(terminal).workers.rows };
     const lines = assertRole('workers', pane, language, `workers ${size(pane)} ${language}`);
-    assert.ok(lines.at(-1).startsWith(dagText(language, 'followShortOn')), `workers ${size(pane)} ${language}: narrow footer`);
+    assert.ok(lines.at(-1).startsWith(` ${dagText(language, 'followShortOn')}`), `workers ${size(pane)} ${language}: narrow footer`);
   }
 });

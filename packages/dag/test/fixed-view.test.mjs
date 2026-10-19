@@ -128,8 +128,9 @@ test('empty worker and DAG panes name their own role and share the coloured head
       // The worker pane no longer borrows the DAG wording, and neither pane keeps Korean chrome.
       if (view === 'tasks') assert.doesNotMatch(plain, /DAG/);
       assert.doesNotMatch(plain, /[\uac00-\ud7a3]/);
-      assert.ok(lines[0].startsWith(`\x1b[1;36m${name}\x1b[0m`), lines[0]);
-      assert.equal(lines.at(-1), connected ? '\x1b[36mFollow ON · LIVE\x1b[0m' : '\x1b[33mFollow OFF · OFFLINE\x1b[0m');
+      // Header and footer sit one column in from the pane edge.
+      assert.ok(lines[0].startsWith(` \x1b[1;36m${name}\x1b[0m`), lines[0]);
+      assert.equal(lines.at(-1), connected ? ' \x1b[36mFollow ON · LIVE\x1b[0m' : ' \x1b[33mFollow OFF · OFFLINE\x1b[0m');
       assert.ok(lines.every(row => width(row) < 26));
     }
   }

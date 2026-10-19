@@ -471,7 +471,7 @@ test('worker and DAG cards share three rows, and role and model split onto two w
       assert.ok(frame.text.includes('Follow ON · LIVE'), at);
     }
     if (columns === 54) assert.deepEqual(cards.dag.rows.slice(1), cards.tasks.rows.slice(1), 'the same rows under the title');
-    assert.ok(cards.tasks.frame.text.startsWith('Workers [0/1]  run 1'), cards.tasks.frame.text.split('\n')[0]);
+    assert.ok(cards.tasks.frame.text.startsWith(' Workers [0/1]  run 1'), cards.tasks.frame.text.split('\n')[0]);
   }
 });
 

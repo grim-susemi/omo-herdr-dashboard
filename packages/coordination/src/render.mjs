@@ -103,9 +103,11 @@ export function renderFrame({ status, events = [], advisor }, options = {}) {
   // Header: name and [done/total] as in every pane; a warning colour only when a card failed.
   const summary = [failed ? t(language, 'failed', { count: failed }) : '', pending ? t(language, 'wait', { count: pending }) : '']
     .filter(Boolean).join(' · ');
-  const head = partsLine([{ text: t(language, 'name'), code: failed ? '1;33' : '1;36' },
+  // The header and footer rows sit one column in from the pane edge, as in every pane.
+  const inset = columns > 1 ? ' ' : '', room = columns - inset.length;
+  const head = inset + partsLine([{ text: t(language, 'name'), code: failed ? '1;33' : '1;36' },
     { text: ` [${cards.length - pending}/${cards.length}]`, code: '1;33' },
-    summary && { text: `  ${summary}`, code: failed ? codes.failed : codes.muted }], columns, color);
+    summary && { text: `  ${summary}`, code: failed ? codes.failed : codes.muted }], room, color);
   const top = [head, divider, section(t(language, 'flow', { count: cards.length }), pending > 0)];
   const info = advisor ?? { state: 'none', consults: 0, stops: 0, last: null };
   const advisorState = t(language, info.state === 'on' ? 'advisorOn' : info.state === 'off' ? 'advisorOff' : 'advisorNone');
@@ -127,7 +129,7 @@ export function renderFrame({ status, events = [], advisor }, options = {}) {
   const footer = [t(language, follow ? 'followOn' : 'followOff'), follow || link.state !== 'connected' ? t(language, stateKey[link.state] ?? 'checking') : '',
     position].filter(Boolean).join(' · ');
   const lines = [...top, ...visible.slice(0, height), ...bottom,
-    paint(fit(footer, columns), link.state === 'connected' ? codes.running : codes.time, color)].slice(0, rows);
+    inset + paint(fit(footer, room), link.state === 'connected' ? codes.running : codes.time, color)].slice(0, rows);
   const plain = lines.map(line => stripVTControlCharacters(line));
   return { lines, text: lines.join('\n'), plain, maxOffset, height, total: cards.length, healthy };
 }

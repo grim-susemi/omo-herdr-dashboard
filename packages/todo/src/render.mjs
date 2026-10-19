@@ -205,9 +205,11 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
   const name = `${t(language, 'todo')} [${total.closed}/${total.total}]`;
   const detail = `${t(language, 'completed')}:${total.completed} · ${t(language, 'dropped')}:${total.dropped}`;
   const divider = paint('─'.repeat(columns), 'muted', color);
-  const top = [width(`${name}  ${detail}`) <= columns
+  // The header and footer rows sit one column in from the pane edge, as in every pane.
+  const inset = columns > 1 ? ' ' : '', edge = columns - inset.length;
+  const top = [inset + (width(`${name}  ${detail}`) <= edge
     ? `${paint(t(language, 'todo'), headStyle, color, true)} ${paint(`[${total.closed}/${total.total}]`, 'activePhase', color, true)}  ${paint(detail, 'muted', color)}`
-    : paint(fit(name, columns), headStyle, color, true), divider];
+    : paint(fit(name, edge), headStyle, color, true)), divider];
   const room = rows - top.length - 2 - Number(Boolean(error));
   const askRows = 0, ask = [];
   askScroll = 0;
@@ -231,7 +233,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     follow && live ? 'followOn' : 'followOff')} · ${t(language, source)}`;
   const lines = [...top, ...ask, ...visible,
     ...(error ? [paint(fit(t(language, 'readError', { error: clean(error) }), columns), 'error', color)] : []),
-    divider, paint(fit(footer, columns), live ? 'accent' : 'warning', color)].slice(0, rows);
+    divider, inset + paint(fit(footer, edge), live ? 'accent' : 'warning', color)].slice(0, rows);
   return { text: lines.join('\n'), lines, bodyLines, taskRanges, phaseRanges, scroll, askScroll,
     bodyStart: top.length + ask.length, bodyRows, askRows, closedRange, foldRanges };
 }
