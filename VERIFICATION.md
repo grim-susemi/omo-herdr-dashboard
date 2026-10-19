@@ -1,5 +1,44 @@
 # Current dashboard verification
 
+## 2026-10-20 stage list, shared three-row cards and English labels (generation 30)
+
+The source change is commit d9b131d on `work/dag-stage-list`. The DAG pane now lists each stage
+under its `Step N` header (`├`/`└` marks) instead of one lane per parallel node, which pushed a
+23-node fan-in 45 cells to the right. Worker and DAG cards share `compactTaskLines`: the title
+with its elapsed time, role and model (they split onto two whole rows when both do not fit on one
+row), then tok/s with the turn and tool counts. The cost and the estimated badge stay in the d
+detail view. When the title would keep fewer than 10 cells beside the time, the time moves to the
+front of the speed row. Folded marks are ▸/▾. The Korean locale uses Workers, run/done,
+done/drop/closed, Step N, h/m/s, turns/tools and Follow ON/OFF · LIVE, and the collaboration
+pane footer matches.
+
+Origin: owner decisions #254=A (always list stages), #259 (card rows, wrapping role and model,
+English turns and tools) and #262=C (time and step labels in English too, then commit and install).
+
+Tests against a clean 3172946 worktree baseline: dag 222 pass/44 fail (the same 44), root 751/11
+(no new failure), todo 156/21 (only the dist-dependent command contract differs), coordination
+14/0. New tests cover the stage list and the shared three-row cards with the role and model split.
+The build and `scripts/verify-package.mjs` exited 0.
+
+The dry run reported generation-000030 with generation-000029 as backup and no legacy wrappers.
+The install exited 0 with `installed: true`. Generations 28 and 29 kept their bytes, and the
+settings.json and models.json hashes did not change. All 41 installed runtime files equal the
+candidate dist, each locale.json is `{"language":"ko"}`, and a fresh Node process imported
+generation 30's `extension.mjs`. Frames rendered with the installed renderer (workers and DAG at
+28 and 34 columns, Todo at 85) equal the candidate frames byte for byte.
+
+Rollback: copy `install-rollback/omo-herdr-dashboard.js` and `install-rollback/current.json` from
+the evidence folder `기타 작업/.omo/evidence/dag-stage-list/` back over the wrapper and
+`herdr-dashboard/integration/current.json`; that points at generation 000029 again. Existing
+conversations keep their loaded generation; generation 30 applies from a new conversation or a
+deliberate `/reload`.
+
+Limits: the baseline failures above remain. The installed generation was checked through its
+render functions and the import, not yet in a live pane. `laneLines` and `nodeDetail` are no
+longer on the render path and are left for a later cleanup.
+
+Korean summary: DAG판을 단계 목록으로 바꾸고, 작업자판과 DAG판 카드를 같은 3줄로 맞추고, 고정 문구를 영어로 바꿨습니다. 세대 30을 설치했고 28·29는 그대로 보존했습니다.
+
 ## 2026-10-20 Todo continuation inset (generation 29)
 
 One Todo renderer change shipped. When a task line wraps, the separator space at
