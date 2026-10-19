@@ -188,7 +188,13 @@ test('compact cards share content-height safe lines, localized counts, selected-
   const dag = renderFrame(state, { ...options, selectedNodeId: 'node' });
   const dagCard = card(dag, 'node', 'nodeRanges');
   assert.ok(dagCard[0].startsWith('╭─ GRAPH_LABEL '));
-  assert.deepEqual(dagCard.slice(1), lines.slice(1));
+  // The worker card lost its message row; the DAG node card keeps it. Compare the detail rows both
+  // cards share (view chrome such as lane/bar prefixes and dividers differs by design).
+  const dagRows = dagCard.filter(row => !row.includes('PROGRESS_HEAD'));
+  assert.equal(dagRows.length, dagCard.length - 1, 'the DAG node card keeps the message row');
+  assert.doesNotMatch(lines.join('\n'), /PROGRESS_HEAD/, 'the worker card is the DAG card without that row');
+  const detailRows = rows => rows.map(row => row.replace(/^[│ ]*▌\s*/, '')).filter(row => /^\[|^↳/.test(row));
+  assert.deepEqual(detailRows(lines), detailRows(dagRows));
   assert.match(dag.text, /node → missing/);
   const missing = card(dag, 'missing', 'nodeRanges');
   assert.equal(missing.length, 3);
