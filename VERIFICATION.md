@@ -1,5 +1,36 @@
 # Current dashboard verification
 
+## 2026-10-20 empty worker and DAG panes, English pane text (generation 32)
+
+The source change is commit 1a570ad on `work/dag-stage-list`. An empty worker pane used to fall
+through to the DAG empty state and showed `DAG 대기 중`; it now shows `○  No workers yet`, and an
+empty DAG pane shows `○  Waiting for a DAG`. The empty DAG pane was drawn by a separate branch of
+`renderFixedFrame` that left the footer uncoloured; `renderFixedFrame` now always calls
+`renderFrame` (a fixed DAG role with no run keeps `DAG [0/0]  None`), so the footer is cyan when
+live and yellow when offline, as in the other panes. Every remaining Korean value in the ko
+catalogs of the DAG, Todo and collaboration panes now carries the English text (DAG 78 keys, Todo
+23, collaboration 1). Origin: owner request on the empty panes and decision #271=B (translate the
+remaining Korean too, then commit and install).
+
+Tests: DAG 222 pass / 45 fail before the runtime test update, then the runtime file 5/0; the 44
+baseline failures are unchanged and the two empty-DAG read-error pins moved from the old
+standalone frame (`slice(-2)`) to the shared footer position (`slice(-4)`). A new test pins the
+empty role wording, the absence of Korean chrome and the coloured header and footer. Root 751/11,
+Todo 156/21 (unit 33/0 plus 123/21, the same 21 as before), collaboration 14/0. The build and
+`scripts/verify-package.mjs` exited 0. The install exited 0 with generation-000031 as backup;
+generations 30 and 31 kept their bytes, settings.json and models.json kept their hashes, the 41
+runtime files equal the candidate dist, generation 32's `extension.mjs` imported in a fresh Node
+process, and the installed renderer draws the same empty frames as the dist. An owned `--no-focus`
+Herdr tab ran the installed viewer with `--once` for an empty worker state and an offline empty
+DAG state and showed the English wording; the tab was closed.
+
+Rollback: copy `install-rollback-32/omo-herdr-dashboard.js` and `install-rollback-32/current.json`
+from `기타 작업/.omo/evidence/dag-stage-list/` over the wrapper and
+`herdr-dashboard/integration/current.json`; that points at generation 000031 again. Generation 32
+applies from a new conversation or a deliberate `/reload`.
+
+Korean summary: 빈 작업자판은 'No workers yet', 빈 DAG판은 'Waiting for a DAG'를 띄우고 바닥줄 색을 다른 판과 맞추었습니다. 세 판의 남은 한국어 문구를 영어로 바꿨고 세대 32를 설치했습니다.
+
 ## 2026-10-20 collaboration pane in the shared grammar (generation 31)
 
 The source change is commit 6e74414 on `work/dag-stage-list` (`packages/coordination/src/render.mjs`,
