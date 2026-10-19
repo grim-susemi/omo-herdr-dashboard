@@ -7,7 +7,7 @@ export function width(text) {
   let result = 0;
   for (const { segment } of segmenter.segment(clean(text))) {
     const cp = segment.codePointAt(0);
-    result += /\p{Extended_Pictographic}/u.test(segment) || cp >= 0x1100 &&
+    result += /\p{Emoji_Presentation}|\uFE0F|\u200D/u.test(segment) || cp >= 0x1100 &&
       (cp <= 0x115f || cp === 0x2329 || cp === 0x232a || cp >= 0x2e80 && cp <= 0xa4cf ||
        cp >= 0xac00 && cp <= 0xd7a3 || cp >= 0xf900 && cp <= 0xfaff ||
        cp >= 0xfe10 && cp <= 0xfe6f || cp >= 0xff01 && cp <= 0xff60 || cp >= 0xffe0 && cp <= 0xffe6 ||

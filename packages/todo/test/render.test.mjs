@@ -273,3 +273,25 @@ test('todo rows start at the mark and only the tracked row is bold', () => {
   const boldRows = frame.bodyLines.filter(line => line.startsWith('\x1b[1;36m'));
   assert.equal(boldRows.length, tracked.end - tracked.start, 'only the tracked task rows are bold');
 });
+
+test('width counts text-presentation pictographs as one cell', () => {
+  // Measured Herdr grid cells: text-presentation glyphs take one column.
+  const cells = [
+    ['A', 1], ['▶', 1], ['⚙', 1], ['⚠', 1], ['©', 1], ['▶\uFE0E', 1], ['▶\uFE0F', 2],
+    ['⏳', 2], ['💭', 2], ['한', 2], ['👍🏽', 2], ['👨‍👩‍👧', 2], ['🇰🇷', 2], ['1\uFE0F\u20E3', 2],
+  ];
+  for (const [glyph, expected] of cells) assert.equal(width(glyph), expected, JSON.stringify(glyph));
+});
+
+test('width matches measured Herdr cells for informative sequences', () => {
+  // E/task-2/probe-herdr.json gridCells. The bare keycap 1\u20E3 is measured 1 but keeps Todo's
+  // pre-existing 2 (listed as still-wrong in E/task-6/sequence-table-r2.json), so it is not asserted.
+  const cells = [
+    ['A', 1], ['▶', 1], ['⚙', 1], ['⚠', 1], ['⏳', 2], ['💭', 2], ['✓', 1], ['⧖', 1], ['↻', 1],
+    ['✎', 1], ['©', 1], ['한', 2], ['▶\uFE0F', 2], ['▶\uFE0E', 1], ['⚙\uFE0F', 2], ['⚙\uFE0E', 1],
+    ['⚠\uFE0F', 2], ['👁\u200D🗨', 2], ['👁\uFE0F\u200D🗨\uFE0F', 2], ['1\uFE0F\u20E3', 2],
+    ['🇰🇷', 2], ['👍🏽', 2], ['👨‍👩‍👧', 2],
+  ];
+  for (const [glyph, expected] of cells) assert.equal(width(glyph), expected, JSON.stringify(glyph));
+});
+

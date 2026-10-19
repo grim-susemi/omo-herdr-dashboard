@@ -48,7 +48,7 @@ export function width(text) {
   for (const { segment } of segmenter.segment(clean(text))) {
     if (/^[\p{Mark}\p{Cf}\n]+$/u.test(segment)) continue;
     const cp = segment.codePointAt(0);
-    result += /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(segment) ||
+    result += /\p{Emoji_Presentation}|\uFE0F|\u200D|\p{Regional_Indicator}|\u20e3/u.test(segment) ||
       cp >= 0x1100 && (cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
         cp >= 0x2e80 && cp <= 0xa4cf || cp >= 0xac00 && cp <= 0xd7a3 ||
         cp >= 0xf900 && cp <= 0xfaff || cp >= 0xfe10 && cp <= 0xfe6f ||

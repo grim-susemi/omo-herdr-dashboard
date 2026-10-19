@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { messages } from '../src/i18n.mjs';
-import { layers, normalizeRun, sessionRuns } from '../src/model.mjs';
+import { clean, layers, normalizeRun, sessionRuns } from '../src/model.mjs';
 import { fit, fitTail, render, renderFrame, standaloneTasks, width } from '../src/render.mjs';
 import { TASK_SCOPE, emptyViewState, setExpanded } from '../src/view-state.mjs';
 import { payload, sessionId } from './fixtures.mjs';
@@ -492,4 +492,41 @@ test('healthy worker cards have four rows; stalls, retries and paused tasks keep
       { rows: 80, columns, color: false, now, viewState, selectedTaskId: 'st_card', verbose: true }).text;
     assert.match(detail.replace(/[│┆\s]+/g, ''), /HEALTHY_PROGRESS/);
   }
+});
+
+test('width counts text-presentation pictographs as one cell', () => {
+  // Measured Herdr grid cells: text-presentation glyphs take one column.
+  const cells = [
+    ['A', 1], ['▶', 1], ['⚙', 1], ['⚠', 1], ['©', 1], ['▶\uFE0E', 1], ['▶\uFE0F', 2],
+    ['⏳', 2], ['💭', 2], ['한', 2], ['👍🏽', 2], ['👨‍👩‍👧', 2], ['🇰🇷', 2], ['1\uFE0F\u20E3', 2],
+  ];
+  for (const [glyph, expected] of cells) assert.equal(width(glyph), expected, JSON.stringify(glyph));
+});
+
+test('detail box rows with a tool mark keep the right border aligned', () => {
+  const now = Date.parse('2026-10-19T00:10:00Z');
+  const task = { id: 'st_card', status: 'running', description: 'CARD_TITLE', agent: 'worker', category: 'visual-engineering',
+    model: 'provider/gpt-5.4', reasoningEffort: 'xhigh', progress: 'HEALTHY_PROGRESS', startedAt: '2026-10-19T00:00:00Z',
+    turns: 3, toolCalls: 4, metrics: { tokens_per_second: 12, cost_usd: 0.5, cost_status: 'reported' },
+    activity: { phase: 'tool', tool: 'bash', since: now - 65000, lastAt: now - 65000 } };
+  const text = renderFrame({ connected: true, runs: [], tasks: [task] },
+    { rows: 80, columns: 40, color: false, language: 'en', now, selectedTaskId: task.id, verbose: true }).text;
+  const lines = text.split('\n').map(clean);
+  const top = lines.find(line => /^╭─*╮$/.test(line));
+  const marked = lines.find(line => line.includes('▶'));
+  assert.ok(top && marked, 'detail box and its tool-mark row are visible');
+  assert.match(marked, /▶ bash running/);
+  assert.equal([...marked].length, [...top].length, JSON.stringify(marked));
+});
+
+test('width matches measured Herdr cells for informative sequences', () => {
+  // E/task-2/probe-herdr.json gridCells. The bare keycap 1\u20E3 is measured 1 but keeps Todo's
+  // pre-existing 2 (listed as still-wrong in E/task-6/sequence-table-r2.json), so it is not asserted.
+  const cells = [
+    ['A', 1], ['▶', 1], ['⚙', 1], ['⚠', 1], ['⏳', 2], ['💭', 2], ['✓', 1], ['⧖', 1], ['↻', 1],
+    ['✎', 1], ['©', 1], ['한', 2], ['▶\uFE0F', 2], ['▶\uFE0E', 1], ['⚙\uFE0F', 2], ['⚙\uFE0E', 1],
+    ['⚠\uFE0F', 2], ['👁\u200D🗨', 2], ['👁\uFE0F\u200D🗨\uFE0F', 2], ['1\uFE0F\u20E3', 2],
+    ['🇰🇷', 2], ['👍🏽', 2], ['👨‍👩‍👧', 2],
+  ];
+  for (const [glyph, expected] of cells) assert.equal(width(glyph), expected, JSON.stringify(glyph));
 });
