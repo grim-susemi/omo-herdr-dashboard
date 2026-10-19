@@ -177,7 +177,8 @@ test('labelled worker details wrap with a stable hanging indent while compact ca
   const options = { columns: 30, rows: 100, color: false, selectedTaskId: 'root', frame: 0, now: 0 };
   const frame = renderFrame(state, options), range = frame.taskRanges.root;
   const lines = frame.text.split('\n').slice(frame.bodyStart + range.start, frame.bodyStart + range.end);
-  assert.equal(lines.length, 4);
+  assert.equal(lines.length, 3);
+  assert.doesNotMatch(lines.join('\n'), /PROGRESS/);
   const detail = renderFrame(state, { ...options, verbose: true }).text.split('\n');
   const label = `${messages.en.description}: `;
   const at = detail.findIndex(line => line.includes(label));
@@ -257,10 +258,13 @@ test('worker and DAG cards follow their content with role badges, a time mark an
     const card = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
     const sub = messages[language].subtask;
     const rows = card.slice(1, -1).map(line => line.slice(2, -2).trimEnd());
-    assert.deepEqual([...rows.slice(0, 4), ...rows.slice(5)], ['⠋ ROOT_TITLE', '[deep-high] gpt-6.1-sol:xhigh',
-      'ROOT_PROGRESS', `⧖ ${language === 'en' ? '1m 0s' : '1분 0초'}`, `  ↳ ${sub} ⠋ CHILD_TITLE`,
+    // Worker cards drop a healthy task's message row; DAG node cards still show it.
+    const divider = view === 'dag' ? 4 : 3;
+    assert.deepEqual([...rows.slice(0, divider), ...rows.slice(divider + 1)], ['⠋ ROOT_TITLE', '[deep-high] gpt-6.1-sol:xhigh',
+      ...(view === 'dag' ? ['ROOT_PROGRESS'] : []), `⧖ ${language === 'en' ? '1m 0s' : '1분 0초'}`, `  ↳ ${sub} ⠋ CHILD_TITLE`,
       '  [deep-low] gpt-6.1-sol:medium', `    ↳ ${sub} ○ GRAND_TITLE`, '    [quick] gpt-6.1-sol:low'], `${view} ${columns}`);
-    assert.ok(rows[4].startsWith(`─ ${t(language, 'subtasksCount', { count: 2 })} ─`), rows[4]);
+    if (view !== 'dag') assert.doesNotMatch(card.join('\n'), /ROOT_PROGRESS/);
+    assert.ok(rows[divider].startsWith(`─ ${t(language, 'subtasksCount', { count: 2 })} ─`), rows[divider]);
     assert.ok(rows.every(row => row.trim()), 'no blank row inside the card');
     assert.equal(card.join('\n').split('⧖').length - 1, 1);
     assert.ok(card.every(line => width(line) === columns - 1 && line.endsWith('│') || /^[╭╰]/.test(line) &&
@@ -328,8 +332,8 @@ test('long CJK titles, long models and roles, and empty roles stay inside the ca
     assert.match(cjk[2], /^│ \[r+…?\]/);
     const modelAt = /:xhigh\s*│$/.test(cjk[2]) ? 2 : 3;
     assert.match(cjk[modelAt], /:xhigh\s*│$/);
-    assert.match(cjk[modelAt + 1], /…\s*│$/);
-    assert.match(cjk[modelAt + 2], /^│ ⧖ 1m 0s\s+│$/);
+    assert.match(cjk[modelAt + 1], /^│ ⧖ 1m 0s\s+│$/);
+    assert.doesNotMatch(cjk.join('\n'), /進捗/);
     assert.doesNotMatch(cjk.join('\n'), /provider\//);
     for (const id of ['b-empty', 'c-control']) {
       assert.equal(card(id).length, 4, id);

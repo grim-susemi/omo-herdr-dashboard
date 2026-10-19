@@ -16,31 +16,36 @@ test('running cards show model liveness: phase, time since the last token, stall
     const frame = renderFrame({ connected: true, runs: [], tasks: [task] }, { rows: 80, columns: 54, color: false, now, ...options });
     return frame.text.split('\n').slice(2 + frame.taskRanges[task.id].start, 2 + frame.taskRanges[task.id].end);
   };
-  // Tokens arriving now: the newest characters stay visible at the right edge.
+  const detailOf = (task, options = {}) => render({ connected: true, runs: [], tasks: [task] },
+    { rows: 80, columns: 120, color: false, now, selectedTaskId: task.id, verbose: true, ...options });
+  // A healthy card has no message row; the detail view keeps the newest characters at the right edge.
   const streaming = card(live);
-  assert.match(streaming[2], /✎ now · ….*NEWEST_TAIL/);
-  assert.doesNotMatch(streaming.join('\n'), /OLD_HEAD|PROGRESS_LINE/);
+  assert.equal(streaming.length, 1);
+  assert.doesNotMatch(streaming.join('\n'), /✎|NEWEST_TAIL|OLD_HEAD|PROGRESS_LINE/);
   for (const line of streaming) assert.ok(width(line) <= 53, line);
-  assert.match(card({ ...live, activity: activity('text', { text: 'x' }, 7000, 9000) })[2], /✎ 7s ago · x/);
-  assert.match(card({ ...live, activity: activity('thinking', { text: 'ponder' }) })[2], /💭 now · ponder/);
-  assert.match(card({ ...live, activity: activity('toolArgs', { tool: 'write', text: '{"path":"a"' }, 1000) })[2], /⚙ write now · .*"a"/);
+  assert.match(detailOf({ ...live, activity: activity('text', { text: 'x' }, 7000, 9000) }), /✎ 7s ago · x/);
+  assert.match(detailOf({ ...live, activity: activity('thinking', { text: 'ponder' }) }), /💭 now · ponder/);
+  assert.match(detailOf({ ...live, activity: activity('toolArgs', { tool: 'write', text: '{"path":"a"' }, 1000) }), /⚙ write now · .*"a"/);
   // Phases without tokens show how long the request or tool has taken.
-  assert.match(card({ ...live, activity: activity('waiting', {}, 12000) })[2], /⏳ waiting for model 12s/);
-  assert.match(card({ ...live, activity: activity('tool', { tool: 'bash' }, 65000) })[2], /▶ bash running 1m 5s/);
+  assert.match(detailOf({ ...live, activity: activity('waiting', {}, 12000) }), /⏳ waiting for model 12s/);
+  assert.match(detailOf({ ...live, activity: activity('tool', { tool: 'bash' }, 65000) }), /▶ bash running 1m 5s/);
+  assert.equal(card({ ...live, activity: activity('tool', { tool: 'bash' }, 65000) }).length, 1);
+  // A retry keeps the card's message row.
   assert.match(card({ ...live, activity: activity('retry', { attempt: 2, maxAttempts: 3 }, 4000) })[2], /↻ retry 2\/3 · 4s/);
   // A silent token phase or a long first-token wait is flagged; a long tool is not.
   assert.match(card({ ...live, activity: activity('text', { text: 'LAST' }, 45000) })[2], /⚠ possibly stalled · 45s ago · LAST/);
   assert.match(card({ ...live, activity: activity('waiting', {}, 95000) })[2], /⚠ possibly stalled · waiting for model 1m 35s/);
-  assert.doesNotMatch(card({ ...live, activity: activity('tool', { tool: 'bash' }, 600000) })[2], /⚠/);
-  // Korean labels, terminal tasks, malformed activity and missing activity keep the progress line.
-  assert.match(card({ ...live, activity: activity('text', { text: 'x' }, 7000) }, { language: 'ko' })[2], /✎ 7초 전 · x/);
+  assert.doesNotMatch(card({ ...live, activity: activity('tool', { tool: 'bash' }, 600000) }).join('\n'), /⚠|PROGRESS_LINE/);
+  // Korean labels; terminal tasks, malformed activity and missing activity drop the message row.
+  assert.match(detailOf({ ...live, activity: activity('text', { text: 'x' }, 7000) }, { language: 'ko' }), /✎ 7초 전 · x/);
   assert.match(card({ ...live, activity: activity('waiting', {}, 95000) }, { language: 'ko' })[2], /⚠ 멈춤 의심 · 응답 대기 1분 35초/);
   const viewState = emptyViewState('session');
   setExpanded(viewState, TASK_SCOPE, 'st_done', true);
   const finished = card(done, { viewState }).join('\n');
-  assert.ok(finished.includes('DONE_PROGRESS') && !finished.includes('DONE_TAIL'));
-  assert.match(card({ ...live, activity: { phase: 'text' } })[2], /PROGRESS_LINE/);
-  assert.match(card({ ...live, activity: undefined })[2], /PROGRESS_LINE/);
+  assert.ok(!finished.includes('DONE_PROGRESS') && !finished.includes('DONE_TAIL'));
+  assert.doesNotMatch(card({ ...live, activity: { phase: 'text' } }).join('\n'), /PROGRESS_LINE/);
+  assert.doesNotMatch(card({ ...live, activity: undefined }).join('\n'), /PROGRESS_LINE/);
+  assert.match(detailOf({ ...live, activity: undefined }), /PROGRESS_LINE/);
   // Detail view labels the activity; the DAG box appends it to the running state and turns yellow when stalled.
   const detail = render({ connected: true, runs: [], tasks: [live] }, { rows: 80, columns: 54, color: false, now, selectedTaskId: 'st_live', verbose: true });
   assert.ok(detail.includes(`${messages.en.activity}: ✎ now · OLD_HEAD`) && detail.includes('PROGRESS_LINE'));
@@ -145,24 +150,25 @@ test('compact cards share content-height safe lines, localized counts, selected-
   const card = (frame, id, kind = 'taskRanges') => frame.text.split('\n').slice((kind === 'taskRanges' ? 2 : 3) + frame[kind][id].start, (kind === 'taskRanges' ? 2 : 3) + frame[kind][id].end);
   const compact = renderFrame(state, options);
   const lines = card(compact, 'root-id');
-  assert.equal(lines.length, 8, 'four root rows, subtask divider, one child row and borders');
+  assert.equal(lines.length, 7, 'three root rows, subtask divider, one child row and borders');
   assert.match(lines[1], /(^|[│▌ ])⠋ ROOT_DESCRIPTION/);
   assert.doesNotMatch(lines[1], />/);
   assert.match(lines[2], /\[worker\/visual\] gpt-5.4 \(high\)/);
-  assert.match(lines[3], /PROGRESS_HEAD.*…/);
-  assert.match(lines[4], /9m 5s · 20 turns · 65 tools/);
-  assert.match(lines[6], /↳ sub ✓ CHILD_DESCRIPTION/);
+  assert.doesNotMatch(lines.join('\n'), /PROGRESS_HEAD/);
+  assert.match(lines[3], /9m 5s · 20 turns · 65 tools/);
+  assert.match(lines[5], /↳ sub ✓ CHILD_DESCRIPTION/);
   assert.match(card(compact, 'other-id')[1], /× OTHER_DESCRIPTION/);
   assert.doesNotMatch(lines.join('\n'), /root-id|child-id|opencodex\/|PROGRESS_TAIL|2026-09-06/);
   assert.ok(!lines.join('\n').includes('\x1b'));
   const korean = renderFrame(state, { ...options, language: 'ko' });
-  assert.match(card(korean, 'root-id')[4], /9분 5초 · 20턴 · 도구 65회/);
+  assert.match(card(korean, 'root-id')[3], /9분 5초 · 20턴 · 도구 65회/);
   const full = renderFrame(state, { ...options, verbose: true });
   const fullRoot = card(full, 'root-id').join('\n');
   for (const token of ['root-id', 'PROGRESS_HEAD', 'PROGRESS_TAIL', '2026-09-06T00:00:00Z', 'gpt-5.4']) assert.ok(fullRoot.includes(token), token);
   assert.doesNotMatch(fullRoot, /opencodex\//);
-  assert.equal(card(full, 'other-id').length, 4);
-  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 8);
+  assert.equal(card(full, 'other-id').length, 3);
+  assert.doesNotMatch(card(full, 'other-id').join('\n'), /OTHER_PROGRESS/);
+  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 7);
   const viewState = emptyViewState('session');
   setExpanded(viewState, TASK_SCOPE, 'root-id', false);
   const saved = structuredClone(viewState);
@@ -242,8 +248,9 @@ test('automatic card ranges and DAG markers use authoritative status, while bool
       const expanded = preference ?? status === 'running';
       const frame = renderFrame(state, options);
       const range = dag ? frame.nodeRanges.node : frame.taskRanges.task;
-      assert.equal(range.end - range.start, expanded ? 4 : !dag && status === 'completed' ? 1 : 3);
-      assert.equal(frame.text.includes('PROGRESS_SENTINEL'), expanded);
+      // Only a paused worker card keeps its progress sentence; DAG node cards are unchanged.
+      assert.equal(range.end - range.start, expanded ? (dag || status === 'paused' ? 4 : 3) : !dag && status === 'completed' ? 1 : 3);
+      assert.equal(frame.text.includes('PROGRESS_SENTINEL'), expanded && (dag || status === 'paused'));
       assert.equal(frame.text.includes('[+] CARD_SENTINEL'), !expanded);
       if (dag && (status === 'unknown' || status === undefined)) {
         assert.match(frame.text, /Graph error: Unknown translation key/);
@@ -442,4 +449,47 @@ test('DAG colors use theme ANSI and not fixed light-gray indexes', () => {
   assert.equal(text.includes(`${esc}[32m`), true);
   assert.equal(text.includes(`${esc}[36m`), true);
   assert.equal(render(state, { columns: 80, rows: 40, color: false, selectedNodeId: 'wait' }).includes(esc), false);
+});
+
+test('healthy worker cards have four rows; stalls, retries and paused tasks keep the message row', () => {
+  const now = Date.parse('2026-10-19T00:10:00Z');
+  const activity = (phase, extra = {}, age = 0, span = age) => ({ phase, since: now - span, lastAt: now - age, ...extra });
+  const base = { id: 'st_card', status: 'running', description: 'CARD_TITLE', agent: 'worker', category: 'visual-engineering',
+    model: 'provider/gpt-5.4', reasoningEffort: 'xhigh', progress: '[bash] HEALTHY_PROGRESS', startedAt: '2026-10-19T00:00:00Z',
+    turns: 3, toolCalls: 4, metrics: { tokens_per_second: 12, cost_usd: 0.5, cost_status: 'reported' },
+    activity: activity('text', { text: 'HEALTHY_TAIL' }) };
+  const viewState = emptyViewState('session');
+  setExpanded(viewState, TASK_SCOPE, 'st_card', true);
+  const own = (task, columns, options = {}) => {
+    const frame = renderFrame({ connected: true, runs: [], tasks: [task], ...options.state },
+      { rows: 80, columns, color: false, now, viewState, ...options.render });
+    const card = frame.text.split('\n').slice(2 + frame.taskRanges[task.id].start, 2 + frame.taskRanges[task.id].end);
+    for (const line of frame.text.split('\n')) assert.ok(width(line) <= columns - 1, `${columns}: ${line}`);
+    return card;
+  };
+  for (const columns of [28, 40, 80]) {
+    // At 28 columns the role badge crowds out model:effort, so the model takes its own row.
+    const rows = columns === 28 ? 5 : 4;
+    const healthy = own(base, columns);
+    assert.equal(healthy.length, rows, `${columns}: ${healthy.join(' / ')}`);
+    assert.doesNotMatch(healthy.join('\n'), /HEALTHY_PROGRESS|HEALTHY_TAIL|✎/);
+    assert.match(healthy[0], /⠋ CARD_TITLE/);
+    if (columns === 28) assert.match(healthy[2], /gpt-5\.4/);
+    const stalled = own({ ...base, activity: activity('text', { text: 'STALL_TAIL' }, 45000) }, columns);
+    assert.equal(stalled.length, rows + 1, `${columns}: ${stalled.join(' / ')}`);
+    assert.match(stalled[rows - 2], /⚠/);
+    const retry = own({ ...base, activity: activity('retry', { attempt: 2, maxAttempts: 3 }, 4000) }, columns);
+    assert.equal(retry.length, rows + 1, `${columns}: ${retry.join(' / ')}`);
+    assert.match(retry[rows - 2], /↻/);
+    const offline = own(base, columns, { state: { connected: false } });
+    assert.equal(offline.length, rows, `${columns}: ${offline.join(' / ')}`);
+    assert.doesNotMatch(offline.join('\n'), /HEALTHY_PROGRESS|HEALTHY_TAIL/);
+    const paused = own({ ...base, status: 'paused', progress: 'PAUSED_SENTENCE' }, columns);
+    assert.equal(paused.length, rows + 1, `${columns}: ${paused.join(' / ')}`);
+    assert.match(paused[rows - 2], /PAUSED/);
+    // The selected detail view still shows a healthy card's progress sentence.
+    const detail = renderFrame({ connected: true, runs: [], tasks: [base] },
+      { rows: 80, columns, color: false, now, viewState, selectedTaskId: 'st_card', verbose: true }).text;
+    assert.match(detail.replace(/[│┆\s]+/g, ''), /HEALTHY_PROGRESS/);
+  }
 });

@@ -34,7 +34,7 @@ test('initial 60x12 worker viewport shows the whole active card and concise foll
 });
 test('workers viewport suppresses a border-only card edge without changing task ranges', () => {
   const source = {...state, runs:[], tasks:[
-    {id:'active',status:'running',description:'ACTIVE',progress:'PROGRESS'},
+    {id:'active',status:'running',description:'ACTIVE',progress:'PROGRESS',turns:2},
     {id:'next',status:'pending',description:'NEXT'}]};
   const frame = renderFixedFrame(source,{columns:80,rows:8,color:false,
     selectedTaskId:'active'},'tasks');
@@ -43,6 +43,8 @@ test('workers viewport suppresses a border-only card edge without changing task 
   assert.equal(frame.bodyStart, 2);
   const body=frame.text.split('\n').slice(frame.bodyStart, frame.bodyStart + frame.bodyRows);
   assert.equal(body.length, 5);
+  assert.doesNotMatch(body.join('\n'), /PROGRESS/);
+  assert.match(body[2], /2 turns/);
   assert.match(body[3], /^╰/);
   assert.equal(body[4], '');
   const colored = renderFixedFrame(source,{columns:80,rows:8,color:true,
@@ -123,8 +125,9 @@ test('completed ordinary roots shrink to unboxed summaries while manual expansio
   assert.doesNotMatch(folded.text, /DETAIL_PROGRESS/);
   const expanded = renderFixedFrame(sample, { columns: 80, rows: 60, color: false,
     viewState: { expanded: { '[null,"done"]': true } } }, 'tasks');
-  assert.match(expanded.text, /DETAIL_PROGRESS/);
-  assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 4);
+  assert.doesNotMatch(expanded.text, /DETAIL_PROGRESS|\[\+\] COMPACT_DONE/);
+  assert.match(expanded.text, /COMPACT_DONE/);
+  assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 3);
 });
 
 test('completed group keeps canonical counts and selected hidden summary reachable', () => {

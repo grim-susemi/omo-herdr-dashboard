@@ -68,8 +68,9 @@ test('real standalone PTY respects saved folds, preserves task selection, switch
   assert.doesNotMatch(foldedAgain, /FIRST_PROGRESS|EXPLICIT_CHILD/);
   assert.deepEqual(pausedPreferences.expanded, preferences.expanded);
   assert.deepEqual(pausedPreferences.navigation, { follow: false });
-  const initial = await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: ' ' }));
-  for (const value of [messages.ko.tasks, 'REAL_CATEGORY', 'REAL_MODEL', 'FIRST_PROGRESS']) assert.ok(initial.includes(value), value);
+  const initial = await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('REAL_MODEL'), () => viewer.send({ keys: ' ' }));
+  for (const value of [messages.ko.tasks, 'REAL_CATEGORY', 'REAL_MODEL']) assert.ok(initial.includes(value), value);
+  assert.ok(!initial.includes('FIRST_PROGRESS'));
   await viewer.frame((text, raw) => selectedTitle(raw, '✓ [+] SECOND_DESCRIPTION'), () => viewer.send({ keys: '\t' }));
   await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION'), () => viewer.send({ keys: '\x1b[Z' }));
   const collapsed = await viewer.frame((text, raw) => includesRunning(raw, '[+] FIRST_DESCRIPTION'), () => viewer.send({ keys: ' ' }));
@@ -107,14 +108,15 @@ test('real standalone PTY respects saved folds, preserves task selection, switch
   viewer = openViewer(file, t);
   await viewer.frame((text, raw) => includesRunning(raw, '[+] NEW_DESCRIPTION'));
   await viewer.frame((text, raw) => includesRunning(raw, '[+] FIRST_DESCRIPTION') && !text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: 'n' }));
-  await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: '\r' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('REAL_MODEL'), () => viewer.send({ keys: '\r' }));
   await viewer.close();
   assert.equal(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded[JSON.stringify([TASK_SCOPE, 'st_a'])], true);
   viewer = openViewer(file, t);
-  await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('FIRST_PROGRESS'));
+  await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('REAL_MODEL'));
   await viewer.frame((text, raw) => includesRunning(raw, '[+] NEW_DESCRIPTION'), () => viewer.send({ keys: 'p' }));
-  const restored = await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: 'n' }));
+  const restored = await viewer.frame((text, raw) => includesRunning(raw, 'FIRST_DESCRIPTION') && text.includes('REAL_MODEL'), () => viewer.send({ keys: 'n' }));
   assert.ok(restored.includes('EXPLICIT_CHILD'));
+  assert.ok(!restored.includes('FIRST_PROGRESS'));
   await viewer.close();
   console.log('Standalone PTY evidence: saved false folded, preference-preserving d peek, stored true restored, startup, Tab/Shift-Tab/n/p, Space/Enter, arrivals/reorder, mixed DAG toggle/all-run exclusion, CJK resize, restart persistence.');
 });
@@ -139,12 +141,12 @@ test('real PTY compact cards expose full selected progress with d without persis
     () => viewer.send({ resize: [32, 80] }));
   assert.equal(initial.split('\n').filter(line => line.startsWith('╭')).length, 3);
   const interiors = initial.split('\n').filter(line => line.startsWith('│'));
-  assert.equal(interiors.length, 7);
+  assert.equal(interiors.length, 5);
   assert.match(interiors[1], /\[worker\/visual\] gpt-6-astra \(opencodex\)/);
-  assert.match(interiors[2], /PROGRESS_HEAD.*…/);
-  assert.match(interiors[3], /9분 5초 · 20턴 · 도구 65회/);
-  assert.match(interiors[4], /× SECOND_COMPACT/);
-  assert.match(interiors[6], /\? -/);
+  assert.match(interiors[2], /9분 5초 · 20턴 · 도구 65회/);
+  assert.match(interiors[3], /× SECOND_COMPACT/);
+  assert.match(interiors[4], /\? -/);
+  assert.doesNotMatch(initial, /PROGRESS_HEAD|SECOND_PROGRESS/);
   assert.ok(interiors.every(line => line.replace(/[│ ]/g, '')));
   assert.doesNotMatch(initial, /a-full-id|b-full-id|c-full-id|PROGRESS_TAIL|2026-09-06|opencodex\//);
   await viewer.frame(text => text.split('\n').length === 50, () => viewer.send({ resize: [50, 80] }));
@@ -152,7 +154,7 @@ test('real PTY compact cards expose full selected progress with d without persis
   for (const token of ['a-full-id', '2026-09-06T00:00:00Z', '2026-09-06T00:09:05Z', 'gpt-6-astra']) assert.ok(full.includes(token), token);
   assert.doesNotMatch(full, /opencodex\//);
   assert.doesNotMatch(full, /b-full-id|c-full-id/);
-  await viewer.frame(text => !text.includes('PROGRESS_TAIL') && text.includes('PROGRESS_HEAD'), () => viewer.send({ keys: 'd' }));
+  await viewer.frame((text, raw) => !text.includes('PROGRESS_TAIL') && !text.includes('PROGRESS_HEAD') && selectedTitle(raw, '✓ COMPACT_DESCRIPTION'), () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => text.includes('PROGRESS_TAIL'), () => viewer.send({ keys: 'd' }));
   const next = await viewer.frame((text, raw) => selectedTitle(raw, '× SECOND_COMPACT'), () => viewer.send({ keys: 'n' }));
   assert.doesNotMatch(next, /a-full-id|b-full-id|PROGRESS_TAIL/);
@@ -172,7 +174,7 @@ test('real PTY compact cards expose full selected progress with d without persis
   viewer = openViewer(file, t);
   const restarted = await viewer.frame((text, raw) => selectedTitle(raw, '✓ [+] COMPACT_DESCRIPTION'));
   assert.doesNotMatch(restarted, /PROGRESS_HEAD|PROGRESS_TAIL|a-full-id/);
-  await viewer.frame(text => text.includes('PROGRESS_HEAD') && !text.includes('[+] COMPACT_DESCRIPTION'), () => viewer.send({ keys: '\r' }));
+  await viewer.frame(text => text.includes('9분 5초') && !text.includes('PROGRESS_HEAD') && !text.includes('[+] COMPACT_DESCRIPTION'), () => viewer.send({ keys: '\r' }));
   await viewer.close();
   assert.deepEqual(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded, { ...expanded, '[null,"a-full-id"]': true });
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
@@ -211,7 +213,7 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   await writeJson(file, state);
   let viewer = openViewer(file, t);
   const matches = (expanded, verbose = false, includeGraph = true) => text => text.includes('AUTO_CARD') &&
-    text.includes('AUTO_PROGRESS') === (expanded || verbose) &&
+    text.includes('AUTO_PROGRESS') === (dag ? expanded || verbose : verbose) &&
     text.includes(`Task: ${task.id}`) === verbose &&
     (verbose || text.includes('[+] AUTO_CARD') === !expanded) &&
     (!dag || !includeGraph || text.includes(`[${expanded ? '-' : '+'}] AUTO_NODE`));
@@ -229,7 +231,7 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   const check = async (expanded, action, verbose = false) => {
     const text = await verifiedFrame(expanded, verbose, action);
     if (!verbose) assert.equal(text.split('\n').filter(line => line.startsWith('│')).length,
-      expanded ? 2 : !dag && task.status === 'completed' ? 0 : 1);
+      expanded ? (dag ? 2 : 1) : !dag && task.status === 'completed' ? 0 : 1);
     return text;
   };
   const transition = async (status, expanded, verbose = false) => {
@@ -237,7 +239,8 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
     else task.status = status;
     task.progress = `AUTO_PROGRESS_${status}`;
     await verifiedFrame(expanded, verbose, () => writeJson(file, state),
-      text => expanded || verbose ? text.includes(task.progress) : text.includes(dag ? 'Completed' : '✓'));
+      text => verbose || (dag && expanded) ? text.includes(task.progress) :
+        (dag || !text.includes(task.progress)) && (expanded || text.includes(dag ? 'Completed' : '✓')));
   };
   await check(false);
   await transition('running', true);
@@ -653,18 +656,19 @@ test('workers completed group toggles independently and selected completed detai
   await viewer.frame(text=>text.includes('Completed tasks (8) [+]'),()=>viewer.send({keys:'c'}));
   const selected=await viewer.frame((text, raw) =>selectedTitle(raw, '✓ [+] GROUP_TASK_0'),()=>viewer.send({keys:'n'}));
   assert.match(selected,/Completed tasks \(8\) \[\+\]/);
-  await viewer.frame(text=>text.includes('PROGRESS_0'),()=>viewer.send({keys:' '}));
+  await viewer.frame((text, raw)=>selectedTitle(raw, '✓ GROUP_TASK_0')&&!text.includes('PROGRESS_0'),()=>viewer.send({keys:' '}));
   state.tasks[0].metrics={cost_usd:0,cost_status:'reported',source:'fixture-metrics'};
   const updated=await viewer.frame(text=>text.includes('$0.0000')&&!text.includes('[reported]'),()=>writeJson(file,state));
-  assert.match(updated,/PROGRESS_0/);
-  await viewer.frame(text=>text.split('\n').length===18&&text.includes('PROGRESS_0'),()=>viewer.send({resize:[18,40]}));
+  assert.doesNotMatch(updated,/PROGRESS_0/);
+  assert.match(updated,/GROUP_TASK_0/);
+  await viewer.frame(text=>text.split('\n').length===18&&text.includes('$0.0000')&&!text.includes('PROGRESS_0'),()=>viewer.send({resize:[18,40]}));
   await viewer.close();const saved=JSON.parse(await readFile(file+'.view.json','utf8'));assert.equal(saved.expanded['[null,"t0"]'],true);assert.equal(saved.navigation.completedExpanded,false);
   viewer=openViewer(file,t,['--view','tasks']);await viewer.frame(text=>text.includes('GROUP_TASK_8')&&text.includes('Follow ON'));
   await viewer.frame(text=>text.includes('Task: t0'),()=>viewer.send({keys:'d'}));
   await viewer.frame(text=>text.includes('Metrics source: fixture-metrics'),()=>viewer.send({keys:'\x1b[6~'}));
-  await viewer.frame(text=>text.includes('PROGRESS_0')&&!text.includes('Metrics source:'),()=>viewer.send({keys:'d'}));
+  await viewer.frame(text=>text.includes('$0.0000')&&!text.includes('PROGRESS_0')&&!text.includes('Metrics source:'),()=>viewer.send({keys:'d'}));
   state.tasks[1].status='running';state.tasks[1].progress='REOPENED';
-  await viewer.frame(text=>text.includes('Completed tasks (7)')&&text.includes('REOPENED'),()=>writeJson(file,state));
+  await viewer.frame(text=>text.includes('Completed tasks (7)')&&text.includes('GROUP_TASK_1')&&!text.includes('REOPENED'),()=>writeJson(file,state));
   await viewer.frame(text=>text.includes('Follow ON'),()=>viewer.send({keys:'f'}));await viewer.close();
   assert.deepEqual(JSON.parse(await readFile(file,'utf8')),state);
 });

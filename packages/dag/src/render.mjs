@@ -364,15 +364,18 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   // nor the activity row gives up room to them in a narrow pane.
   const counts = stats.join(' · ');
   const timeRow = [elapsed, counts].filter(Boolean).join(' · ');
-  const progress = task?.progress || node?.error ? clean(task?.progress || node.error) : '';
+  // A healthy card drops its message row; a stall, a retry or a paused task keeps it.
+  const live = timing.connected ? activitySummary(task, language, timing.now) : null;
+  const alert = live && (live.stalled || task.activity.phase === 'retry') ? live : null;
+  const held = !alert && status === 'paused' && task?.progress ? clean(task.progress) : '';
   const lines = [
     titleText,
     metadata,
-    `${indent}${progress}`,
+    `${indent}${held}`,
     `${indent}${task?.metrics ? metricSummary(task, language, Boolean(node)) : ''}`,
     `${indent}${timeRow}`,
   ].map((line, index) => {
-    const activity = index === 2 && timing.connected ? activitySummary(task, language, timing.now) : null;
+    const activity = index === 2 ? alert : null;
     if (!activity) return fit(line, room);
     const head = `${indent}${activity.head}`;
     const rest = room - width(head) - 3;
