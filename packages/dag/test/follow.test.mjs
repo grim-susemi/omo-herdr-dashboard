@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { stripVTControlCharacters } from 'node:util';
 import { messages } from '../src/i18n.mjs';
 import { renderFrame, runningTarget, width } from '../src/render.mjs';
 
@@ -14,11 +15,11 @@ test('execution colors emphasize unselected graph and task titles, borders and s
     const graph = lines.slice(frame.bodyStart + frame.graphRanges[id].start, frame.bodyStart + frame.graphRanges[id].end);
     const card = lines.slice(frame.bodyStart + frame.nodeRanges[id].start, frame.bodyStart + frame.nodeRanges[id].end);
     assert.ok(graph[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(graph[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
+    assert.ok(id === 'completed' ? graph[1].includes(`\x1b[1;${color}m`) : graph[1].includes(`\x1b[${color}m`) && !graph[1].includes('\x1b[1;'), id);
     assert.ok(graph[2].includes(`\x1b[${color}m`), id);
     assert.ok(graph[3].startsWith(`\x1b[${color}m╰`), id);
     assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(card[1].includes(`\x1b[1;${color}m${id === 'completed' ? '>' : ' '}`), id);
+    assert.ok(id === 'completed' ? card[1].includes(`\x1b[1;${color}m`) : card[1].includes(`\x1b[${color}m`) && !card[1].includes('\x1b[1;'), id);
     assert.ok(card.at(-1).startsWith(`\x1b[${color}m╰`), id);
   }
   const pending = lines.slice(3 + frame.graphRanges.pending.start, 3 + frame.graphRanges.pending.end).join('\n');
@@ -31,10 +32,10 @@ test('execution colors emphasize unselected graph and task titles, borders and s
     const card = standalone.text.split('\n').slice(standalone.bodyStart + range.start, standalone.bodyStart + range.end);
     if (id === 'completed') {
       assert.equal(range.end-range.start,1);
-      assert.ok(card[0].includes(`\x1b[${color}m> ✓ [+] T_completed`),id);
+      assert.ok(card[0].includes(`\x1b[1;${color}m✓ [+] T_completed`),id);
     } else {
       assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-      assert.ok(card[1].includes(`\x1b[1;${color}m `), id);
+      assert.ok(card[1].includes(`\x1b[${color}m`) && !card[1].includes('\x1b[1;'), id);
     }
     if (id === 'completed') assert.ok(!card.join('\n').includes('\x1b[36m'));
   }
@@ -127,12 +128,44 @@ test('standalone follow reveals the running card without changing selection; dis
     const frame = renderFrame(state, { rows: 18, columns: 35, color: true, language, selectedTaskId: 'a', runningTaskId: 'z', now: 1000 });
     assert.ok(frame.scroll > 0 && frame.scroll <= frame.taskRanges.z.start);
     assert.ok(frame.text.includes('TASK_z'));
-    assert.ok(!frame.text.includes('> ⠋ TASK_z'));
+    assert.ok(frame.text.includes('\x1b[36m⠋ TASK_z') && !frame.text.includes('\x1b[1;36m⠋ TASK_z'));
     assert.ok(frame.text.includes(messages[language].followShortOn));
     assert.ok(frame.text.split('\n').every(line => width(line) < 35));
     const disconnected = renderFrame({ ...state, connected: false }, { rows: 80, columns: 54, color: false, language, now: 1000 });
     assert.ok(disconnected.text.includes(messages[language].followOff));
     assert.ok(!disconnected.text.includes('LIVE_TOKEN'));
     assert.ok(disconnected.text.includes(messages[language].disconnected));
+  }
+});
+
+test('titles start without a marker column and only the selected title is bold', () => {
+  const nodes = [{ id: 'b', label: 'N_B', state: 'completed', taskId: 'tb' }, { id: 'a', label: 'N_A', state: 'failed', taskId: 'ta' },
+    { id: 'c', label: 'N_C', state: 'running', taskId: 'tc' }];
+  const tasks = [{ id: 'tb', status: 'completed', description: 'T_B' }, { id: 'ta', status: 'failed', description: 'T_A' },
+    { id: 'tc', status: 'running', description: 'T_C' }];
+  const run = { id: 'r', name: 'Run', status: 'running', nodes, edges: [{ from: 'b', to: 'a' }, { from: 'a', to: 'c' }] };
+  for (const color of [false, true]) {
+    const graph = renderFrame({ connected: true, runs: [run], tasks }, { columns: 40, rows: 60, color, frame: 0, view: 'dag', selectedNodeId: 'b' });
+    const graphRow = id => graph.text.split('\n')[graph.bodyStart + graph.graphRanges[id].start - graph.scroll];
+    // Collapsed nodes on one lane: the status icon follows the lane dot and its gap directly, selected or not.
+    assert.ok(stripVTControlCharacters(graphRow('b')).startsWith('•  ✓ N_B'), graphRow('b'));
+    assert.ok(stripVTControlCharacters(graphRow('a')).startsWith('•  × N_A'), graphRow('a'));
+    assert.ok(stripVTControlCharacters(graphRow('c')).includes('⠋ N_C'), graphRow('c'));
+    const workers = renderFrame({ connected: true, runs: [], tasks }, { columns: 40, rows: 60, color, frame: 0, view: 'tasks', selectedTaskId: 'tb' });
+    const workerRow = id => workers.text.split('\n')[workers.bodyStart + workers.taskRanges[id].start - workers.scroll];
+    // One cell of bar (or its blank) and then the status icon, for the selected and the unselected cards alike.
+    assert.ok(stripVTControlCharacters(workerRow('tb')).slice(1).startsWith('✓ [+] T_B'), workerRow('tb'));
+    assert.ok(stripVTControlCharacters(workerRow('ta')).slice(1).startsWith('× [+] T_A'), workerRow('ta'));
+    assert.ok(stripVTControlCharacters(workerRow('tc')).slice(1).startsWith('⠋ T_C'), workerRow('tc'));
+    if (!color) {
+      assert.ok(!graph.text.includes('\x1b') && !workers.text.includes('\x1b'));
+      continue;
+    }
+    assert.ok(graphRow('b').includes('\x1b[1;32m✓ N_B'), graphRow('b'));
+    assert.ok(graphRow('a').includes('\x1b[31m× N_A') && !graphRow('a').includes('\x1b[1;'), graphRow('a'));
+    assert.ok(graphRow('c').includes('\x1b[36m⠋ N_C') && !graphRow('c').includes('\x1b[1;'), graphRow('c'));
+    assert.ok(workerRow('tb').includes('\x1b[1;32m✓ [+] T_B'), workerRow('tb'));
+    assert.ok(workerRow('ta').includes('\x1b[31m× [+] T_A') && !workerRow('ta').includes('\x1b[1;'), workerRow('ta'));
+    assert.ok(workerRow('tc').includes('\x1b[36m⠋ T_C') && !workerRow('tc').includes('\x1b[1;'), workerRow('tc'));
   }
 });

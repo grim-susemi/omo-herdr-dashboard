@@ -134,16 +134,16 @@ function durationText(task, timing, status, language) {
   const duration = task ? elapsedTime(task, timing, status) : null;
   return duration ? `${timeMark} ${compactDuration(language, duration.split(':').reduce((total, part) => total * 60 + Number(part), 0) * 1000)}` : '';
 }
-// Title row: marker, status icon, node label, task description (shrinks first) and elapsed time.
+// Title row: status icon, node label, task description (shrinks first) and elapsed time; only the selected title is bold.
 function nodeTitle(node, task, language, timing, room, color, selected) {
   const status = node.state;
   const label = clean(node.label ?? node.id), description = clean(task?.description ?? '');
   const time = durationText(task, timing, status, language);
-  const head = `${selected ? '>' : ' '}${statusIcon(status, timing.frame)} ${label}`;
+  const head = `${statusIcon(status, timing.frame)} ${label}`;
   const tail = time ? [{ text: ` · ${time}`, color: status === 'running' ? roleColors.time : roleColors.counts }] : [];
   const descRoom = room - width(head) - tail.reduce((sum, part) => sum + width(part.text), 0) - 2;
   const desc = description && description !== label && descRoom >= 4 ? { text: `  ${fit(description, descRoom)}` } : null;
-  return partsLine([{ text: head, color: colors[status], bold: status === 'running' }, desc, ...tail].filter(Boolean), room, color);
+  return partsLine([{ text: head, color: colors[status], bold: selected }, desc, ...tail].filter(Boolean), room, color);
 }
 // Card rows under the title: role and model, live activity or progress, counts and cost, then subtasks.
 function nodeDetail(task, tasks, language, timing, room, color) {
@@ -351,7 +351,6 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const room = Math.max(1, roomOverride ?? columns - 4);
   const depthColumns = 2 * Math.min(depth, Math.max(0, Math.floor((room - 12) / 2)));
   const indent = '';
-  const marker = depth ? '↳' : selected ? '>' : ' ';
   const identity = [task?.agent, task?.category].map(part => clean(part).trim()).filter(Boolean).join('/');
   // Keep existing role/model wrapping while removing the visible child inset.
   const badge = identity ? `[${fit(identity, Math.max(1, room - depthColumns - 2))}]` : '';
@@ -360,7 +359,7 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   const modelOwnRow = Boolean(task?.model) && modelRoom < width(task.reasoningEffort ? `:${task.reasoningEffort}` : '') + 2;
   const metadata = modelOwnRow ? `${indent}${badge}` :
     `${indent}${[badge, task?.model ? modelLabel(task, modelRoom) : ''].filter(Boolean).join(' ')}`;
-  const titleText = `${indent}${marker} ${statusIcon(status, timing.frame)} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`;
+  const titleText = `${indent}${depth ? '↳ ' : ''}${statusIcon(status, timing.frame)} ${collapsed ? '[+] ' : ''}${value(task?.description || node?.label)}`;
   // The elapsed time and the turn/tool counts take the card's last row, so neither the title
   // nor the activity row gives up room to them in a narrow pane.
   const counts = stats.join(' · ');
@@ -450,12 +449,11 @@ function detailBox(text, columns, color, status, label) {
     paint(`╰${'─'.repeat(Math.max(0, columns - 2))}╯`, border, color)];
 }
 
-// A compact card trades the box for a status-coloured bar: the title row is bold,
-// a one-row card has no bar, and only the verbose inspection keeps its box.
-function barCard(lines, columns, color, status) {
+// A compact card trades the box for a status-coloured bar: only the selected card's title row is bold, a one-row card has no bar, and only the verbose inspection keeps its box.
+function barCard(lines, columns, color, status, selected = false) {
   const bar = lines.length > 1 ? paint('▌', colors[status], color) : ' ';
   // Rows after the title are already sized to columns - 3 (and may carry a coloured badge).
-  return lines.map((line, index) => `${bar}${index ? `  ${line}` : paint(fit(line, columns - 1), colors[status], color, true)}`);
+  return lines.map((line, index) => `${bar}${index ? `  ${line}` : paint(fit(line, columns - 1), colors[status], color, selected)}`);
 }
 
 function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
@@ -464,7 +462,7 @@ function taskCard(task, tasks, columns, color, language, timing, { selected, exp
   if (!detailed) {
     const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded, color, room: columns - 3 });
     const text = expanded ? [...compact, ...descendantLines(task, tasks, language, timing, columns + 1, color)] : compact.slice(0, 1);
-    return barCard(compactCompleted && !expanded ? compact.slice(0, 1) : text, columns, color, status);
+    return barCard(compactCompleted && !expanded ? compact.slice(0, 1) : text, columns, color, status, selected);
   }
   const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: false, color });
   const text = [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${statusIcon(node.state, timing.frame)} ${t(language, node.state)}`] : []),

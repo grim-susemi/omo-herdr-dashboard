@@ -23,7 +23,7 @@ const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 // Finished rows are told apart by colour: done is dim green and struck through, dropped is dim red.
 const style = { accent: '36', phase: '35', muted: '90', completed: '2;32', abandoned: '2;31',
   in_progress: '36', warning: '33', error: '31', activePhase: '33' };
-const layout = { taskInset: 5, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
+const layout = { taskInset: 4, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2, fallbackColumns: 16, fallbackRows: 4 };
 const marks = { pending: '[ ]', in_progress: '[•]', completed: '[✓]', abandoned: '[×]', cancelled: '[×]' };
 export const STRIKE_INTERVAL_MS = 65;
 export const STRIKE_TOTAL_FRAMES = 14;
@@ -161,7 +161,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
       const key = snapshot?.phaseSummaries?.[phaseIndex]?.taskKeys?.[taskIndex] ??
         JSON.stringify([phase.name, occurrence, task.content, taskOccurrence]);
       const taskStart = bodyLines.length;
-      const prefix = `${target?.key === key ? '>' : ' '}${marks[task.status]} `;
+      const prefix = `${marks[task.status]} `;
       const wrapped = wrap(task.content, columns - layout.taskInset);
       const strikeText = `${prefix}${wrapped.join('')}`;
       const reveal = strikeRevealCount(strikeText, completionFrames.get(key));
@@ -172,7 +172,7 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
         bodyLines.push(task.status === 'completed' ? completedLine(text,
           reveal === undefined ? undefined : index === 0 ? reveal :
             reveal <= consumed ? 0 : layout.taskInset + reveal - consumed, color) :
-          paint(text, task.status, color, task.status === 'in_progress'));
+          paint(text, task.status, color, target?.key === key));
         consumed += [...(index === 0 ? text : line)].length;
       }
       taskRanges[key] = { start: taskStart, end: bodyLines.length, phaseStart: start, status: task.status };

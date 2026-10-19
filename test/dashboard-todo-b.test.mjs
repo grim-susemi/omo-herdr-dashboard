@@ -112,8 +112,8 @@ for (const columns of [24, 30, 40, 54, 80, 120]) for (const language of ['en', '
     const markers = ['[✓]', '[×]', '[•]', '[ ]'];
     for (const [index, key] of snapshot.phaseSummaries[0].taskKeys.entries()) {
       const range = frame.taskRanges[key], lines = frame.bodyLines.slice(range.start, range.end).map(stripVTControlCharacters);
-      assert.equal(lines[0].slice(1, 4), markers[index]);
-      for (const line of lines.slice(1)) assert.ok(line.startsWith('     '));
+      assert.equal(lines[0].slice(0, 3), markers[index]);
+      for (const line of lines.slice(1)) assert.ok(line.startsWith('    '));
     }
     assert.ok(frame.bodyLines[frame.taskRanges[snapshot.target.key].start].startsWith('\x1b[1;36m'));
   });

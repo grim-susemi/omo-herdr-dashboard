@@ -29,7 +29,8 @@ function assertTodo(pane, language, label) {
   assert.ok(lines.some(line => line.startsWith(`${todoText(language, 'now')}: ${lead}`)), `${label}: Now line`);
   const range = frame.taskRanges[target.key];
   assert.ok(range.start >= frame.scroll && range.start < frame.scroll + frame.bodyRows, `${label}: target row in view`);
-  assert.ok(lines[frame.bodyStart + range.start - frame.scroll].startsWith(`>[•] ${lead}`), `${label}: marked target row`);
+  assert.ok(lines[frame.bodyStart + range.start - frame.scroll].startsWith(`[•] ${lead}`), `${label}: target row`);
+  assert.ok(frame.lines[frame.bodyStart + range.start - frame.scroll].startsWith('\x1b[1;36m[•] '), `${label}: bold target row`);
   const footer = lines.at(-1);
   assert.ok(['followOn', 'followShortOn'].some(key => footer.startsWith(todoText(language, key))) &&
     footer.includes(todoText(language, 'current')), `${label}: footer ${footer}`);

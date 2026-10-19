@@ -257,7 +257,7 @@ test('worker and DAG cards follow their content with role badges, a time mark an
     const card = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
     const sub = messages[language].subtask;
     const rows = card.slice(1, -1).map(line => line.slice(2, -2).trimEnd());
-    assert.deepEqual([...rows.slice(0, 4), ...rows.slice(5)], ['> ⠋ ROOT_TITLE', '[deep-high] gpt-6.1-sol:xhigh',
+    assert.deepEqual([...rows.slice(0, 4), ...rows.slice(5)], ['⠋ ROOT_TITLE', '[deep-high] gpt-6.1-sol:xhigh',
       'ROOT_PROGRESS', `⧖ ${language === 'en' ? '1m 0s' : '1분 0초'}`, `  ↳ ${sub} ⠋ CHILD_TITLE`,
       '  [deep-low] gpt-6.1-sol:medium', `    ↳ ${sub} ○ GRAND_TITLE`, '    [quick] gpt-6.1-sol:low'], `${view} ${columns}`);
     assert.ok(rows[4].startsWith(`─ ${t(language, 'subtasksCount', { count: 2 })} ─`), rows[4]);
@@ -390,7 +390,7 @@ test('DAG runs draw no boxes: a lane graph with stage headers and a barred card 
       const title = rows[ranges[node.id].start];
       // The lane carries a dot; an open (running) node keeps its card bar and the spinner beside the name.
       assert.match(title, /^[│ ]*•/u, `${name} ${node.id} dot`);
-      if (node.state === 'running') assert.ok(title.includes(`▌ ${spinnerFrames[0]} `), `${name} card`);
+      if (node.state === 'running') assert.ok(title.includes(`▌${spinnerFrames[0]} `), `${name} card`);
       else assert.ok(!title.includes('▌'), `${name} ${node.id} has no card`);
     }
   }
@@ -406,19 +406,19 @@ test('DAG runs draw no boxes: a lane graph with stage headers and a barred card 
 });
 
 test('a card one column narrower than its longest line truncates with an ellipsis instead of overflowing', () => {
-  const task = { id: 'wide', status: 'running', description: 'D'.repeat(30), agent: 'deep-high', model: 'gpt-6.1-sol',
+  const task = { id: 'wide', status: 'running', description: 'D'.repeat(32), agent: 'deep-high', model: 'gpt-6.1-sol',
     reasoningEffort: 'xhigh', startedAt: '2026-10-14T00:00:00.000Z', progress: 'PROGRESS' };
   const draw = columns => {
     const frame = renderFrame({ connected: true, runs: [], tasks: [task] },
       { columns, rows: 50, color: false, frame: 0, now: cardNow, selectedTaskId: 'wide' });
     return { frame, card: cardLines(frame, frame.taskRanges.wide) };
   };
-  // The title row, '> ⠋ ' plus 30 cells, is the widest; 39 columns leave exactly 34 interior cells.
+  // The title row, '⠋ ' plus 32 cells, is the widest; 39 columns leave exactly 34 interior cells.
   const exact = draw(39);
-  assert.ok(exact.card[1].endsWith(`> ⠋ ${'D'.repeat(30)} │`));
+  assert.ok(exact.card[1].endsWith(`⠋ ${'D'.repeat(32)} │`));
   assert.doesNotMatch(exact.frame.text, /…/);
   const narrow = draw(38);
-  assert.ok(narrow.card[1].endsWith(`> ⠋ ${'D'.repeat(28)}… │`));
+  assert.ok(narrow.card[1].endsWith(`⠋ ${'D'.repeat(30)}… │`));
   assert.ok(narrow.card.every(line => width(line) === 37));
   assert.ok(narrow.frame.text.split('\n').every(line => width(line) < 38));
 });

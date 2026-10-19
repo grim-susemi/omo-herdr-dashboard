@@ -146,7 +146,8 @@ test('compact cards share content-height safe lines, localized counts, selected-
   const compact = renderFrame(state, options);
   const lines = card(compact, 'root-id');
   assert.equal(lines.length, 8, 'four root rows, subtask divider, one child row and borders');
-  assert.match(lines[1], /> ⠋ ROOT_DESCRIPTION/);
+  assert.match(lines[1], /(^|[│▌ ])⠋ ROOT_DESCRIPTION/);
+  assert.doesNotMatch(lines[1], />/);
   assert.match(lines[2], /\[worker\/visual\] gpt-5.4 \(high\)/);
   assert.match(lines[3], /PROGRESS_HEAD.*…/);
   assert.match(lines[4], /9m 5s · 20 turns · 65 tools/);
@@ -341,7 +342,7 @@ test('navigation keeps a selected detail header visible and scrolling remains bo
   const frame = renderFrame(state, { rows: 14, columns: 54, selectedNodeId: 'verify', revealSelection: true, color: false, viewState: { expanded: { [JSON.stringify([runs[0].id, 'verify'])]: true } } });
   const card = frame.nodeRanges.verify;
   assert.ok(card.start >= frame.scroll && card.start < frame.scroll + frame.bodyRows);
-  assert.ok(frame.text.includes(`>○ ${runs[0].nodes.find(node => node.id === 'verify').label}`));
+  assert.ok(frame.text.includes(`○ ${runs[0].nodes.find(node => node.id === 'verify').label}`));
   const end = renderFrame(state, { rows: 14, scroll: 99999, color: false });
   assert.ok(end.scroll < 99999);
 });

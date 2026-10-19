@@ -513,7 +513,8 @@ test('same-scope source error, disconnect and reattach retain an active target w
   f.time.advance(2000);
   await failed;
   assert.equal(viewer.state.target.key, targetKey);
-  assert.ok(!viewer.frame.bodyLines.some(line => stripVTControlCharacters(line).startsWith('>[•] ')));
+  assert.ok(viewer.frame.bodyLines.some(line => line.startsWith('\x1b[36m[•] ')), 'offline in-progress rows keep their colour');
+  assert.ok(!viewer.frame.bodyLines.some(line => line.startsWith('\x1b[1;36m[•] ')), 'no row is drawn as the target offline');
   const disconnected = signal(viewer.events, 'disconnected');
   await f.presence.close(); await disconnected;
   assert.equal(viewer.state.availability, 'disconnected');

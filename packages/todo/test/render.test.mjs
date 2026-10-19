@@ -52,7 +52,8 @@ for (const [columns, rows, bodyRows] of [[80, 24, 15], [40, 16, 7], [24, 8, 2],
     for (const line of frame.lines) assert.ok(fixtureCells(line) <= columns, JSON.stringify(line));
     if (columns === 24) assert.match(frame.text, /2\/5 done:1 drop:1/);
     if (bodyRows > 0) {
-      assert.ok(frame.lines.some(line => line.includes('>[•] ')), 'actual target remains visible');
+      const target = frame.bodyLines[frame.taskRanges[snapshot.target.key].start];
+      assert.ok(target.startsWith('[•] ') && frame.lines.includes(target), 'actual target remains visible');
       assert.ok(frame.askRows <= 2);
       // The first body row is the scrolled row, or the followed phase's title pinned over it.
       const phaseTitle = frame.bodyLines[frame.taskRanges[snapshot.target.key].phaseStart];
@@ -69,7 +70,7 @@ test('every phase shell and every actual status remain accessible by basic body 
   assert.equal(Object.keys(full.phaseRanges).length, 3);
   assert.equal(Object.keys(full.taskRanges).length, 5);
   assert.equal(Object.values(full.taskRanges).filter(range => range.status === 'in_progress').length, 2);
-  assert.equal(full.bodyLines.filter(line => line.startsWith(' [•] ') || line.startsWith('>[•] ')).length, 2);
+  assert.equal(full.bodyLines.filter(line => line.startsWith('[•] ')).length, 2);
   for (const [index, phase] of snapshot.phases.entries()) {
     const range = full.phaseRanges[snapshot.phaseSummaries[index].key];
     const frame = renderFrame(snapshot, { columns: 40, rows: 16, scroll: range.start, color: false, completedExpanded: true });
@@ -179,7 +180,10 @@ test('retained native target drives marker and reveal without replacing the snap
   const retained = runningTarget(snapshot, target);
   const followed = renderFrame(snapshot, { rows: 16, columns: 40, color: false, target: retained, revealTarget: true });
   assert.ok(followed.scroll > 0);
-  assert.match(followed.text, />\[•\] NATIVE_28/);
+  assert.match(followed.text, /^\[•\] NATIVE_28/m);
+  const colored = renderFrame(snapshot, { rows: 16, columns: 40, color: true, target: retained, revealTarget: true });
+  assert.ok(colored.lines.some(line => line.startsWith('\x1b[1;36m[•] NATIVE_28')), 'the retained target row is bold');
+  assert.ok(colored.bodyLines.some(line => line.startsWith('\x1b[36m[•] NATIVE_0')), 'the snapshot target row is not');
   const paused = renderFrame(snapshot, { rows: 16, columns: 40, color: false,
     target: retained, follow: false, revealTarget: false });
   assert.equal(paused.scroll, 0);
@@ -221,7 +225,8 @@ test('following pins the phase holding current work to the first body row', () =
     { name: 'Next', tasks: [{ content: 'X1', status: 'pending' }] }]);
   const followed = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true, revealTarget: true });
   assert.match(followed.lines[followed.bodyStart], /─ Now /);
-  assert.ok(followed.lines.some(line => line.includes('>[•] N2')));
+  assert.ok(followed.lines.includes(followed.bodyLines[followed.taskRanges[snapshot.target.key].start]));
+  assert.ok(followed.lines.some(line => line.startsWith('[•] N2')));
   assert.ok(followed.lines.some(line => line.includes('X1')));
   const paused = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true });
   assert.match(paused.lines[paused.bodyStart], /─ Done /);
@@ -232,7 +237,8 @@ test('a phase longer than the pane keeps its title on top while the current work
     content: `ROW_${index}`, status: index === 15 ? 'in_progress' : 'pending' })) }]);
   const frame = renderFrame(snapshot, { columns: 40, rows: 10, color: false, revealTarget: true });
   assert.match(frame.lines[frame.bodyStart], /─ Long /);
-  assert.match(frame.lines[frame.bodyStart + 1], />\[•\] ROW_15/);
+  assert.equal(frame.lines[frame.bodyStart + 1], frame.bodyLines[frame.taskRanges[snapshot.target.key].start]);
+  assert.match(frame.lines[frame.bodyStart + 1], /^\[•\] ROW_15/);
   assert.ok(!frame.lines.some(line => /ROW_0\b/.test(line)));
 });
 
@@ -243,4 +249,27 @@ test('done and dropped rows carry different colours', () => {
   const row = text => frame.bodyLines.find(line => line.includes(text));
   assert.ok(row('DONE').startsWith('\x1b[9;2;32m'), JSON.stringify(row('DONE')));
   assert.ok(row('DROP').startsWith('\x1b[2;31m'), JSON.stringify(row('DROP')));
+});
+
+test('todo rows start at the mark and only the tracked row is bold', () => {
+  const snapshot = mixed();
+  const frame = renderFrame(snapshot, { columns: 40, rows: 60, color: true, completedExpanded: true });
+  const keys = snapshot.phaseSummaries.flatMap(summary => summary.taskKeys ?? []);
+  assert.equal(keys.length, 5);
+  for (const key of keys) {
+    const range = frame.taskRanges[key];
+    const rows = frame.bodyLines.slice(range.start, range.end).map(line => stripVTControlCharacters(line));
+    assert.match(rows[0], /^\[[ •✓×]\] \S/, key);
+    // Wrapped rows hang under the text, four cells in: the mark and its gap.
+    for (const row of rows.slice(1)) assert.match(row, /^ {4}\S/, key);
+  }
+  const tracked = frame.taskRanges[snapshot.target.key];
+  assert.ok(tracked.end - tracked.start > 1, 'the tracked task wraps');
+  for (const line of frame.bodyLines.slice(tracked.start, tracked.end)) assert.ok(line.startsWith('\x1b[1;36m'), JSON.stringify(line));
+  const parallel = keys.filter(key => key !== snapshot.target.key && frame.taskRanges[key].status === 'in_progress');
+  assert.equal(parallel.length, 1);
+  const other = frame.taskRanges[parallel[0]];
+  for (const line of frame.bodyLines.slice(other.start, other.end)) assert.ok(line.startsWith('\x1b[36m'), JSON.stringify(line));
+  const boldRows = frame.bodyLines.filter(line => line.startsWith('\x1b[1;36m'));
+  assert.equal(boldRows.length, tracked.end - tracked.start, 'only the tracked task rows are bold');
 });
