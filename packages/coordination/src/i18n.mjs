@@ -1,31 +1,28 @@
-// Fixed strings of the OmO collaboration pane. The footer follow label is the same
-// single form every dashboard pane uses (todo and DAG catalogs carry the same words).
+// Fixed strings of the OmO collaboration pane. The header, section and footer words follow the
+// other dashboard panes (Name [done/total], `─ Section ───`, `Follow ON · LIVE`).
 export const messages = {
   en: {
-    title: 'OmO Collab', header: 'Collab · Advisor', healthy: '●OK', attention: '⚠Check',
-    coordination: 'Coord', connected: '● connected', noCarrier: '○ no carrier',
-    disabled: '○ disabled', checking: '○ checking', closed: '○ session ended', error: '⚠ error',
-    baseline: ' baseline {hash}…', noBaseline: ' baseline unknown', recent: 'Recent flow',
+    title: 'OmO Collab', name: 'Collab', wait: 'wait {count}', failed: '×{count}', flow: 'Flow {count}',
     emptyFlow: ' (no collaboration yet)', advisor: 'Advisor', advisorOn: '● on', advisorOff: '○ off',
-    advisorNone: '○ no record', consults: 'consults {count}', stops: ' STOP {count}', last: ' · {time}',
+    advisorNone: '○ no record', stats: '{consults} consults · {stops} STOP',
+    kindNotify: 'note', kindInspect: 'check', kindRepair: 'fix', kindAdvisor: 'advisor',
+    live: 'LIVE', noCarrier: 'no carrier', disabled: 'off', closed: 'ended', checking: 'checking', error: 'error',
     followOn: 'Follow ON', followOff: 'Follow OFF', note: 'note',
   },
   ko: {
-    title: 'OmO 협업', header: '협업 · 어드바이저', healthy: '●정상', attention: '⚠확인',
-    coordination: '코디네이션', connected: '● 연결됨', noCarrier: '○ 캐리어 없음',
-    disabled: '○ 꺼짐', checking: '○ 확인 중', closed: '○ 세션 종료', error: '⚠ 오류',
-    baseline: ' baseline {hash}…', noBaseline: ' baseline 미확인', recent: '최근 흐름',
-    emptyFlow: ' (아직 협업 없음)', advisor: '어드바이저', advisorOn: '● on', advisorOff: '○ off',
-    advisorNone: '○ 기록 없음', consults: '자문 {count}', stops: ' 열린 STOP {count}', last: ' · {time}',
+    title: 'OmO Collab', name: 'Collab', wait: 'wait {count}', failed: '×{count}', flow: 'Flow {count}',
+    emptyFlow: ' (no collaboration yet)', advisor: 'Advisor', advisorOn: '● on', advisorOff: '○ off',
+    advisorNone: '○ no record', stats: '{consults} consults · {stops} STOP',
+    kindNotify: 'note', kindInspect: 'check', kindRepair: 'fix', kindAdvisor: 'advisor',
+    live: 'LIVE', noCarrier: 'no carrier', disabled: 'off', closed: 'ended', checking: 'checking', error: 'error',
     followOn: 'Follow ON', followOff: 'Follow OFF', note: '노트',
   },
   'zh-cn': {
-    title: 'OmO 协作', header: '协作 · 顾问', healthy: '●正常', attention: '⚠检查',
-    coordination: '协调', connected: '● 已连接', noCarrier: '○ 无载体',
-    disabled: '○ 已关闭', checking: '○ 检查中', closed: '○ 会话结束', error: '⚠ 错误',
-    baseline: ' baseline {hash}…', noBaseline: ' baseline 未知', recent: '最近流程',
+    title: 'OmO 协作', name: '协作', wait: '等待 {count}', failed: '×{count}', flow: '流程 {count}',
     emptyFlow: ' (暂无协作)', advisor: '顾问', advisorOn: '● on', advisorOff: '○ off',
-    advisorNone: '○ 无记录', consults: '咨询 {count}', stops: ' STOP {count}', last: ' · {time}',
+    advisorNone: '○ 无记录', stats: '咨询 {consults} · STOP {stops}',
+    kindNotify: '备注', kindInspect: '检查', kindRepair: '修复', kindAdvisor: '顾问',
+    live: '在线', noCarrier: '无载体', disabled: '已关闭', closed: '会话结束', checking: '检查中', error: '错误',
     followOn: '跟随 ON', followOff: '跟随 OFF', note: '备注',
   },
 };

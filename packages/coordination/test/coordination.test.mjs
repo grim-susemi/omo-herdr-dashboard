@@ -45,8 +45,8 @@ test('a session filter keeps only that session\'s lines, so the flow and the bad
     const status = { v: 1, state: 'connected', protocol: 'api v1' };
     const head = session => renderFrame({ status, events: readActivity(file, { session }) },
       { columns: 28, rows: 30, language: 'ko', color: false }).plain[0];
-    assert.match(head('s1'), /⚠확인$/);
-    assert.match(head('s2'), /●정상$/);
+    assert.equal(head('s1'), 'Collab [1/2]  ×1 · wait 1');
+    assert.equal(head('s2'), 'Collab [0/1]  wait 1');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -152,40 +152,53 @@ test('advisor summary counts consults and gate stops of the newest job', () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('a 28x30 frame shows connection, baseline, flow, advisor and the unified follow footer', () => {
+test('a 28x30 frame shows the shared header, a flow card per ask, the advisor section and the follow footer', () => {
   const status = { v: 1, state: 'connected', protocol: 'api v1', baseline: 'eb2db2c195edcf8e42dac8944535b7df85ad6e90fe1c806676573296799b2287' };
-  const frame = renderFrame({ status, events: [ask, reply], advisor: { state: 'on', consults: 2, stops: 0, last: '2026-10-18T08:10:00.000Z' } },
-    { columns: 28, rows: 30, language: 'ko', color: false, timeZone: 'UTC' });
+  const advisor = { state: 'on', consults: 2, stops: 0, last: '2026-10-18T08:10:00.000Z' };
+  const options = { columns: 28, rows: 30, language: 'ko', color: false, timeZone: 'UTC' };
+  const frame = renderFrame({ status, events: [ask, reply], advisor }, options);
   assert.equal(frame.plain.length, 30);
   assert.ok(frame.plain.every(row => width(row) <= 27));
-  assert.match(frame.plain[0], /^협업 · 어드바이저 +●정상$/);
-  assert.equal(frame.plain[2], '코디네이션 ● 연결됨 v1');
-  // The real 28-column pane gives the viewer about 25 columns: the connection line still fits whole.
+  // Name [done/total] as in the other panes; the ask and its reply are one card.
+  assert.equal(frame.plain[0], 'Collab [1/1]');
+  assert.match(frame.plain[2], /^─ Flow 1 ─+$/);
+  assert.equal(frame.plain[3], ' ✓ 리드→워커A · ⧖ 3s');
+  assert.equal(frame.plain[4], ' 08:22 "레인2 상태 어때?"');
+  assert.equal(frame.plain[5], ' ↳ 빌드 중, 3분 남음');
+  assert.match(frame.plain.at(-4), /^─ Advisor ● on 08:10 ─+$/);
+  assert.equal(frame.plain.at(-3), ' 2 consults · 0 STOP');
+  assert.equal(frame.plain.at(-1), 'Follow ON · LIVE');
+  // The connection and baseline rows are gone: the link is named in the footer only.
+  assert.ok(!frame.plain.some(row => /baseline|v1/.test(row)));
+  // A waiting ask carries the running bar, spinner and elapsed time of a running worker card.
+  const waiting = renderFrame({ status, events: [ask] }, { ...options, now: Date.parse(ask.ts) + 45000 });
+  assert.equal(waiting.plain[0], 'Collab [0/1]  wait 1');
+  assert.equal(waiting.plain[3], '▌⠋ 리드→워커A · ⧖ 45s');
+  const colored = renderFrame({ status, events: [ask, reply], advisor }, { ...options, color: true });
+  assert.deepEqual(colored.plain, frame.plain);
+  assert.ok(colored.text.includes('\x1b[1;36mCollab'));
+  // The real 28-column pane gives the viewer about 25 columns: header and footer fit whole.
   for (const language of ['ko', 'en', 'zh-cn']) {
-    const narrow = renderFrame({ status, events: [] }, { columns: 25, rows: 30, language, color: false });
-    assert.ok(!narrow.plain[2].endsWith('…') && narrow.plain[2].endsWith('v1'), `${language}: ${narrow.plain[2]}`);
+    const narrow = renderFrame({ status, events: [ask, reply] }, { columns: 25, rows: 30, language, color: false });
+    for (const row of [narrow.plain[0], narrow.plain.at(-1)]) assert.ok(!row.endsWith('…'), `${language}: ${row}`);
   }
-  assert.equal(frame.plain[3], ' baseline eb2db2c1…');
-  assert.equal(frame.plain[5], '08:22 리드→워커A ❓ ⏳');
-  assert.equal(frame.plain[6], ' "레인2 상태 어때?"');
-  assert.equal(frame.plain[7], '08:22 워커A→리드 ✅ 3s');
-  assert.equal(frame.plain.at(-1), 'Follow ON · 1–2/2');
-  assert.ok(frame.plain.includes('어드바이저 ● on · 자문 2'));
 });
 
-test('an empty or unknown state renders the empty frame without an error', () => {
+test('an empty or unknown state renders the empty frame without an error or a warning', () => {
   const frame = renderFrame({ status: null, events: [], advisor: undefined }, { columns: 28, rows: 30, language: 'ko', color: false });
-  assert.equal(frame.plain[2], '코디네이션 ○ 확인 중');
-  assert.ok(frame.plain.includes(' (아직 협업 없음)'));
-  assert.equal(frame.plain.at(-1), 'Follow ON · 0–0/0');
-  assert.match(frame.plain[0], /⚠확인$/);
+  assert.equal(frame.plain[0], 'Collab [0/0]');
+  assert.ok(frame.plain.includes(' (no collaboration yet)'));
+  assert.match(frame.plain.at(-3), /^─ Advisor ○ no record ─+$/);
+  assert.equal(frame.plain.at(-1), 'Follow ON · checking');
+  // Only a failed card raises a warning; an unconnected pane does not.
+  assert.ok(!frame.plain.some(row => row.includes('⚠')));
 });
 
-test('scrolling up pauses follow and the counter names the events shown', () => {
+test('scrolling up pauses follow and the counter names the cards shown', () => {
   const events = Array.from({ length: 20 }, (_, index) => ({ ...reply, id: `q-${index}` }));
-  const frame = renderFrame({ events }, { columns: 28, rows: 16, language: 'ko', color: false, follow: false, offset: 4 });
-  // 16 rows leave 6 flow rows = 3 events; 4 rows up from the newest ends at event 18.
-  assert.equal(frame.plain.at(-1), 'Follow OFF · 16–18/20');
+  const frame = renderFrame({ status: { state: 'connected' }, events }, { columns: 28, rows: 16, language: 'ko', color: false, follow: false, offset: 4 });
+  // 16 rows leave 10 flow rows = 5 two-row cards; 4 rows up from the newest shows cards 14 to 18.
+  assert.equal(frame.plain.at(-1), 'Follow OFF · 14–18/20');
 });
 
 test('the lower row splits 86 columns into the measured 28 | 28 | 30', () => {
