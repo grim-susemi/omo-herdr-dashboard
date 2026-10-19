@@ -15,7 +15,7 @@ export const messages = {
     advisorNone: '○ no record', stats: '{consults} consults · {stops} STOP',
     kindNotify: 'note', kindInspect: 'check', kindRepair: 'fix', kindAdvisor: 'advisor',
     live: 'LIVE', noCarrier: 'no carrier', disabled: 'off', closed: 'ended', checking: 'checking', error: 'error',
-    followOn: 'Follow ON', followOff: 'Follow OFF', note: '노트',
+    followOn: 'Follow ON', followOff: 'Follow OFF', note: 'note',
   },
   'zh-cn': {
     title: 'OmO 协作', name: '协作', wait: '等待 {count}', failed: '×{count}', flow: '流程 {count}',

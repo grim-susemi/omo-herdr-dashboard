@@ -540,7 +540,9 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const all = state?.runs ?? [];
   const run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
   const roots = standaloneTasks(state);
-  const tasksView = view === 'tasks' || !all.length;
+  // The fixed DAG role stays a DAG pane with no run yet; only the standalone viewer falls back to tasks.
+  const dagRole = fixed && view === 'dag';
+  const tasksView = view === 'tasks' || !all.length && !dagRole;
   // One header row "name [done/total]  summary" under which a divider runs, the same shape as the Todo pane.
   const headLine = (name, done, total, detail) => {
     const tally = `[${done}/${total}]`, rest = columns - width(`${name} ${tally}`) - 2;
@@ -552,6 +554,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const switchHint = fixed ? '' : tasksView ? (all.length ? ` · DAG (${all.length})` : '') : ` · ${t(language, 'tasks')} (${roots.length})`;
   const head = [headLine(t(language, 'tasks'), rootsDone, roots.length,
     `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })}${switchHint}`), separator(columns, color)];
+  if (dagRole && !run) head[0] = headLine('DAG', 0, 0, t(language, 'none'));
   const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
   if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'),
     ...(state?.connected ? [] : [t(language, 'disconnected')]), '');
@@ -605,7 +608,10 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     }
     for (const node of run.nodes) if (node.error) body.push('', `× ${clean(node.id)}: ${node.error}`);
   } else {
-    body.push('', `  ○  ${t(language, 'waiting')}`, '', `  ${t(language, 'waitingLine1')}`, `  ${t(language, 'waitingLine2')}`);
+    // An empty pane names its own role: the worker pane waits for workers, the DAG pane for a run.
+    const [first, line1, line2] = view === 'tasks' ? ['noWorkers', 'noWorkersLine1', 'noWorkersLine2'] :
+      ['waiting', 'waitingLine1', 'waitingLine2'];
+    body.push('', `  ○  ${t(language, first)}`, '', paint(`  ${t(language, line1)}`, dim, color), paint(`  ${t(language, line2)}`, dim, color));
   }
   const narrow = columns < 40;
   const available = Math.max(0, rows - head.length - 2 - Number(Boolean(error)) - Number(Boolean(notice)));
@@ -627,7 +633,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
         /^[╭╰]─+[╮╯]$/.test(clean(body[from]))) visible[from - start] = '';
   }
   while (visible.length < available) visible.push('');
-  if (!tasksView && narrow && available === 1) {
+  if (!tasksView && run && narrow && available === 1) {
     const node = run.nodes.find(node => node.id === runningNodeId) ??
       run.nodes.find(node => graphRanges[node.id]?.start <= start && graphRanges[node.id]?.end > start) ??
       run.nodes.find(node => node.id === selectedNodeId) ?? run.nodes[0];

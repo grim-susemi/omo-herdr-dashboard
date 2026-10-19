@@ -36,7 +36,7 @@ test('unsupported host Node falls back to PATH and rejects non-Node probe respon
   for (const result of [reply('/old/node', '22.0.0'), reply('/bun', '24.0.0', true),
     { stdout: 'omob dev build' }, reply('node'), { stdout: '{}' }]) {
     await assert.rejects(resolveViewerNode({ env: {}, execPath: '/compiled/omo', language: 'ko',
-      run: async () => result }), /Node.js 24 이상/);
+      run: async () => result }), /Node.js 24 or later/);
   }
 });
 

@@ -11,30 +11,8 @@ import { readJson } from './storage.mjs';
 import { TASK_SCOPE, emptyViewState, isExpanded, loadViewState, saveViewState, setExpanded } from './view-state.mjs';
 
 export function renderFixedFrame(state, options, view) {
-  const columns = Math.max(1, (options.columns ?? 54) - 1), rows = Math.max(1, options.rows ?? 48);
-  if (view === 'dag' && !state?.runs?.length) {
-    // The same frame as every other pane: one header row and a divider, then a divider above the footer.
-    const divider = '─'.repeat(columns);
-    const head = [`DAG [0/0]  ${t(state?.language, 'none')}`, divider];
-    const body = [options.error || '', state?.connected ? t(state?.language, 'waiting') : t(state?.language, 'disconnected')];
-    const narrow = columns < 40;
-    const status = options.error ? t(state?.language, options.offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: options.error }) :
-      `${t(state?.language, narrow ? options.follow && state?.connected ? 'followShortOn' : 'followShortOff' :
-        options.follow && state?.connected ? 'followOn' : 'followOff')} · ${t(state?.language, options.offline || !state?.connected ?
-        !state?.connected && !narrow ? 'disconnected' : 'offlineShort' : 'liveShort')}`;
-    const foot = [divider, status];
-    // A short pane drops body rows first so the footer stays.
-    const shown = body.length > rows - foot.length - head.length ? body.filter(Boolean) : body;
-    const lines = [...head, ...shown].slice(0, Math.max(0, rows - foot.length));
-    while (lines.length < Math.max(0, rows - foot.length)) lines.push('');
-    const plain = [...lines, ...foot].slice(-rows).map(line => fit(line, columns));
-    // Colour after sizing, as renderFrame does: name cyan, count yellow, summary and dividers dim.
-    const paint = (text, code) => options.color === false ? text : `\x1b[${code}m${text}\x1b[0m`;
-    const colored = plain.map((line, index) => line === divider ? paint(line, '2') : index === 0 && line.startsWith('DAG [0/0]') ?
-      `${paint('DAG', '1;36')} ${paint('[0/0]', '1;33')}${line.length > 9 ? paint(line.slice(9), '2') : ''}` : line);
-    return { text: colored.join('\n'), scroll: 0, nodeRanges: {}, taskRanges: {}, graphRanges: {} };
-  }
-  // The fixed role keeps renderFrame's own header row (name [done/total] summary); no footer invites a mode switch.
+  // The fixed role keeps renderFrame's own header row (name [done/total] summary), body and coloured footer,
+  // an empty DAG pane included; no footer invites a mode switch.
   return renderFrame(state, { ...options, view, fixed: true });
 }
 

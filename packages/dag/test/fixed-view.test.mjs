@@ -111,11 +111,29 @@ for (const view of ['dag', 'tasks']) for (const columns of [80, 24])
     assert.doesNotMatch(frame, /Follow ON.*Connected/);
     assert.ok(frame.split('\n').every(line => width(line) < columns));
     if (view === 'dag') {
+      // An empty DAG pane keeps the same footer rows as a populated one: the read error sits above the divider.
       const empty = renderFixedFrame({ ...state, runs: [] }, options, view).text;
-      assert.match(empty.split('\n').slice(-2).join('\n'), /^Read error:/m);
+      assert.match(empty.split('\n').slice(-4).join('\n'), /^Read error:/m);
       assert.doesNotMatch(empty, /ORDINARY_ROOT|Tasks|Follow ON/);
     }
   });
+
+test('empty worker and DAG panes name their own role and share the coloured header and footer', () => {
+  const empty = connected => ({ connected, language: 'ko', runs: [], tasks: [] });
+  for (const [view, name, line] of [['tasks', 'Workers', 'No workers yet'], ['dag', 'DAG', 'Waiting for a DAG']]) {
+    for (const connected of [true, false]) {
+      const frame = renderFixedFrame(empty(connected), { columns: 26, rows: 12, color: true, follow: true }, view).text;
+      const lines = frame.split('\n'), plain = stripVTControlCharacters(frame);
+      assert.ok(plain.includes(`○  ${line}`), `${view}: ${plain}`);
+      // The worker pane no longer borrows the DAG wording, and neither pane keeps Korean chrome.
+      if (view === 'tasks') assert.doesNotMatch(plain, /DAG/);
+      assert.doesNotMatch(plain, /[\uac00-\ud7a3]/);
+      assert.ok(lines[0].startsWith(`\x1b[1;36m${name}\x1b[0m`), lines[0]);
+      assert.equal(lines.at(-1), connected ? '\x1b[36mFollow ON · LIVE\x1b[0m' : '\x1b[33mFollow OFF · OFFLINE\x1b[0m');
+      assert.ok(lines.every(row => width(row) < 26));
+    }
+  }
+});
 
 
 
