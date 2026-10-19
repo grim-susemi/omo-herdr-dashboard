@@ -43,11 +43,14 @@ export function parseActivityLine(line) {
   return { ...value, to: value.to ?? null, summary: value.summary.slice(0, 160) };
 }
 
-export function readActivity(path) {
+// With `session`, only that session's lines: the mod stamps `session` on ask, notify
+// and inspect lines (a child's lines carry its parent's session); lines without one
+// (auto-repair) cannot be attributed to a session and are left out.
+export function readActivity(path, { session } = {}) {
   const events = [];
   for (const line of tailLines(path)) {
     const event = parseActivityLine(line);
-    if (event) events.push(event);
+    if (event && (session === undefined || event.session === session)) events.push(event);
   }
   return events.slice(-MAX_EVENTS);
 }

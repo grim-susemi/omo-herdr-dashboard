@@ -31,7 +31,6 @@ export default function extension(pi, { createController = options => new Coordi
       controller = createController({ stateDir, dagStateDir, viewer, language, cwd: pi.cwd,
         receiptPath: join(agentDir, '.agent-coordination-install', 'receipt.json'),
         activityPath: join(agentDir, 'coordination-activity.jsonl'),
-        advisorPath: join(agentDir, 'logs', 'oracle-advisor.jsonl'),
         parentPane: process.env.HERDR_PANE_ID, sessionId: ctx.sessionManager?.getSessionId?.(),
         herdr: createHerdr(), node: () => resolveViewerNode({ language }) });
       // Placement waits for the dashboard panes in the background; a failure never reaches the session.

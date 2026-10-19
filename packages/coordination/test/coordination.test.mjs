@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseActivityLine, readActivity, readAdvisor, readStatus, tailLines } from '../src/activity.mjs';
 import { renderFrame } from '../src/render.mjs';
-import { CoordinationPane, connectionStatus, lowerRowWidths, API_KEY, API_READY_KEY } from '../src/controller.mjs';
+import { CoordinationPane, advisorSummary, connectionStatus, lowerRowWidths, ADVISOR_KEY, API_KEY, API_READY_KEY } from '../src/controller.mjs';
+import { parseArgs, snapshot } from '../src/viewer.mjs';
 import { width } from '../../dag/src/render.mjs';
 
 const directory = () => mkdtempSync(join(tmpdir(), 'omo-coordination-'));
@@ -27,6 +28,100 @@ test('missing, corrupt and half-written activity files read as an empty or parti
     assert.deepEqual(readStatus(join(dir, 'absent.json')), null);
     writeFileSync(join(dir, 'status.json'), '{broken');
     assert.equal(readStatus(join(dir, 'status.json')), null);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a session filter keeps only that session\'s lines, so the flow and the badge differ per pane', () => {
+  const dir = directory();
+  try {
+    const file = join(dir, 'activity.jsonl');
+    const repair = { v: 1, ts: ask.ts, kind: 'repair', from: 'auto-repair', to: null, summary: 'settled t1 run 1', ok: true, phase: 'done' };
+    writeFileSync(file, line({ ...ask, id: 'a', session: 's1' }) + line({ ...ask, id: 'b', session: 's2' }) + line(repair) +
+      line({ ...reply, id: 'c', session: 's1', ok: false }));
+    assert.deepEqual(readActivity(file).map(event => event.id ?? event.kind), ['a', 'b', 'repair', 'c']);
+    assert.deepEqual(readActivity(file, { session: 's1' }).map(event => event.id), ['a', 'c']);
+    assert.deepEqual(readActivity(file, { session: 's2' }).map(event => event.id), ['b']);
+    assert.deepEqual(readActivity(file, { session: 's3' }), []);
+    const status = { v: 1, state: 'connected', protocol: 'api v1' };
+    const head = session => renderFrame({ status, events: readActivity(file, { session }) },
+      { columns: 28, rows: 30, language: 'ko', color: false }).plain[0];
+    assert.match(head('s1'), /⚠확인$/);
+    assert.match(head('s2'), /●정상$/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the viewer snapshot filters by --session and takes the advisor from the status file', () => {
+  const dir = directory();
+  try {
+    const [statusFile, activityFile, advisorFile] = ['status.json', 'activity.jsonl', 'oracle-advisor.jsonl'].map(name => join(dir, name));
+    writeFileSync(activityFile, line({ ...ask, id: 'a', session: 's1' }) + line({ ...ask, id: 'b', session: 's2' }));
+    writeFileSync(advisorFile, line({ at: '2026-10-18T01:00:00.000Z', event: 'consult', job_id: 'J9' }));
+    const own = { state: 'on', job: 'J1', consults: 1, stops: 0, last: null };
+    writeFileSync(statusFile, JSON.stringify({ v: 1, state: 'connected', advisor: own }));
+    const options = parseArgs(['--status', statusFile, '--activity', activityFile, '--advisor', advisorFile, '--session', 's1']);
+    assert.equal(options.session, 's1');
+    assert.deepEqual(snapshot(options).events.map(event => event.id), ['a']);
+    assert.deepEqual(snapshot(options).advisor, own);
+    // A status file without an advisor record falls back to an explicit --advisor log.
+    writeFileSync(statusFile, JSON.stringify({ v: 1, state: 'connected' }));
+    assert.equal(snapshot(options).advisor.job, 'J9');
+    assert.equal(snapshot({ ...options, advisor: undefined }).advisor, undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('advisor summary reads this process\'s advisor job, not the newest job of any session', () => {
+  assert.deepEqual(advisorSummary({}), { state: 'none', consults: 0, stops: 0, last: null });
+  assert.equal(advisorSummary({ [ADVISOR_KEY]: { disabled: true, runtime: null } }).state, 'off');
+  const job = { job_id: 'J1', status: 'active', opened_at: '2026-10-20T00:00:00.000Z', counters: { consults: 2 },
+    stops: { S1: { status: 'open' }, S2: { status: 'overridden' } } };
+  const host = (status, facts) => ({ [ADVISOR_KEY]: { runtime: { getSessionStatus: () => status, ledger: { jobFacts: facts } } } });
+  assert.deepEqual(advisorSummary(host('lead', job)), { state: 'on', job: 'J1', consults: 2, stops: 1, last: '2026-10-20T00:00:00.000Z' });
+  assert.equal(advisorSummary(host('lead', job), '2026-10-20T01:00:00.000Z').last, '2026-10-20T01:00:00.000Z');
+  assert.equal(advisorSummary(host('lead', { ...job, status: 'paused' })).state, 'off');
+  assert.equal(advisorSummary(host('lead', null)).state, 'none');
+  assert.equal(advisorSummary(host('child', job)).state, 'none');
+  const broken = { [ADVISOR_KEY]: { runtime: { getSessionStatus() { throw new Error('gone'); } } } };
+  assert.equal(advisorSummary(broken).state, 'none');
+});
+
+test('advisor ledger events rewrite the status file once per window and stop unsubscribes', async () => {
+  const dir = directory();
+  try {
+    const listeners = new Set();
+    let facts = null;
+    const ledger = { get jobFacts() { return facts; }, subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); } };
+    const host = { [ADVISOR_KEY]: { runtime: { getSessionStatus: () => 'lead', ledger } } };
+    const pending = [];
+    const timers = { setTimeout(callback) { pending.push(callback); return pending.length; }, clearTimeout() {} };
+    const controller = new CoordinationPane({ stateDir: dir, dagStateDir: join(dir, 'dag'), parentPane: 'P', sessionId: 's1',
+      cwd: dir, herdr: async () => ({}), node: async () => 'node', viewer: 'viewer.mjs', activityPath: 'a.jsonl',
+      host, env: { OMO_HERDR_COORDINATION_PANE: '0' }, timers });
+    await controller.start();
+    assert.equal(readStatus(controller.statusFile).advisor.state, 'none');
+    assert.equal(listeners.size, 1);
+    facts = { job_id: 'J1', status: 'active', opened_at: '2026-10-20T00:00:00.000Z', counters: { consults: 0 }, stops: {} };
+    for (const listener of listeners) { listener({ type: 'job_opened' }); listener({ type: 'trigger_state_recorded' }); }
+    assert.equal(pending.length, 1);
+    await pending.shift()();
+    const advisor = readStatus(controller.statusFile).advisor;
+    assert.equal(advisor.state, 'on');
+    assert.equal(advisor.job, 'J1');
+    assert.ok(Number.isFinite(Date.parse(advisor.last)));
+    // Bookkeeping entries alone do not move the last-activity time.
+    const before = controller.advisorLast;
+    for (const listener of listeners) listener({ type: 'progress_recorded' });
+    assert.equal(controller.advisorLast, before);
+    assert.equal(pending.length, 1);
+    // A listener that cannot schedule never throws into the advisor's append.
+    pending.length = 0;
+    controller.advisorTimer = undefined;
+    const throwing = { ...timers, setTimeout() { throw new Error('no timers'); } };
+    controller.timers = throwing;
+    for (const listener of listeners) assert.doesNotThrow(() => listener({ type: 'consult_started' }));
+    controller.timers = timers;
+    await controller.stop();
+    assert.equal(listeners.size, 0);
+    assert.equal(readStatus(controller.statusFile).state, 'closed');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -127,10 +222,11 @@ test('placement splits workers, swaps the new pane leftmost, resizes the group a
       calls.push(args.join(' '));
       if (args[0] === 'layout') return { layout: { tab_id: 't1', panes } };
       if (args[0] === 'split') { panes = [...panes, pane('C', 103, 16, 17, 30)]; return { pane: { pane_id: 'C' } }; }
+      if (args[0] === 'close') panes = panes.filter(entry => entry.pane_id !== args[1]);
       return {};
     };
     const controller = new CoordinationPane({ stateDir: join(dir, 'state'), dagStateDir, parentPane: 'P', sessionId: 's1',
-      cwd: dir, herdr, node: async () => 'node', viewer: 'viewer.mjs', activityPath: 'a.jsonl', advisorPath: 'o.jsonl',
+      cwd: dir, herdr, node: async () => 'node', viewer: 'viewer.mjs', activityPath: 'a.jsonl',
       host: {}, env: {} });
     // The first look only records the lower row; the split waits for the same row on the next tick.
     assert.equal(await controller.placeOnce(), false);
@@ -141,9 +237,44 @@ test('placement splits workers, swaps the new pane leftmost, resizes the group a
     assert.match(calls[2], /^split --pane W --direction right --ratio 0\.5/);
     assert.equal(calls[3], 'swap --source-pane C --target-pane W');
     assert.match(calls[4], /^resize --pane W --direction right --amount 0\.2558/);
+    // The viewer filters the shared flow to this session and no longer reads the shared advisor log.
+    assert.match(calls[5], /'--session' 's1'/);
+    assert.doesNotMatch(calls[5], /--advisor/);
     // A second session start finds its live pane and mutates nothing.
     calls.length = 0;
     assert.equal(await new CoordinationPane({ ...controller }).placeOnce(), true);
     assert.deepEqual(calls, ['layout --pane P']);
+    // A new session in the same chat pane replaces the viewer that filters on the old session.
+    calls.length = 0;
+    const next = new CoordinationPane({ ...controller, sessionId: 's2' });
+    assert.equal(await next.placeOnce(), false);
+    assert.equal(next.state, 'replacing');
+    assert.deepEqual(calls, ['layout --pane P', 'close C']);
+    assert.equal(await next.placeOnce(), false);
+    assert.equal(await next.placeOnce(), true);
+    assert.match(calls.find(call => call.startsWith('run ')), /'--session' 's2'/);
+    const record = JSON.parse(readFileSync(next.recordFile, 'utf8'));
+    assert.equal(record.sessionId, 's2');
+    assert.equal(record.viewer, 'viewer.mjs');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a live pane recorded by an older build (no viewer field) is replaced once', async () => {
+  const dir = directory();
+  try {
+    const stateDir = join(dir, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'P.pane.json'), JSON.stringify({ v: 1, paneId: 'C', parentPaneId: 'P', sessionId: 's1', phase: 'running' }));
+    const calls = [];
+    const herdr = async (...args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'layout') return { layout: { tab_id: 't1', panes: [{ pane_id: 'P', rect: {} }, { pane_id: 'C', rect: {} }] } };
+      return {};
+    };
+    const controller = new CoordinationPane({ stateDir, dagStateDir: join(dir, 'dag'), parentPane: 'P', sessionId: 's1', cwd: dir,
+      herdr, node: async () => 'node', viewer: 'viewer.mjs', activityPath: 'a.jsonl', host: {}, env: {} });
+    assert.equal(await controller.placeOnce(), false);
+    assert.equal(controller.state, 'replacing');
+    assert.deepEqual(calls, ['layout --pane P', 'close C']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

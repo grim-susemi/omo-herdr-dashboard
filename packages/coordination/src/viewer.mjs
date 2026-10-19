@@ -1,6 +1,7 @@
-// OmO collaboration pane viewer. Read-only: it polls the controller's status file,
-// the coordination activity log and the oracle advisor log once a second and
-// repaints only when something changed. Missing or corrupt files render empty.
+// OmO collaboration pane viewer. Read-only: it polls the controller's status file
+// (connection and this session's advisor job) and the coordination activity log,
+// filtered to `--session`, once a second and repaints only when something changed.
+// Missing or corrupt files render empty.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,14 +14,18 @@ import { languageOf, t } from './i18n.mjs';
 export function parseArgs(argv) {
   const value = name => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
   return { status: value('--status'), activity: value('--activity'), advisor: value('--advisor'),
-    record: value('--record'), closePane: value('--close-pane'), language: languageOf(value('--lang')),
+    session: value('--session'), record: value('--record'), closePane: value('--close-pane'), language: languageOf(value('--lang')),
     once: argv.includes('--once'), columns: Number(value('--columns')) || undefined, rows: Number(value('--rows')) || undefined };
 }
 
 export function snapshot(options) {
-  return { status: options.status ? readStatus(options.status) : null,
-    events: options.activity ? readActivity(options.activity) : [],
-    advisor: options.advisor ? readAdvisor(options.advisor) : undefined };
+  const status = options.status ? readStatus(options.status) : null;
+  return { status,
+    events: options.activity ? readActivity(options.activity, { session: options.session }) : [],
+    // The controller records this session's advisor job in the status file; an explicit
+    // --advisor (manual --once reads) still summarizes the shared advisor log.
+    advisor: status?.advisor && typeof status.advisor === 'object' ? status.advisor
+      : options.advisor ? readAdvisor(options.advisor) : undefined };
 }
 
 async function run(options) {

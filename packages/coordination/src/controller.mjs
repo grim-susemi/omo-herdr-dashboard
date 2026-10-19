@@ -15,6 +15,12 @@ export const API_READY_KEY = Symbol.for('omo.agent-coordination.api-ready.v1');
 export const LOWER_ROW = Object.freeze({ collab: 28, workers: 28, dag: 30 });
 export const PLACE_INTERVAL_MS = 2000;
 export const PLACE_ATTEMPTS = 30;
+// The oracle-advisor extension's registration in this process (its REGISTRATION_KEY).
+export const ADVISOR_KEY = Symbol.for('omo.oracle-advisor.v1');
+// Advisor ledger events are coalesced into one status write per this window.
+export const ADVISOR_WRITE_MS = 500;
+// Per-tool bookkeeping entries of an active job; they are not advisor activity.
+const ADVISOR_BOOKKEEPING = new Set(['trigger_state_recorded', 'progress_recorded']);
 
 export const safeKey = value => String(value ?? 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
 
@@ -34,6 +40,23 @@ export async function connectionStatus({ host = globalThis, env = process.env, r
   return { state: 'no-carrier', protocol: null, baseline };
 }
 
+// This session's advisor job as the oracle-advisor extension in this process holds it:
+// each pane shows its own session's job, not the newest job of any session.
+export function advisorSummary(host = globalThis, last = null) {
+  const registration = host[ADVISOR_KEY];
+  if (registration?.disabled) return { state: 'off', consults: 0, stops: 0, last: null };
+  let job = null;
+  try {
+    const runtime = registration?.runtime;
+    if (runtime?.getSessionStatus?.() === 'lead') job = runtime.ledger?.jobFacts ?? null;
+  } catch { job = null; }
+  if (!job) return { state: 'none', consults: 0, stops: 0, last: null };
+  return { state: job.status === 'active' ? 'on' : 'off', job: job.job_id ?? null,
+    consults: job.counters?.consults ?? 0,
+    stops: Object.values(job.stops ?? {}).filter(stop => stop?.status === 'open').length,
+    last: last ?? job.opened_at ?? null };
+}
+
 // Widths for a lower row of `total` columns, scaled from the measured 28|28|30.
 export function lowerRowWidths(total) {
   const sum = LOWER_ROW.collab + LOWER_ROW.workers + LOWER_ROW.dag;
@@ -50,11 +73,12 @@ export function lowerRow(layout, ids) {
 }
 
 export class CoordinationPane {
-  constructor({ stateDir, dagStateDir, receiptPath, activityPath, advisorPath, parentPane, sessionId, cwd,
+  constructor({ stateDir, dagStateDir, receiptPath, activityPath, parentPane, sessionId, cwd,
     herdr, node, viewer, language = 'en', host = globalThis, env = process.env,
     interval = PLACE_INTERVAL_MS, attempts = PLACE_ATTEMPTS, timers = { setTimeout, clearTimeout } }) {
-    Object.assign(this, { stateDir, dagStateDir, receiptPath, activityPath, advisorPath, parentPane, sessionId, cwd,
+    Object.assign(this, { stateDir, dagStateDir, receiptPath, activityPath, parentPane, sessionId, cwd,
       herdr, node, viewer, language, host, env, interval, attempts, timers });
+    this.advisorLast = null;
     this.statusFile = join(stateDir, `${safeKey(parentPane)}.status.json`);
     this.recordFile = join(stateDir, `${safeKey(parentPane)}.pane.json`);
     this.stopped = false;
@@ -62,12 +86,32 @@ export class CoordinationPane {
   }
   async writeStatus(override) {
     const status = override ?? await connectionStatus({ host: this.host, env: this.env, receiptPath: this.receiptPath });
-    await writeJson(this.statusFile, { v: 1, ...status, sessionId: this.sessionId, parentPaneId: this.parentPane,
-      pid: process.pid, at: new Date().toISOString() });
+    await writeJson(this.statusFile, { v: 1, ...status, advisor: advisorSummary(this.host, this.advisorLast),
+      sessionId: this.sessionId, parentPaneId: this.parentPane, pid: process.pid, at: new Date().toISOString() });
     return status;
+  }
+  // Advisor ledger events rewrite the status file (coalesced) so the pane follows this
+  // session's job. The listener runs inside the advisor's own append: it only sets a timer
+  // and never throws.
+  watchAdvisor() {
+    const ledger = this.host[ADVISOR_KEY]?.runtime?.ledger;
+    if (this.unwatchAdvisor || typeof ledger?.subscribe !== 'function') return;
+    this.unwatchAdvisor = ledger.subscribe(event => {
+      try {
+        if (this.stopped) return;
+        if (!ADVISOR_BOOKKEEPING.has(event?.type)) this.advisorLast = new Date().toISOString();
+        if (this.advisorTimer) return;
+        // The returned promise is ignored by real timers; tests await it.
+        this.advisorTimer = this.timers.setTimeout(() => {
+          this.advisorTimer = undefined;
+          return this.stopped ? undefined : this.writeStatus().catch(() => {});
+        }, ADVISOR_WRITE_MS);
+      } catch { /* the pane is advisory; the advisor's append must not fail */ }
+    });
   }
   async start() {
     await this.writeStatus();
+    this.watchAdvisor();
     if (this.env.OMO_HERDR_COORDINATION_PANE === '0') { this.state = 'disabled'; return; }
     let left = this.attempts;
     const tick = async () => {
@@ -84,6 +128,9 @@ export class CoordinationPane {
   async stop() {
     this.stopped = true;
     if (this.timer) this.timers.clearTimeout(this.timer);
+    if (this.advisorTimer) this.timers.clearTimeout(this.advisorTimer);
+    this.unwatchAdvisor?.();
+    this.unwatchAdvisor = undefined;
     try { await this.writeStatus({ state: 'closed', protocol: null, baseline: (await readJson(this.statusFile).catch(() => null))?.baseline ?? null }); }
     catch { /* the viewer shows the last state */ }
   }
@@ -107,7 +154,14 @@ export class CoordinationPane {
     if (!layout?.panes) return false;
     const record = await readJson(this.recordFile).catch(() => null);
     const live = id => layout.panes.some(pane => pane?.pane_id === id);
-    if (record?.paneId && live(record.paneId)) { this.state = 'current'; return true; }
+    if (record?.paneId && live(record.paneId)) {
+      if (record.sessionId === this.sessionId && record.viewer === this.viewer) { this.state = 'current'; return true; }
+      // The live viewer was started for another session (its flow filter) or by another
+      // build: close it and place a fresh one from the next tick's layout.
+      await this.herdr('close', record.paneId);
+      this.state = 'replacing';
+      return false;
+    }
     // An owner close holds for the session that saw it; the next session reopens the pane.
     if (record?.manualClose && record.sessionId === this.sessionId) { this.state = 'closed-by-owner'; return true; }
     const ids = await this.dashboardIds(layout);
@@ -123,7 +177,7 @@ export class CoordinationPane {
     const paneId = created?.pane?.pane_id;
     if (!paneId) throw new Error('collaboration split returned no pane id');
     const next = { v: 1, paneId, tabId: layout.tab_id, parentPaneId: this.parentPane, sessionId: this.sessionId,
-      workers: ids.workers, dag: ids.dag, createdAt: new Date().toISOString(), phase: 'split' };
+      viewer: this.viewer, workers: ids.workers, dag: ids.dag, createdAt: new Date().toISOString(), phase: 'split' };
     await writeJson(this.recordFile, next);
     // The split opened right of the workers pane; the swap makes collaboration the leftmost cell.
     await this.herdr('swap', '--source-pane', paneId, '--target-pane', ids.workers);
@@ -133,8 +187,8 @@ export class CoordinationPane {
       await this.herdr('resize', '--pane', ids.workers, '--direction', desired > current ? 'right' : 'left',
         '--amount', String(Math.abs(current - desired)));
     await this.herdr('run', paneId, shellCommand([await this.node(), this.viewer, '--status', this.statusFile,
-      '--activity', this.activityPath, '--advisor', this.advisorPath, '--record', this.recordFile,
-      '--lang', this.language, '--close-pane', paneId]));
+      '--activity', this.activityPath, ...(this.sessionId ? ['--session', this.sessionId] : []),
+      '--record', this.recordFile, '--lang', this.language, '--close-pane', paneId]));
     // The chat keeps the input: if the new cell took the focus, hand it back to the chat on its left.
     if ((await this.herdr('get', paneId).catch(() => null))?.pane?.focused === true)
       await this.herdr('focus', '--pane', paneId, '--direction', 'left').catch(() => {});
