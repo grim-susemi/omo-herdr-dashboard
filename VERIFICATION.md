@@ -1,5 +1,33 @@
 # Current dashboard verification
 
+## 2026-10-20 header and footer inset (generation 33)
+
+The source change is commit a11a295 on `work/title-indent`. The Todo, worker, DAG and
+collaboration panes drew their `name [done/total]` header and their `Follow ON · LIVE` footer flush
+against the left edge; both rows now sit one column in (a one-column pane keeps no inset), so they
+line up with the cards below. Dividers, section bars and body rows are unchanged. Origin: owner
+request to indent the top and bottom title rows slightly, and decision #278=A (commit, install
+generation 33, push).
+
+Tests: DAG 223/44 (the same 44 as before), root 750/12 with one band footer pin left, which was
+updated and its file re-run with no failure outside the baseline (so root is back to the same 11),
+Todo 156/21 (the same 21), collaboration 14/0. Six assertions that pinned the rows at column 0 now
+expect the inset. The fresh worktree needed `npm ci` in `packages/dag` for the `node-pty` PTY tests
+and `npm run build` for the installer test. The build and `scripts/verify-package.mjs` exited 0. The
+install exited 0 with generation-000032 as backup; generations 31 and 32 kept their bytes,
+settings.json and models.json kept their hashes, the 41 runtime files equal the dist, generation
+33's `extension.mjs` imported in a fresh Node process, and the installed renderers draw the same
+frames as the dist and the source. An owned `--no-focus` Herdr tab ran the installed collaboration
+viewer with `--once` at 26x16 and showed ` Collab [2/3]  wait 1` and ` Follow ON · LIVE`; the tab was
+closed.
+
+Rollback: copy `install-rollback-33/omo-herdr-dashboard.js` and `install-rollback-33/current.json`
+from `기타 작업/.omo/evidence/dag-stage-list/` over the wrapper and
+`herdr-dashboard/integration/current.json`; that points at generation 000032 again. Generation 33
+applies from a new conversation or a deliberate `/reload`.
+
+Korean summary: 네 판의 맨 위 제목 줄과 맨 아래 바닥줄을 한 칸 들여썼습니다. 세대 33을 설치했고 31·32는 그대로입니다.
+
 ## 2026-10-20 empty worker and DAG panes, English pane text (generation 32)
 
 The source change is commit 1a570ad on `work/dag-stage-list`. An empty worker pane used to fall
