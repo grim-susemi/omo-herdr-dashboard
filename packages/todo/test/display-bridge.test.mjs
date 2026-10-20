@@ -653,7 +653,8 @@ test('pending publication retains only prior authorization that is still live', 
   assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
 
   let settle;
-  f.adapter.publish = () => new Promise(resolve => { settle = resolve; });
+  let pending;
+  f.adapter.publish = () => (pending = new Promise(resolve => { settle = resolve; }));
   f.change('next-todo');
   f.bridge.observe({ type: 'message_end' }, f.ctx);
   assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
@@ -670,8 +671,9 @@ test('pending publication retains only prior authorization that is still live', 
     'a healthy prior authorization cannot re-hide a key during the same write');
   assert.deepEqual(f.widgets.get('omo-task'), ['worker-1']);
 
+  const completed = pending.then(() => {});
   settle({ ...f.owner, sequence: 2 });
-  await new Promise(resolve => setImmediate(resolve));
+  await completed;
   assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
     'a new success authorizes the mask again');
   f.bridge.remove();
