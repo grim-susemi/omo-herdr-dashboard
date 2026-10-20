@@ -559,7 +559,11 @@ class ParentSlot {
         await this.publish({ ...this.obsoleteOperation(this.record, operation), phase: unresolved ? 'BLOCKED' : 'CLAIMED' });
       } else {
         if (!same(operation.target, observation?.target)) throw fail('IDENTITY_MISMATCH');
-        if (observation.effect?.id !== id || observation.effect.settled !== true) throw fail('EFFECT_UNKNOWN');
+        // A retire is not a tracked mutation, so it never records an effect. Its effect is the
+        // retained viewer exiting, which changes the observed identity above. An unchanged
+        // target therefore proves the retire did not happen: settle it so the next pass can
+        // re-issue it, instead of latching the slot BLOCKED until the window restarts.
+        if (operation.type !== 'retire' && (observation.effect?.id !== id || observation.effect.settled !== true)) throw fail('EFFECT_UNKNOWN');
         await this.settle(id, 'SETTLED', unresolved ? 'BLOCKED' :
           this.record.transaction.id === id ? 'RECOVERING' : 'CLAIMED');
       }
