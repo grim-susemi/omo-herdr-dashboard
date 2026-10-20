@@ -5,6 +5,10 @@ import { inlineRecoveryFactory } from './inline-recovery.mjs';
 
 const roles = new Map([['todo-sidebar', 'todo'], ['omo-task', 'workers'], ['omo-dag', 'dag']]);
 const signature = snapshot => JSON.stringify([snapshot.phases, snapshot.ask]);
+// A publication identity is semantic content plus scope. leafRevision advances
+// on every session event and must not by itself create a publication.
+const publicationKey = snapshot => JSON.stringify([snapshot.ownerKey, snapshot.sessionId, snapshot.scopeEpoch,
+  snapshot.availability, snapshot.phases, snapshot.ask]);
 // Missing acknowledgment is a pending state, not evidence that the viewer is gone.
 const pendingAckReasons = new Set(['role-sequence', 'presence-not-ready']);
 const coverageOf = reason => reason === 'ready' ? 'ready' :
@@ -196,7 +200,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
   function completePublication(value, candidate, id) {
     if (disposed || id !== revision || !current()) return false;
     // An async completion cannot authorize hiding a newer unread branch.
-    if (!read() || candidate !== JSON.stringify(snapshot)) {
+    if (!read() || candidate !== publicationKey(snapshot)) {
       receipt = null;
       published = null;
       pending = null;
@@ -228,7 +232,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       reconcile();
       return false;
     }
-    const candidate = JSON.stringify(snapshot);
+    const candidate = publicationKey(snapshot);
     if (candidate === published || candidate === pending) {
       reconcile();
       return receipt !== null;

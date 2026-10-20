@@ -65,6 +65,16 @@ function fixture(options = {}) {
     setFailRead(value) { failRead = value; },
     setFailSetter(value) { failSetter = value; },
     setBranch(value) { branch = value; },
+    message(id = `message-${branch.length}`) {
+      branch = [...branch, { type: 'message', id, message: { role: 'assistant', content: [] } }];
+    },
+    changeAsk(text) {
+      const last = [...branch].reverse().find(entry => entry.customType === 'senpi.todo-state');
+      branch = [...branch, { type: 'custom', id: `entry-${branch.length + 1}`,
+        customType: 'senpi.todo-state', data: { schema: 'v2',
+          phases: structuredClone(last?.data?.phases ?? []),
+          ask: { entryId: `ask-${branch.length}`, capturedAt: 1, text } } }];
+    },
     change(content = 'changed', status = 'pending') {
       const phases = structuredClone(branch.at(-1).data.phases);
       phases[0].tasks.push({ content, status });
@@ -699,6 +709,34 @@ test('a key never masked stays visible through pending and lagging acknowledgmen
   f.bridge.readinessChanged();
   assert.deepEqual(f.bridge.status.masked, ['todo-sidebar'], 'only the previously masked key is retained');
   assert.deepEqual(f.widgets.get('omo-task'), ['worker-visible']);
+  f.bridge.remove();
+});
+
+test('leaf-only session events do not publish while semantic Todo changes do', () => {
+  const f = fixture();
+  f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+  f.ui.setWidget('omo-task', ['worker-line']);
+  f.ui.setWidget('omo-dag', ['dag-line']);
+  for (const role of ['todo', 'workers', 'dag']) f.ready.add(role);
+  f.bridge.readinessChanged();
+  const publications = f.published.length;
+  const leaf = f.bridge.snapshot.leafRevision;
+
+  f.message('assistant-message');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  assert.notEqual(f.bridge.snapshot.leafRevision, leaf, 'the leaf advanced');
+  assert.equal(f.published.length, publications, 'leafRevision alone must not publish');
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  f.changeAsk('new ask');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  assert.equal(f.published.length, publications + 1, 'an ask change publishes');
+  assert.equal(f.published.at(-1).leafRevision, f.bridge.snapshot.leafRevision,
+    'the payload still carries leafRevision');
+
+  f.change('real-todo');
+  f.bridge.observe({ type: 'tool_result', toolName: 'todo' }, f.ctx);
+  assert.equal(f.published.length, publications + 2, 'a real Todo change publishes');
   f.bridge.remove();
 });
 
