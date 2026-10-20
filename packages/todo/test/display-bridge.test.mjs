@@ -18,6 +18,7 @@ function fixture(options = {}) {
   let sequence = 0;
   let dagOwned = false;
   const ready = new Set();
+  const reasons = new Map();
   const widgets = new Map();
   const calls = [];
   const published = [];
@@ -45,6 +46,8 @@ function fixture(options = {}) {
     getOwner: () => owner,
     publish(value) { published.push(value); return { ...owner, sequence: ++sequence }; },
     isReady: binding => ready.has(binding.role),
+    ...(options.triState ? { readiness: binding => reasons.get(binding.role) ??
+      (ready.has(binding.role) ? 'ready' : 'lost') } : {}),
     hasDagOwnedTasks: () => dagOwned,
     ...options,
   };
@@ -56,8 +59,9 @@ function fixture(options = {}) {
       return instance;
     };
   }
-  return { bridge, ctx, ui, original, adapter, owner, environment, ready, widgets, calls, published, instances, factory,
+  return { bridge, ctx, ui, original, adapter, owner, environment, ready, reasons, widgets, calls, published, instances, factory,
     setDagOwned(value) { dagOwned = value; },
+    setReason(role, reason) { reasons.set(role, reason); },
     setFailRead(value) { failRead = value; },
     setFailSetter(value) { failSetter = value; },
     setBranch(value) { branch = value; },
@@ -583,4 +587,156 @@ test('recovery factory retains phase shells, ask, statuses, counts and bounded K
   a.dispose();
   assert.deepEqual(a.render(80), []);
   assert.ok(b.render(80).length > 0);
+});
+
+test('existing masks survive a pending publication and lagging role acknowledgments', async () => {
+  const f = fixture({ triState: true });
+  const options = { placement: 'belowEditor' };
+  f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+  f.ui.setWidget('omo-task', ['worker-line'], options);
+  f.ui.setWidget('omo-dag', ['dag-line'], options);
+  for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  let settle;
+  let deferred = 0;
+  f.adapter.publish = () => {
+    deferred++;
+    return new Promise(resolve => { settle = resolve; });
+  };
+  f.change('second-todo');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  assert.equal(deferred, 1, 'a real Todo change starts a publication');
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+    'a pending publication keeps every existing mask');
+  assert.deepEqual([...f.widgets.keys()], [], 'nothing is restored while publication is pending');
+
+  for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'role-sequence');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+    'role-sequence is acknowledgment lag, not hard loss');
+
+  settle({ ...f.owner, sequence: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  f.setReason('workers', 'presence-not-ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+    'presence lease lag keeps the mask');
+
+  for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+  f.bridge.remove();
+});
+
+test('hard-loss readiness reasons and lifecycle stops restore masks immediately', () => {
+  for (const reason of ['stopped', 'managed-blocked', 'recovery-blocked', 'layout-active',
+    'arrangement-moving', 'source-refreshing', 'actor-fallback', 'scope-mismatch',
+    'participant-mismatch', 'role-generation', 'role-paint', 'role-not-ready', 'role-closed']) {
+    const f = fixture({ triState: true });
+    const options = { placement: 'belowEditor' };
+    f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+    f.ui.setWidget('omo-task', ['native-worker'], options);
+    f.ui.setWidget('omo-dag', ['native-dag'], options);
+    for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'ready');
+    f.bridge.readinessChanged();
+    assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'], reason);
+    f.setReason('workers', reason);
+    f.bridge.readinessChanged();
+    assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-dag'], reason);
+    assert.deepEqual(f.widgets.get('omo-task'), ['native-worker'], reason);
+    f.bridge.remove();
+  }
+
+  const read = fixture({ triState: true });
+  read.ui.setWidget('todo-sidebar', read.factory('native-todo'));
+  read.ui.setWidget('omo-task', ['native-worker']);
+  for (const role of ['todo', 'workers']) read.setReason(role, 'ready');
+  read.bridge.readinessChanged();
+  assert.deepEqual(read.bridge.status.masked, ['todo-sidebar', 'omo-task']);
+  read.setFailRead(true);
+  read.bridge.readinessChanged();
+  assert.deepEqual(read.bridge.status.masked, [], 'readThrew restores already-masked keys');
+  read.bridge.remove();
+
+  const suspended = fixture({ triState: true });
+  suspended.ui.setWidget('todo-sidebar', suspended.factory('native-todo'));
+  suspended.setReason('todo', 'ready');
+  suspended.bridge.readinessChanged();
+  assert.deepEqual(suspended.bridge.status.masked, ['todo-sidebar']);
+  suspended.bridge.suspend();
+  assert.deepEqual(suspended.bridge.status.masked, [], 'suspension restores before navigation');
+  assert.equal(suspended.bridge.status.suspended, true);
+  suspended.bridge.remove();
+
+  const blocked = fixture({ triState: true });
+  blocked.ui.setWidget('todo-sidebar', blocked.factory('native-todo'));
+  blocked.setReason('todo', 'ready');
+  blocked.bridge.readinessChanged();
+  assert.deepEqual(blocked.bridge.status.masked, ['todo-sidebar']);
+  blocked.bridge.observe({ type: 'session_tree' });
+  assert.deepEqual(blocked.bridge.status.masked, [], 'blockedEpoch drops every mask');
+  assert.equal(blocked.bridge.readinessChanged(), false);
+  blocked.bridge.remove();
+});
+
+test('a key never masked stays visible through pending and lagging acknowledgments', () => {
+  const f = fixture({ triState: true });
+  f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+  f.setReason('todo', 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar']);
+  f.adapter.publish = () => new Promise(() => {});
+  f.change('pending-change');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  f.ui.setWidget('omo-task', ['worker-visible'], { placement: 'belowEditor' });
+  assert.deepEqual(f.widgets.get('omo-task'), ['worker-visible']);
+  assert.ok(!f.bridge.status.masked.includes('omo-task'));
+  f.setReason('todo', 'role-sequence');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar'], 'only the previously masked key is retained');
+  assert.deepEqual(f.widgets.get('omo-task'), ['worker-visible']);
+  f.bridge.remove();
+});
+
+test('worker re-registration during a pending publication keeps its prior mask', async () => {
+  const f = fixture({ triState: true });
+  const options = { placement: 'belowEditor' };
+  f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+  f.ui.setWidget('omo-task', ['worker-1'], options);
+  f.ui.setWidget('omo-dag', ['dag-1'], options);
+  for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  let settle;
+  let deferred = 0;
+  f.adapter.publish = () => {
+    deferred++;
+    return new Promise(resolve => { settle = resolve; });
+  };
+  f.change('next-todo');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  assert.equal(deferred, 1);
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  const before = f.calls.length;
+  f.ui.setWidget('omo-task', ['worker-2'], options);
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+    'the host re-set cannot revoke an authorization that was already in force');
+  assert.equal(f.widgets.has('omo-task'), false);
+  const after = f.calls.slice(before);
+  assert.ok(after.some(call => call.key === 'omo-task' && call.content?.[0] === 'worker-2'));
+  assert.ok(after.some(call => call.key === 'omo-task' && call.content === undefined));
+
+  f.setReason('workers', 'role-sequence');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+  settle({ ...f.owner, sequence: 9 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+  f.bridge.remove();
 });

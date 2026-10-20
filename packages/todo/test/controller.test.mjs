@@ -344,6 +344,8 @@ test('an authenticated protocol ACK without verified pane creation cannot hide n
   const receipt = { ...offer, sequence: received.sequence };
   assert.equal(f.controller.presence.isReady(receipt), true, 'protocol layer alone accepts the bound ACK');
   assert.equal(f.controller.adapter.isReady(receipt), false, 'controller also requires a proven owned role process');
+  assert.equal(typeof f.controller.adapter.readiness, 'function', 'the bridge can read the denial reason');
+  assert.notEqual(f.controller.adapter.readiness(receipt), 'ready', 'a denied binding has a named reason');
   assert.deepEqual(f.controller.bridge.status.masked, []);
   assert.equal(f.calls.filter(call => call[0] === 'split').length, 0);
 });

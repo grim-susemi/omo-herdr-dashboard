@@ -1638,48 +1638,50 @@ export class TodoPane {
     await this.startControl();
     await this.presence.start();
     if (this.stopped) return;
+    const readiness = receipt => {
+      const record = this.ownedRoles.get(receipt?.role);
+      const snapshot = this.actor?.snapshot;
+      const result = reason => {
+        this.readinessReasons ??= new Map();
+        if (this.readinessReasons.get(receipt.role) !== reason) {
+          this.readinessReasons.set(receipt.role, reason);
+          void this.actor?.diagnose('display', { code: 'NONE', reason, sequence: receipt.sequence,
+            ackSequence: snapshot?.roles[receipt.role]?.ack?.sequence, phase: snapshot?.phase },
+            { role: receipt.role });
+        }
+        return reason;
+      };
+      if (this.managed) {
+        for (const [reason, denied] of [
+          ['stopped', this.stopped], ['managed-blocked', this.managedBlocked],
+          ['recovery-blocked', this.recoveryBlocked], ['layout-active', this.layoutActive],
+          ['arrangement-moving', this.arrangement?.moving], ['source-refreshing', this.sourceRefreshing],
+          ['actor-fallback', this.actor?.inlineFallback !== false],
+          ['scope-mismatch', snapshot?.sessionId !== this.binding.sessionId],
+          ['participant-mismatch', snapshot?.participants.todo?.lifetimeId !== this.lifetimeId ||
+            snapshot?.participants.dag?.lifetimeId !== this.provider?.lifetimeId],
+        ]) if (denied) return result(reason);
+        for (const role of ['todo', 'dag', 'workers']) {
+          if (snapshot.roles[role]?.generation !== snapshot.generation) return result('role-generation');
+          if (!snapshot.roles[role]?.ack?.painted) return result('role-paint');
+          if (snapshot.roles[role].ack.sequence !== receipt.sequence) return result('role-sequence');
+          if (!this.ownedRoles.get(role)?.ready) return result('role-not-ready');
+          if (this.ownedRoles.get(role).manualClose) return result('role-closed');
+          if (!this.presence.isReady({ ...receipt, role })) return result('presence-not-ready');
+        }
+      }
+      if (record?.scopeEpoch !== this.scopeEpoch) return result('scope-mismatch');
+      if (record.ready !== true || !Number.isSafeInteger(record.processId)) return result('role-not-ready');
+      if (record.manualClose === true) return result('role-closed');
+      return result(this.presence.isReady(receipt) ? 'ready' : 'presence-not-ready');
+    };
     this.adapter = {
       getOwner: () => this.presence.getOwner(),
       publish: snapshot => this.presence.publish(snapshot),
       settings: this.presence.settings,
       hasDagOwnedTasks: () => this.presence.hasDagOwnedTasks(),
-      isReady: receipt => {
-        const record = this.ownedRoles.get(receipt?.role);
-        const snapshot = this.actor?.snapshot;
-        const result = reason => {
-          this.readinessReasons ??= new Map();
-          if (this.readinessReasons.get(receipt.role) !== reason) {
-            this.readinessReasons.set(receipt.role, reason);
-            void this.actor?.diagnose('display', { code: 'NONE', reason, sequence: receipt.sequence,
-              ackSequence: snapshot?.roles[receipt.role]?.ack?.sequence, phase: snapshot?.phase },
-              { role: receipt.role });
-          }
-          return reason === 'ready';
-        };
-        if (this.managed) {
-          for (const [reason, denied] of [
-            ['stopped', this.stopped], ['managed-blocked', this.managedBlocked],
-            ['recovery-blocked', this.recoveryBlocked], ['layout-active', this.layoutActive],
-            ['arrangement-moving', this.arrangement?.moving], ['source-refreshing', this.sourceRefreshing],
-            ['actor-fallback', this.actor?.inlineFallback !== false],
-            ['scope-mismatch', snapshot?.sessionId !== this.binding.sessionId],
-            ['participant-mismatch', snapshot?.participants.todo?.lifetimeId !== this.lifetimeId ||
-              snapshot?.participants.dag?.lifetimeId !== this.provider?.lifetimeId],
-          ]) if (denied) return result(reason);
-          for (const role of ['todo', 'dag', 'workers']) {
-            if (snapshot.roles[role]?.generation !== snapshot.generation) return result('role-generation');
-            if (!snapshot.roles[role]?.ack?.painted) return result('role-paint');
-            if (snapshot.roles[role].ack.sequence !== receipt.sequence) return result('role-sequence');
-            if (!this.ownedRoles.get(role)?.ready) return result('role-not-ready');
-            if (this.ownedRoles.get(role).manualClose) return result('role-closed');
-            if (!this.presence.isReady({ ...receipt, role })) return result('presence-not-ready');
-          }
-        }
-        if (record?.scopeEpoch !== this.scopeEpoch) return result('scope-mismatch');
-        if (record.ready !== true || !Number.isSafeInteger(record.processId)) return result('role-not-ready');
-        if (record.manualClose === true) return result('role-closed');
-        return result(this.presence.isReady(receipt) ? 'ready' : 'presence-not-ready');
-      },
+      isReady: receipt => readiness(receipt) === 'ready',
+      readiness,
     };
     this.onPresenceEvent = event => {
       if (event.type === 'disconnected') {

@@ -5,6 +5,10 @@ import { inlineRecoveryFactory } from './inline-recovery.mjs';
 
 const roles = new Map([['todo-sidebar', 'todo'], ['omo-task', 'workers'], ['omo-dag', 'dag']]);
 const signature = snapshot => JSON.stringify([snapshot.phases, snapshot.ask]);
+// Missing acknowledgment is a pending state, not evidence that the viewer is gone.
+const pendingAckReasons = new Set(['role-sequence', 'presence-not-ready']);
+const coverageOf = reason => reason === 'ready' ? 'ready' :
+  pendingAckReasons.has(reason) ? 'pending-ack' : 'lost';
 const sameScope = (a, b) => a && b && a.ownerKey === b.ownerKey &&
   a.sessionId === b.sessionId && a.scopeEpoch === b.scopeEpoch;
 
@@ -87,22 +91,57 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     } catch (error) { fail('restore', error); return false; }
   }
 
-  function covered(key) {
+  function coverage(key) {
     const role = roles.get(key);
-    if (!receipt || readThrew || suspended || blockedEpoch !== null || !current()) return false;
+    if (readThrew || suspended || blockedEpoch !== null || !current()) return 'lost';
     // A readable branch without a native Todo has nothing to replace in the sidebar.
-    if (key === 'todo-sidebar' && readFailed) return false;
+    if (key === 'todo-sidebar' && readFailed) return 'lost';
     const setting = adapter.settings?.[role] ?? 'auto';
-    if (setting !== 'auto') return false;
+    if (setting !== 'auto') return 'lost';
+    // A publication in flight keeps an authorization this key already earned.
+    // It never authorizes hiding a key that was not masked before.
+    if (!receipt) return pending !== null ? 'pending-ack' : 'lost';
+    const reasonFor = binding => typeof adapter.readiness === 'function'
+      ? adapter.readiness(binding)
+      : adapter.isReady?.(binding) === true ? 'ready' : 'lost';
     try {
-      if (adapter.isReady?.({ ...receipt, role }) !== true) return false;
+      const roleState = coverageOf(reasonFor({ ...receipt, role }));
+      if (roleState !== 'ready') return roleState;
       if (role === 'workers') {
         const dagOwned = adapter.hasDagOwnedTasks?.();
-        if (typeof dagOwned !== 'boolean') return false;
-        if (dagOwned && adapter.isReady({ ...receipt, role: 'dag' }) !== true) return false;
+        if (typeof dagOwned !== 'boolean') return 'lost';
+        if (dagOwned) {
+          const dagState = coverageOf(reasonFor({ ...receipt, role: 'dag' }));
+          if (dagState !== 'ready') return dagState;
+        }
       }
+      return 'ready';
+    } catch (error) { fail('readiness', error); return 'lost'; }
+  }
+
+  function retainMask(key) {
+    if (masks.has(key) || !current()) return false;
+    const capture = captures.get(key);
+    if (!capture) return false;
+    const safe = capture.content !== undefined ||
+      key === 'todo-sidebar' && recovery !== null && snapshot?.availability !== 'waiting' &&
+        snapshot?.counts.total > 0;
+    if (!safe || coverage(key) !== 'pending-ack') return false;
+    try {
+      own(key, undefined, capture.options);
+      masks.add(key);
       return true;
-    } catch (error) { fail('readiness', error); return false; }
+    } catch (error) {
+      fail('mask', error);
+      receipt = null;
+      published = null;
+      pending = null;
+      revision++;
+      // A failing mask setter may have removed content before throwing.
+      masks.add(key);
+      restore(key);
+      return false;
+    }
   }
 
   function reconcile() {
@@ -112,8 +151,9 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       const safe = capture ? capture.content !== undefined :
         key === 'todo-sidebar' && recovery !== null && snapshot?.availability !== 'waiting' &&
           snapshot?.counts.total > 0;
-      if (!safe || !covered(key)) { restore(key); continue; }
-      if (masks.has(key)) continue;
+      const state = safe ? coverage(key) : 'lost';
+      if (state === 'lost') { restore(key); continue; }
+      if (state === 'pending-ack' || masks.has(key)) continue;
       try {
         own(key, undefined, capture?.options);
         masks.add(key);
@@ -245,6 +285,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       restore(key);
       return undefined;
     }
+    const wasMasked = masks.has(key);
     masks.delete(key);
     if (suspended || blockedEpoch !== null) {
       captures.delete(key);
@@ -258,14 +299,18 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     read();
     captures.set(key, { content, options, signature: snapshot && signature(snapshot) });
     refresh();
+    // The 250 ms native worker re-registration replaces an already hidden
+    // widget. Re-apply only the authorization that key had before the re-set;
+    // a key never masked stays visible until a publication succeeds.
+    if (wasMasked) retainMask(key);
     return result;
   }
 
   const bridge = {
     get snapshot() { return snapshot && structuredClone(snapshot); },
     get status() {
-      return { disposed, suspended, owner: { ...owner }, masked: [...masks], capturedKeys: [...captures.keys()],
-        publication: receipt && { ...receipt }, readFailed };
+      return { disposed, suspended, owner: { ...owner }, masked: [...roles.keys()].filter(key => masks.has(key)),
+        capturedKeys: [...captures.keys()], publication: receipt && { ...receipt }, readFailed };
     },
     failures,
     captured(key) { return captures.get(key); },
