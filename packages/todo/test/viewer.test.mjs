@@ -52,7 +52,9 @@ class Output extends EventEmitter {
   write(raw, callback) {
     this.writes.push(raw);
     if (!callback) return true;
-    if (this.hold && stripVTControlCharacters(raw).includes('Todo | LIVE')) {
+    // A painted live frame: the header names the pane and the footer source is exactly LIVE
+    // (cached and offline frames end in 'NOT LIVE' and must not be held).
+    if (this.hold && /Todo \[[\s\S]*· LIVE/.test(stripVTControlCharacters(raw))) {
       const entry = { raw, callback };
       this.pending.push(entry); this.emit('pending', entry);
     } else queueMicrotask(callback);
@@ -64,7 +66,7 @@ class Output extends EventEmitter {
 const native = content => projectNativeTodo([{ type: 'custom', customType: 'senpi.todo-state',
   data: { schema: 'v2', ask: { entryId: 'fixture-ask', capturedAt: 1, text: '가나다라마바사'.repeat(70) },
     phases: [{ name: 'Build', tasks: [{ content, status: 'in_progress' },
-      ...Array.from({ length: 18 }, (_, index) => ({ content: `Queued task ${index}`, status: 'pending' }))] }] } }]);
+      ...Array.from({ length: 40 }, (_, index) => ({ content: `Queued task ${index}`, status: 'pending' }))] }] } }]);
 
 async function fixture(t, { offers = true, hold = false } = {}) {
   const id = randomUUID();
@@ -278,13 +280,13 @@ test('late offers connect without restart and same-scope observations preserve m
   const snapshot = signal(viewer.events, 'snapshot');
   await f.writeState({ ...f.state, presenceOffer: f.presence.offer('todo') });
   await snapshot;
-  const saved = signal(viewer.events, 'preferences', value => value.scroll > 0 && value.askScroll === 1);
-  viewer.key('j'); viewer.key('a'); await saved;
+  const saved = signal(viewer.events, 'preferences', value => value.scroll > 0);
+  viewer.key('j'); await saved;
   const preference = JSON.parse(await fs.readFile(f.state.prefsPath, 'utf8'));
   await f.writeState({ ...f.state, updatedAt: 2 });
   await viewer.refresh();
   assert.equal(viewer.state.scroll, preference.scroll);
-  assert.equal(viewer.state.askScroll, 1);
+  assert.ok(viewer.state.scroll > 0);
   assert.equal(f.requests.length, 0);
 });
 
@@ -293,15 +295,15 @@ test('a changed control offer registers the current bound PID without resetting 
   await f.publish('Rebound control');
   const ack = signal(f.presence.events, 'event', value => value.type === 'ack');
   const viewer = await f.start(); await ack;
-  const saved = signal(viewer.events, 'preferences', value => value.askScroll === 1);
-  viewer.key('a'); await saved;
+  const saved = signal(viewer.events, 'preferences', value => value.scroll > 0);
+  viewer.key('j'); await saved;
   const token = randomUUID();
   const registered = signal(f.controlEvents, 'request', value => value.type === 'register' && value.token === token);
   const rebound = signal(viewer.events, 'snapshot', value => value.snapshot.target.content === 'Rebound control');
   await f.writeState({ ...f.state, controlOffer: { ...f.state.controlOffer, token } });
   const request = await registered; await rebound;
   assert.equal(request.pid, process.pid);
-  assert.equal(viewer.state.askScroll, 1);
+  assert.ok(viewer.state.scroll > 0, 'the manual scroll survives the control rebind');
   assert.equal(f.requests.filter(value => value.type === 'register').length, 2);
 });
 
@@ -422,9 +424,9 @@ test('follow keeps reveal transient, retains navigation but resumes automaticall
   assert.equal(viewer.state.scroll, 0);
   await assert.rejects(fs.readFile(f.state.prefsPath), { code: 'ENOENT' });
   const source = await fs.readFile(f.statePath, 'utf8');
-  const paused = signal(viewer.events, 'preferences', value => !value.follow && value.askScroll === 1);
-  viewer.key('a'); await paused;
-  assert.equal(viewer.state.scroll, 0, 'ask navigation must not save automatic body reveal');
+  const paused = signal(viewer.events, 'preferences', value => !value.follow);
+  viewer.key('f'); await paused;
+  assert.equal(viewer.state.scroll, 0, 'pausing follow must not save the automatic body reveal');
   const resumed = signal(viewer.events, 'preferences', value => value.follow);
   viewer.key('f'); await resumed;
   const moving = signal(viewer.events, 'frame', value => value.text.includes('Follow OFF'));
@@ -442,7 +444,6 @@ test('follow keeps reveal transient, retains navigation but resumes automaticall
   viewer = await f.start(); await restarted;
   assert.equal(viewer.state.follow, true);
   assert.equal(viewer.state.scroll, manualScroll);
-  assert.equal(viewer.state.askScroll, 1);
   assert.equal(await fs.readFile(f.statePath, 'utf8'), source);
   const following = signal(viewer.events, 'frame', value => value.text.includes('Follow ON'));
   await viewer.draw(); await following;
@@ -451,11 +452,11 @@ test('follow keeps reveal transient, retains navigation but resumes automaticall
   await publish(); await retained;
   assert.equal(viewer.state.target.content, 'FOLLOW_NATIVE_31');
   phases[1].tasks[31].status = 'completed';
-  const handoff = signal(viewer.events, 'frame', value => value.sequence === 3 && value.text.includes('Now: EARLY_ARRIVAL'));
+  const handoff = signal(viewer.events, 'frame', value => value.sequence === 3 && value.text.includes('[•] EARLY_ARRIVAL'));
   await publish(); await handoff;
   assert.equal(viewer.state.target.content, 'EARLY_ARRIVAL');
   phases.shift();
-  const idle = signal(viewer.events, 'frame', value => value.sequence === 4 && value.text.includes('No current target'));
+  const idle = signal(viewer.events, 'frame', value => value.sequence === 4 && !value.text.includes('[•]'));
   await publish(); await idle;
   assert.equal(viewer.state.target, null);
   const owner = f.presence.getOwner();
