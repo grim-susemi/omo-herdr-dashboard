@@ -1008,8 +1008,8 @@ export async function canCleanupPane(info, record, inspect) {
 export class TodoPane {
   constructor({ ctx, environment = process.env, stateDir, cwd, node = process.execPath,
     viewer, herdr = createDashboardHerdr(environment), inspectShell, language = 'en', notify = () => {}, managed = false,
-    retirementObservations = new Map(), retireViewer = retireVerifiedViewer, cacheReads = false }) {
-    Object.assign(this, { ctx, environment, stateDir, cwd, node, viewer, herdr: cacheReads ? herdrRead(herdr) : herdr, inspectShell, language, notify, managed, retireViewer });
+    retirementObservations = new Map(), retireViewer = retireVerifiedViewer, cacheReads = false, clock }) {
+    Object.assign(this, { ctx, environment, stateDir, cwd, node, viewer, herdr: cacheReads ? herdrRead(herdr) : herdr, inspectShell, language, notify, managed, retireViewer, clock });
     this.binding = { socketPath: environment.HERDR_SOCKET_PATH, parentPaneId: environment.HERDR_PANE_ID,
       sessionId: ctx.sessionManager.getSessionId() };
     this.binding.ownerKey = displayOwnerKey(this.binding.socketPath, this.binding.parentPaneId, this.binding.sessionId);
@@ -1634,18 +1634,20 @@ export class TodoPane {
       write(snapshot) { return cache.write(snapshot); },
     };
     this.presence = createPresence({ ...this.binding, scopeEpoch: this.scopeEpoch, storage: this.storage, pipePath: this.presencePath,
-      hasDagOwnedTasks: () => this.source !== null && this.source.runs.some(run => run.nodes.some(node => node.taskId)) });
+      clock: this.clock, hasDagOwnedTasks: () => this.source !== null && this.source.runs.some(run => run.nodes.some(node => node.taskId)) });
     await this.startControl();
     await this.presence.start();
     if (this.stopped) return;
     const readiness = receipt => {
       const record = this.ownedRoles.get(receipt?.role);
       const snapshot = this.actor?.snapshot;
-      const result = reason => {
+      const result = (reason, diagnostic = reason) => {
         this.readinessReasons ??= new Map();
         if (this.readinessReasons.get(receipt.role) !== reason) {
           this.readinessReasons.set(receipt.role, reason);
-          void this.actor?.diagnose('display', { code: 'NONE', reason, sequence: receipt.sequence,
+          const diagnosticReason = diagnostic.startsWith('presence-') && diagnostic !== 'presence-not-ready'
+            ? 'presence-not-ready' : diagnostic;
+          void this.actor?.diagnose('display', { code: 'NONE', reason: diagnosticReason, sequence: receipt.sequence,
             ackSequence: snapshot?.roles[receipt.role]?.ack?.sequence, phase: snapshot?.phase },
             { role: receipt.role });
         }
@@ -1661,19 +1663,37 @@ export class TodoPane {
           ['participant-mismatch', snapshot?.participants.todo?.lifetimeId !== this.lifetimeId ||
             snapshot?.participants.dag?.lifetimeId !== this.provider?.lifetimeId],
         ]) if (denied) return result(reason);
-        for (const role of ['todo', 'dag', 'workers']) {
+        const required = ['todo', 'dag', 'workers'];
+        // Hard gates for every required role precede any transient ack lag. A
+        // Todo sequence mismatch must not hide a later role's loss.
+        for (const role of required) {
+          const owned = this.ownedRoles.get(role);
+          if (owned?.ready !== true || !Number.isSafeInteger(owned.processId)) return result('role-not-ready');
+          if (owned.manualClose === true) return result('role-closed');
+        }
+        for (const role of required) {
           if (snapshot.roles[role]?.generation !== snapshot.generation) return result('role-generation');
           if (!snapshot.roles[role]?.ack?.painted) return result('role-paint');
-          if (snapshot.roles[role].ack.sequence !== receipt.sequence) return result('role-sequence');
-          if (!this.ownedRoles.get(role)?.ready) return result('role-not-ready');
-          if (this.ownedRoles.get(role).manualClose) return result('role-closed');
-          if (!this.presence.isReady({ ...receipt, role })) return result('presence-not-ready');
         }
+        const presenceReasons = new Map();
+        for (const role of required) {
+          const reason = this.presence.readiness({ ...receipt, role });
+          presenceReasons.set(role, reason);
+          // Expiry, a missing observer, a closed presence or source/baseline
+          // failure outranks any ack lag, even on a different role.
+          if (reason !== 'ready' && reason !== 'presence-ack-lag') return result(reason);
+        }
+        // Aggregate transient pending only after every hard gate passed.
+        for (const role of required)
+          if (snapshot.roles[role]?.ack?.sequence !== receipt.sequence) return result('role-sequence');
+        for (const role of required)
+          if (presenceReasons.get(role) !== 'ready') return result(presenceReasons.get(role));
+        return result('ready');
       }
       if (record?.scopeEpoch !== this.scopeEpoch) return result('scope-mismatch');
       if (record.ready !== true || !Number.isSafeInteger(record.processId)) return result('role-not-ready');
       if (record.manualClose === true) return result('role-closed');
-      return result(this.presence.isReady(receipt) ? 'ready' : 'presence-not-ready');
+      return result(this.presence.readiness(receipt));
     };
     this.adapter = {
       getOwner: () => this.presence.getOwner(),

@@ -62,6 +62,9 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
     if (observer.timer !== null) clock.clearTimeout(observer.timer);
     observer.timer = null;
     observer.expires = 0;
+    // A fresh delivery/ack gives the viewer a new paint opportunity. The
+    // expiry callback sets this flag again after clearing the timer.
+    observer.expired = false;
   }
   function deliver(observer) {
     if (!baseline) {
@@ -86,7 +89,7 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
         if (message.type !== 'hello' || message.sequence !== 0 || observers.has(message.role)) {
           emit('rejected', { reason: 'duplicate-or-hello', role: message.role }); socket.destroy(); return;
         }
-        observer = { socket, role: message.role, sequence: 0, expires: 0, timer: null };
+        observer = { socket, role: message.role, sequence: 0, expires: 0, expired: false, timer: null };
         observers.set(observer.role, observer);
         emit('connected', { role: observer.role });
         deliver(observer);
@@ -109,6 +112,7 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
       observer.timer = clock.setTimeout(() => {
         if (epoch !== revision || observers.get(observer.role) !== observer) return;
         clearLease(observer);
+        observer.expired = true;
         emit('expired', { role: observer.role });
         changed();
       }, leaseMs);
@@ -197,12 +201,25 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
       tail = job.catch(() => {});
       return job;
     },
+    // The boolean stays for compatibility. Callers that retain a mask need to
+    // distinguish a healthy current-baseline ack lag from authorization that is
+    // actually gone: expiry, a missing/disconnected observer, a closed server,
+    // source error/last-known, or an invalid scope/baseline.
+    readiness(receipt) {
+      if (closed) return 'presence-closed';
+      if (!sameSnapshotScope(receipt, owner)) return 'presence-scope';
+      if (!['current', 'empty', 'waiting'].includes(state.availability)) return 'presence-error';
+      if (!Number.isSafeInteger(receipt?.sequence) || receipt.sequence < 1) return 'presence-invalid';
+      const observer = observers.get(receipt.role);
+      if (!observer) return 'presence-missing';
+      if (!baseline) return 'presence-baseline';
+      if (observer.expired) return 'presence-expired';
+      if (receipt.sequence !== baseline.sequence || observer.sequence !== receipt.sequence ||
+        !(observer.expires > clock.now())) return 'presence-ack-lag';
+      return 'ready';
+    },
     isReady(receipt) {
-      const observer = observers.get(receipt?.role);
-      return !closed && ['current', 'empty', 'waiting'].includes(state.availability) &&
-        sameSnapshotScope(receipt, owner) && Number.isSafeInteger(receipt.sequence) &&
-        receipt.sequence === baseline?.sequence && observer?.sequence === receipt.sequence &&
-        observer.expires > clock.now();
+      return this.readiness(receipt) === 'ready';
     },
     sourceFailed(error, sourceScope) {
       if (closed || !sameSnapshotScope(sourceScope, owner)) return false;

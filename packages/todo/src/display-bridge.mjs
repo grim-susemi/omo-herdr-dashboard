@@ -10,7 +10,9 @@ const signature = snapshot => JSON.stringify([snapshot.phases, snapshot.ask]);
 const publicationKey = snapshot => JSON.stringify([snapshot.ownerKey, snapshot.sessionId, snapshot.scopeEpoch,
   snapshot.availability, snapshot.phases, snapshot.ask]);
 // Missing acknowledgment is a pending state, not evidence that the viewer is gone.
-const pendingAckReasons = new Set(['role-sequence', 'presence-not-ready']);
+// A presence ack lag is transient only while the observer, scope and baseline are
+// still live; presence-expired/missing/error/scope/baseline are hard loss.
+const pendingAckReasons = new Set(['role-sequence', 'presence-not-ready', 'presence-ack-lag']);
 const coverageOf = reason => reason === 'ready' ? 'ready' :
   pendingAckReasons.has(reason) ? 'pending-ack' : 'lost';
 const sameScope = (a, b) => a && b && a.ownerKey === b.ownerKey &&
@@ -50,6 +52,10 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
   let snapshot = null;
   let recovery = null;
   let receipt = null;
+  // The last successful receipt. Unlike `receipt`, it survives while a newer
+  // publication is unresolved so liveness can still be checked; pending alone
+  // never authorizes retaining a mask.
+  let authorization = null;
   let published = null;
   let pending = null;
   let revision = 0;
@@ -103,23 +109,32 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     const setting = adapter.settings?.[role] ?? 'auto';
     if (setting !== 'auto') return 'lost';
     // A publication in flight keeps an authorization this key already earned.
-    // It never authorizes hiding a key that was not masked before.
-    if (!receipt) return pending !== null ? 'pending-ack' : 'lost';
+    // It never authorizes hiding a key that was not masked before. The prior
+    // receipt is still evaluated against current liveness, so a real disconnect,
+    // manual close, expired lease or source failure is not hidden by the write.
+    const live = receipt !== null;
+    if (!live && (pending === null || authorization === null)) return 'lost';
+    const binding = live ? receipt : authorization;
     const reasonFor = binding => typeof adapter.readiness === 'function'
       ? adapter.readiness(binding)
       : adapter.isReady?.(binding) === true ? 'ready' : 'lost';
     try {
-      const roleState = coverageOf(reasonFor({ ...receipt, role }));
-      if (roleState !== 'ready') return roleState;
+      const roleState = coverageOf(reasonFor({ ...binding, role }));
+      if (roleState === 'lost') return 'lost';
       if (role === 'workers') {
         const dagOwned = adapter.hasDagOwnedTasks?.();
         if (typeof dagOwned !== 'boolean') return 'lost';
         if (dagOwned) {
-          const dagState = coverageOf(reasonFor({ ...receipt, role: 'dag' }));
+          const dagState = coverageOf(reasonFor({ ...binding, role: 'dag' }));
+          if (dagState === 'lost') return 'lost';
+          if (!live) return 'pending-ack';
           if (dagState !== 'ready') return dagState;
         }
       }
-      return 'ready';
+      // While the write is unresolved an authorized-but-otherwise-ready role
+      // can only retain an existing mask; a successful receipt is needed to
+      // create one.
+      return live ? roleState : 'pending-ack';
     } catch (error) { fail('readiness', error); return 'lost'; }
   }
 
@@ -138,6 +153,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     } catch (error) {
       fail('mask', error);
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       revision++;
@@ -164,6 +180,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       } catch (error) {
         fail('mask', error);
         receipt = null;
+        authorization = null;
         published = null;
         pending = null;
         revision++;
@@ -202,6 +219,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     // An async completion cannot authorize hiding a newer unread branch.
     if (!read() || candidate !== publicationKey(snapshot)) {
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       refresh();
@@ -210,12 +228,14 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     if (!sameScope(value, owner) || !Number.isSafeInteger(value.sequence) || value.sequence < 1) {
       fail('publication', 'Rejected or mismatched publication receipt');
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       reconcile();
       return false;
     }
     receipt = { ownerKey: owner.ownerKey, sessionId: owner.sessionId, scopeEpoch: owner.scopeEpoch, sequence: value.sequence };
+    authorization = receipt;
     published = candidate;
     pending = null;
     reconcile();
@@ -227,6 +247,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     if (!read()) {
       revision++;
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       reconcile();
@@ -238,6 +259,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       return receipt !== null;
     }
     const id = ++revision;
+    if (receipt) authorization = receipt;
     receipt = null;
     pending = candidate;
     try {
@@ -248,6 +270,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
           if (disposed || id !== revision || !current()) return;
           fail('publication', error);
           receipt = null;
+          authorization = null;
           published = null;
           pending = null;
           reconcile();
@@ -259,6 +282,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     } catch (error) {
       fail('publication', error);
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       reconcile();
@@ -284,6 +308,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     } catch (error) {
       fail('native-setter', error);
       receipt = null;
+      authorization = null;
       published = null;
       read();
       restore(key);
@@ -321,6 +346,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
     invalidate() {
       revision++;
       receipt = null;
+      authorization = null;
       published = null;
       pending = null;
       reconcile();
@@ -338,6 +364,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       suspended = true;
       revision++;
       receipt = null;
+      authorization = null;
       pending = null;
       published = null;
     },
@@ -351,6 +378,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
         recovery = null;
         revision++;
         receipt = null;
+        authorization = null;
         pending = null;
         published = null;
       }
@@ -366,6 +394,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
           snapshot = null;
           recovery = null;
           receipt = null;
+          authorization = null;
           pending = null;
           published = null;
           revision++;
@@ -403,6 +432,7 @@ export function installDisplayBridge(ctx, adapter, { environment = process.env }
       disposed = true;
       revision++;
       receipt = null;
+      authorization = null;
       pending = null;
     },
   };

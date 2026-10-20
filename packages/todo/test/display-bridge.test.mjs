@@ -642,6 +642,65 @@ test('existing masks survive a pending publication and lagging role acknowledgme
   f.bridge.remove();
 });
 
+test('pending publication retains only prior authorization that is still live', async () => {
+  const f = fixture({ triState: true });
+  const options = { placement: 'belowEditor' };
+  f.ui.setWidget('todo-sidebar', f.factory('native-todo'));
+  f.ui.setWidget('omo-task', ['worker-1'], options);
+  f.ui.setWidget('omo-dag', ['dag-1'], options);
+  for (const role of ['todo', 'workers', 'dag']) f.setReason(role, 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  let settle;
+  f.adapter.publish = () => new Promise(resolve => { settle = resolve; });
+  f.change('next-todo');
+  f.bridge.observe({ type: 'message_end' }, f.ctx);
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+
+  f.setReason('workers', 'role-not-ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.widgets.get('omo-task'), ['worker-1'],
+    'hard loss restores Workers while the write is unresolved');
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-dag']);
+
+  f.setReason('workers', 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-dag'],
+    'a healthy prior authorization cannot re-hide a key during the same write');
+  assert.deepEqual(f.widgets.get('omo-task'), ['worker-1']);
+
+  settle({ ...f.owner, sequence: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+    'a new success authorizes the mask again');
+  f.bridge.remove();
+});
+
+test('presence ack lag is transient while its hard reasons are not', () => {
+  const f = fixture({ triState: true });
+  f.ui.setWidget('omo-task', ['native-worker']);
+  f.setReason('workers', 'ready');
+  f.bridge.readinessChanged();
+  assert.deepEqual(f.bridge.status.masked, ['omo-task']);
+  for (const reason of ['presence-ack-lag', 'presence-not-ready']) {
+    f.setReason('workers', reason);
+    f.bridge.readinessChanged();
+    assert.deepEqual(f.bridge.status.masked, ['omo-task'], reason);
+  }
+  for (const reason of ['presence-expired', 'presence-missing', 'presence-error',
+    'presence-closed', 'presence-scope', 'presence-baseline']) {
+    f.setReason('workers', 'ready');
+    f.bridge.readinessChanged();
+    assert.deepEqual(f.bridge.status.masked, ['omo-task'], `restore ${reason}`);
+    f.setReason('workers', reason);
+    f.bridge.readinessChanged();
+    assert.deepEqual(f.bridge.status.masked, [], reason);
+    assert.deepEqual(f.widgets.get('omo-task'), ['native-worker'], reason);
+  }
+  f.bridge.remove();
+});
+
 test('hard-loss readiness reasons and lifecycle stops restore masks immediately', () => {
   for (const reason of ['stopped', 'managed-blocked', 'recovery-blocked', 'layout-active',
     'arrangement-moving', 'source-refreshing', 'actor-fallback', 'scope-mismatch',

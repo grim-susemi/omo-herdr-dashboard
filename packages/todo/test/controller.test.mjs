@@ -9,12 +9,13 @@ import { join } from 'node:path';
 import { TodoPane, dashboardChannels, readRoleState, registerRoleViewer, requestRoleClose, viewerProcess, paneViewerProcess, canCleanupPane, parseLaunchCommand, queryShellProcesses, cachedProcessQuery } from '../src/controller.mjs';
 import net from 'node:net';
 import extension from '../extension.mjs';
+import { createRoleClient } from '../src/presence.mjs';
 
 const snapshot = { type: 'custom', customType: 'senpi.todo-state', data: {
   schema: 'v2', phases: [{ name: 'Build', tasks: [{ content: 'Native work', status: 'in_progress' }] }],
 } };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
-async function fixture(t, branch = [snapshot]) {
+async function fixture(t, branch = [snapshot], options = {}) {
   const directory = join(tmpdir(), `todo-controller-${process.pid}-${randomUUID()}`);
   console.log(JSON.stringify({ event: 'resource-planned', pid: process.pid, directory }));
   await mkdir(directory);
@@ -23,7 +24,12 @@ async function fixture(t, branch = [snapshot]) {
   const calls = [], panes = new Map([['qa:parent', { pane_id: 'qa:parent', tab_id: 'qa:tab' }],
     ['qa:dag', { pane_id: 'qa:dag', tab_id: 'qa:tab' }], ['qa:workers', { pane_id: 'qa:workers', tab_id: 'qa:tab' }]]);
   const processes = new Map();
-  const ctx = { hasUI: true, mode: 'tui', ui: { setWidget() {} },
+  const widgets = new Map();
+  const ctx = { hasUI: true, mode: 'tui', ui: { widgets,
+    setWidget(key, content) {
+      if (content === undefined) widgets.delete(key); else widgets.set(key, content);
+      return true;
+    } },
     sessionManager: { getSessionFile: () => 'selected.jsonl', getSessionId: () => 'synthetic-session',
       getBranch: () => branch, getLeafId: () => 'leaf' } };
   let number = 0;
@@ -45,7 +51,7 @@ async function fixture(t, branch = [snapshot]) {
     return {};
   };
   const controller = new TodoPane({ ctx, environment, stateDir: directory, cwd: directory,
-    node: 'node', viewer: join(directory, 'viewer.mjs'), herdr });
+    node: 'node', viewer: join(directory, 'viewer.mjs'), herdr, clock: options.clock });
   console.log(JSON.stringify({ event: 'resource-planned', pid: process.pid, controlPipe: controller.controlPath,
     presencePipe: controller.presencePath }));
   t.after(async () => {
@@ -71,7 +77,7 @@ async function fixture(t, branch = [snapshot]) {
   const bus = new EventEmitter();
   const pi = { events: { on(name, callback) { bus.on(name, callback); return () => bus.off(name, callback); },
     emit: (name, value) => bus.emit(name, value) } };
-  return { controller, calls, panes, processes, events, directory, provider, ready, source, pi, bus };
+  return { controller, calls, panes, processes, events, directory, provider, ready, source, pi, bus, branch, widgets };
 }
 
 test('fresh native branch opens a waiting Todo and later native commit updates the same pane', async t => {
@@ -491,4 +497,242 @@ test('an empty or invalid process query is never read as a dead previous produce
   assert.equal(spawned, 0);
   f.controller.inspectShell = async () => [];
   assert.deepEqual(await f.controller.observePreviousProducer({ pid: 4242, birth: '1' }), { identity: { pid: 4242, birth: '1' }, state: 'dead' });
+});
+
+// Real named-pipe role clients plus the real controller/presence closure. The
+// owned-role records are the same synthetic inputs the gate review used; every
+// event below is an actual presence event, not a mocked readiness enum.
+const dashboardRoles = ['todo', 'dag', 'workers'];
+const widgetByRole = { todo: 'todo-sidebar', workers: 'omo-task', dag: 'omo-dag' };
+function presenceEvent(presence, predicate, label, timeout = 3000) {
+  const deferred = Promise.withResolvers();
+  const abort = AbortSignal.timeout(timeout);
+  let settled = false;
+  const cleanup = () => { presence.events.off('event', handler); abort.removeEventListener('abort', failed); };
+  const finish = (value, error) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (error) deferred.reject(error); else deferred.resolve(value);
+  };
+  const handler = event => { if (predicate(event)) finish(event); };
+  const failed = () => finish(undefined, new Error(`Missing ${label}`));
+  presence.events.on('event', handler);
+  abort.addEventListener('abort', failed, { once: true });
+  return deferred.promise;
+}
+async function connectRole(controller, role) {
+  const ack = presenceEvent(controller.presence, event => event.type === 'ack' && event.role === role, `ack ${role}`);
+  let client;
+  client = createRoleClient({ offer: controller.presence.offer(role),
+    onSnapshot: (_snapshot, message) => client.painted(message) });
+  try { await ack; return client; } catch (error) { client.close(); throw error; }
+}
+function ownRoles(controller) {
+  for (const role of dashboardRoles) controller.ownedRoles.set(role, {
+    scopeEpoch: controller.scopeEpoch, processId: 123, ready: true, manualClose: false });
+}
+function publishNativeWidgets(f) {
+  for (const role of dashboardRoles)
+    f.controller.ctx.ui.setWidget(widgetByRole[role], [`native-${role}`]);
+}
+async function authorizedDashboard(f) {
+  publishNativeWidgets(f);
+  ownRoles(f.controller);
+  const clients = new Map();
+  for (const role of dashboardRoles) clients.set(role, await connectRole(f.controller, role));
+  f.controller.bridge.readinessChanged();
+  assert.deepEqual(f.controller.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+  return clients;
+}
+function appendTodo(branch, content) {
+  const last = [...branch].reverse().find(entry => entry.customType === 'senpi.todo-state');
+  const phases = structuredClone(last.data.phases);
+  phases[0].tasks.push({ content, status: 'pending' });
+  branch.push({ type: 'custom', customType: 'senpi.todo-state', data: { schema: 'v2', phases } });
+}
+function pauseWrites(controller) {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const write = controller.storage.write.bind(controller.storage);
+  controller.storage.write = async snapshot => { entered.resolve(); await release.promise; return write(snapshot); };
+  return { entered: entered.promise, release: release.resolve,
+    restore() { controller.storage.write = write; } };
+}
+function closeClients(clients) {
+  for (const client of clients.values()) client.close();
+}
+
+test('hard loss: a real Workers disconnect during an unresolved write restores native workers', async t => {
+  const f = await fixture(t), { controller } = f;
+  const clients = await authorizedDashboard(f);
+  const prior = controller.bridge.status.publication;
+  const paused = pauseWrites(controller);
+  try {
+    appendTodo(f.branch, 'during-write');
+    controller.bridge.observe({ type: 'message_end' }, controller.ctx);
+    await paused.entered;
+    assert.ok(controller.bridge.status.publication === null, 'the write is still unresolved');
+    const disconnected = presenceEvent(controller.presence,
+      event => event.type === 'disconnected' && event.role === 'workers', 'workers disconnected');
+    clients.get('workers').close();
+    await disconnected;
+    assert.equal(controller.ownedRoles.has('workers'), false);
+    assert.ok(f.widgets.has('omo-task'), 'native Workers is visible immediately');
+    assert.equal(controller.presence.readiness({ ...prior, role: 'workers' }), 'presence-missing',
+      'a disconnected observer is named, not generic lag');
+    assert.ok(!controller.bridge.status.masked.includes('omo-task'));
+    controller.ctx.ui.setWidget('omo-task', ['latest-worker']);
+    assert.deepEqual(f.widgets.get('omo-task'), ['latest-worker'], 're-registration remains visible');
+    paused.release();
+    await controller.presence.idle();
+    controller.bridge.readinessChanged();
+    assert.ok(f.widgets.has('omo-task'), 'the settled write cannot revoke the hard loss');
+  } finally { paused.release(); paused.restore(); closeClients(clients);
+    await controller.presence.idle().catch(() => {}); }
+});
+
+test('hard loss: an authenticated Todo close during an unresolved write restores native Todo', async t => {
+  const f = await fixture(t), { controller } = f;
+  f.ready.resolve(); controller.bind(f.pi);
+  f.pi.events.emit(dashboardChannels.provider,
+    { v: 1, kind: 'dag-provider', ...controller.binding, provider: f.provider });
+  await controller.schedule();
+  const clients = await authorizedDashboard(f);
+  const paused = pauseWrites(controller);
+  try {
+    appendTodo(f.branch, 'during-close');
+    controller.bridge.observe({ type: 'message_end' }, controller.ctx);
+    await paused.entered;
+    const state = await readRoleState(controller.stateFile);
+    const closed = once(f.events, `closed:${state.paneId}`, { signal: AbortSignal.timeout(3000) });
+    assert.equal(await requestRoleClose({ state, paneId: state.paneId,
+      launchToken: state.launchToken, pid: 5001 }), true);
+    await closed;
+    assert.equal(controller.ownedRoles.has('todo'), false);
+    assert.ok(f.widgets.has('todo-sidebar'), 'native Todo is visible during the unresolved write');
+    assert.ok(!controller.bridge.status.masked.includes('todo-sidebar'));
+  } finally { paused.release(); await controller.presence.idle().catch(() => {});
+    paused.restore(); closeClients(clients); }
+});
+
+test('hard loss: injected clock expiry restores native workers without a wall sleep', async t => {
+  let now = 0;
+  let next = 0;
+  const timers = new Map();
+  const clock = {
+    now: () => now,
+    setTimeout(callback, ms) { const id = ++next; timers.set(id, { callback, at: now + ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    advance(ms) {
+      now += ms;
+      for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.callback(); }
+    },
+  };
+  const f = await fixture(t, [snapshot], { clock }), { controller } = f;
+  const clients = await authorizedDashboard(f);
+  try {
+    const expired = presenceEvent(controller.presence,
+      event => event.type === 'expired' && event.role === 'workers', 'workers expiry');
+    clock.advance(10000);
+    await expired;
+    assert.ok(f.widgets.has('omo-task'), 'expired authorization restores Workers');
+    assert.ok(!controller.bridge.status.masked.includes('omo-task'));
+    assert.equal(controller.presence.readiness({ ...controller.bridge.status.publication, role: 'workers' }),
+      'presence-expired');
+    assert.equal(timers.size, 0, 'no lease callback remains to hide the loss');
+  } finally { closeClients(clients); }
+});
+
+test('hard loss: a real source failure falls back to last-known and restores Todo', async t => {
+  const f = await fixture(t), { controller } = f;
+  const clients = await authorizedDashboard(f);
+  try {
+    const failed = presenceEvent(controller.presence, event => event.type === 'source-error', 'source error');
+    assert.equal(controller.presence.sourceFailed(new Error('source unavailable'),
+      controller.presence.getOwner()), true);
+    await failed;
+    assert.equal(controller.presence.state.availability, 'last-known');
+    assert.ok(f.widgets.has('omo-task'), 'source-error restores Workers');
+    assert.ok(f.widgets.has('todo-sidebar'), 'source-error restores Todo');
+    assert.equal(controller.adapter.readiness({ ...controller.bridge.status.publication, role: 'workers' }),
+      'presence-error');
+  } finally { closeClients(clients); }
+});
+
+test('hard loss: managed readiness checks every later role before Todo ack lag', async t => {
+  const f = await fixture(t), { controller } = f;
+  f.ready.resolve(); controller.bind(f.pi);
+  f.pi.events.emit(dashboardChannels.provider,
+    { v: 1, kind: 'dag-provider', ...controller.binding, provider: f.provider });
+  await controller.schedule();
+  const clients = await authorizedDashboard(f);
+  try {
+    const sequence = controller.bridge.status.publication.sequence;
+    controller.managed = true;
+    controller.actor = { inlineFallback: false, diagnose: async () => {}, snapshot: {
+      sessionId: controller.binding.sessionId, generation: 1, phase: 'READY', operations: [],
+      participants: { todo: { lifetimeId: controller.lifetimeId }, dag: { lifetimeId: f.provider.lifetimeId } },
+      roles: Object.fromEntries(dashboardRoles.map(role => [role,
+        { generation: 1, ack: { painted: true, sequence } }])),
+    } };
+    controller.bridge.readinessChanged();
+    assert.deepEqual(controller.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag']);
+    controller.actor.snapshot.roles.todo.ack.sequence = sequence - 1;
+    controller.bridge.readinessChanged();
+    assert.deepEqual(controller.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+      'Todo ack lag alone remains transient');
+    const original = new Map([...controller.ownedRoles].map(([role, record]) => [role, { ...record }]));
+    const restore = role => {
+      controller.ownedRoles.set(role, { ...original.get(role) });
+      controller.actor.snapshot.roles.todo.ack.sequence = sequence;
+      controller.bridge.readinessChanged();
+      assert.deepEqual(controller.bridge.status.masked, ['todo-sidebar', 'omo-task', 'omo-dag'],
+        `healthy control after ${role}`);
+      controller.actor.snapshot.roles.todo.ack.sequence = sequence - 1;
+    };
+    const expectLoss = (reason, label) => {
+      controller.bridge.readinessChanged();
+      assert.equal(controller.adapter.readiness({ ...controller.bridge.status.publication, role: 'workers' }),
+        reason, label);
+      assert.deepEqual(controller.bridge.status.masked, [], `${label}: hard loss outranks Todo lag`);
+      for (const role of dashboardRoles) assert.ok(f.widgets.has(widgetByRole[role]), `${label}: ${role}`);
+    };
+
+    controller.ownedRoles.delete('dag');
+    expectLoss('role-not-ready', 'DAG ownership missing');
+    restore('dag');
+
+    controller.ownedRoles.get('dag').ready = false;
+    expectLoss('role-not-ready', 'DAG not ready');
+    restore('dag');
+
+    controller.ownedRoles.get('dag').manualClose = true;
+    expectLoss('role-closed', 'DAG manual close');
+    restore('dag');
+
+    controller.ownedRoles.get('workers').ready = false;
+    expectLoss('role-not-ready', 'Workers not ready');
+    restore('workers');
+
+    controller.ownedRoles.get('workers').manualClose = true;
+    expectLoss('role-closed', 'Workers manual close');
+    restore('workers');
+
+    controller.ownedRoles.get('workers').processId = Number.NaN;
+    expectLoss('role-not-ready', 'Workers process invalid');
+    restore('workers');
+
+    const disconnected = presenceEvent(controller.presence,
+      event => event.type === 'disconnected' && event.role === 'workers', 'managed workers disconnection');
+    clients.get('workers').close();
+    await disconnected;
+    expectLoss('role-not-ready', 'Workers viewer missing');
+    const reconnected = await connectRole(controller, 'workers');
+    clients.set('workers', reconnected);
+    restore('workers');
+  } finally {
+    controller.managed = false;
+    controller.actor = null;
+    closeClients(clients);
+  }
 });
