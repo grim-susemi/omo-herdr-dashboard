@@ -36,13 +36,19 @@ function deferred() {
 }
 function clock() {
   let now = 0, id = 0;
-  const timers = new Map(), intervals = new Map();
-  return { now: () => now, setTimeout(fn, ms) { const key = ++id; timers.set(key, { fn, at: now + ms }); return key; },
+  const timers = new Map(), intervals = new Map(), events = new EventEmitter();
+  return { now: () => now, setTimeout(fn, ms) { const key = ++id; timers.set(key, { fn, at: now + ms });
+      events.emit('timeout', ms); return key; },
     clearTimeout: key => timers.delete(key), setInterval(fn, ms) { const key = ++id; intervals.set(key, { fn, ms }); return key; },
     clearInterval: key => intervals.delete(key),
     advance(ms) { now += ms; for (const [key, timer] of [...timers]) if (timer.at <= now) { timers.delete(key); timer.fn(); } },
     repaint(ms) { for (const timer of intervals.values()) if (ms === undefined || ms === timer.ms) timer.fn(); },
     intervalCount(ms) { return [...intervals.values()].filter(timer => timer.ms === ms).length; },
+    timeoutDelays() { return [...timers.values()].map(timer => timer.at - now); },
+    async waitForTimeout(ms) {
+      if ([...timers.values()].some(timer => timer.at - now === ms)) return;
+      await signal(events, 'timeout', value => value === ms);
+    },
     get size() { return timers.size + intervals.size; } };
 }
 class Output extends EventEmitter {
@@ -83,6 +89,7 @@ async function fixture(t, { offers = true, hold = false } = {}) {
   const presence = createPresence({ ...binding, storage, clock: time, pipePath: presencePipe });
   const output = new Output({ hold }), input = new PassThrough();
   const controlEvents = new EventEmitter(), sockets = new Set(), requests = [], viewers = [];
+  const registrationReplies = [], heldRegistrations = [];
   let state = { schema: 'omo-herdr-dashboard/role/1', ...binding, tabId: 'fixture-tab', role: 'todo',
     paneId: `fixture-pane-${id}`, launchToken: randomUUID(), connected: true, language: 'en',
     updatedAt: 1, availability: 'waiting', cachePath, prefsPath: `${statePath}.view.json`,
@@ -107,8 +114,15 @@ async function fixture(t, { offers = true, hold = false } = {}) {
         assert.equal(request[key], state.controlOffer[key]);
       }
       requests.push(request); controlEvents.emit('request', request);
-      socket.end(`${JSON.stringify({ ...state.controlOffer,
-        type: request.type === 'register' ? 'registered' : acceptClose ? 'closed' : 'denied' })}\n`);
+      if (request.type === 'register') {
+        const action = registrationReplies.shift() ?? 'registered';
+        if (action === 'hold') { heldRegistrations.push({ socket, offer: { ...state.controlOffer } }); return; }
+        if (action === 'error') { socket.destroy(); return; }
+        socket.end(`${JSON.stringify({ ...state.controlOffer,
+          type: action === 'denied' ? 'denied' : 'registered' })}\n`);
+        return;
+      }
+      socket.end(`${JSON.stringify({ ...state.controlOffer, type: acceptClose ? 'closed' : 'denied' })}\n`);
     });
   });
   t.after(async () => {
@@ -134,6 +148,12 @@ async function fixture(t, { offers = true, hold = false } = {}) {
   await writeState();
   const options = { statePath, paneId: state.paneId, launchToken: state.launchToken };
   return { directory, statePath, cachePath, controlPipe, presence, output, input, time, requests, controlEvents, options, writeState,
+    registrationReplies, heldRegistrations,
+    releaseRegistration(type = 'denied') {
+      const entry = heldRegistrations.shift();
+      if (!entry) throw new Error('No held registration');
+      entry.socket.end(`${JSON.stringify({ ...entry.offer, type })}\n`);
+    },
     get state() { return state; }, set acceptClose(value) { acceptClose = value; },
     async publish(content) { return presence.publish({ ...native(content), ...presence.getOwner() }); },
     async start(overrides = {}) {
@@ -333,6 +353,120 @@ test('watch subscribes before initial read; an atomic replacement cannot install
   assert.equal(viewer.state.role.scopeEpoch, 2);
   assert.equal(viewer.state.snapshot, null);
   assert.equal(viewer.state.availability, 'waiting');
+});
+
+test('denied registration retries the identical offer on the injected 100ms clock and succeeds once', async t => {
+  const f = await fixture(t);
+  await f.publish('Retry target');
+  f.registrationReplies.push('denied');
+  const first = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const viewer = await f.start(); await first;
+  const registers = () => f.requests.filter(value => value.type === 'register').length;
+  assert.equal(registers(), 1);
+  await f.time.waitForTimeout(100);
+  // A re-read of identical valid state is not a reconnect and must not cancel the retry.
+  await viewer.refresh();
+  assert.equal(registers(), 1);
+  f.time.advance(99);
+  assert.equal(registers(), 1, 'no retry before 100ms');
+  const second = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const painted = signal(viewer.events, 'snapshot', value => value.snapshot.target.content === 'Retry target');
+  f.time.advance(1);
+  await Promise.all([second, painted]);
+  assert.equal(registers(), 2, 'exactly one retry attempt');
+  assert.equal(viewer.state.availability, 'current');
+  assert.equal(viewer.state.error, '');
+});
+
+test('a registration error then a rejection use the next backoff steps without overlapping attempts', async t => {
+  const f = await fixture(t);
+  await f.publish('Backoff target');
+  f.registrationReplies.push('error', 'denied');
+  const first = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const viewer = await f.start(); await first;
+  const registers = () => f.requests.filter(value => value.type === 'register').length;
+  await f.time.waitForTimeout(100);
+  f.time.advance(99);
+  assert.equal(registers(), 1);
+  const second = signal(f.controlEvents, 'request', value => value.type === 'register');
+  f.time.advance(1);
+  await second;
+  assert.equal(registers(), 2);
+  await f.time.waitForTimeout(200);
+  f.time.advance(199);
+  assert.equal(registers(), 2);
+  const third = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const painted = signal(viewer.events, 'snapshot', value => value.snapshot.target.content === 'Backoff target');
+  f.time.advance(1);
+  await Promise.all([third, painted]);
+  assert.equal(registers(), 3);
+  assert.equal(viewer.state.availability, 'current');
+});
+
+test('a late denial from the previous offer cannot demote the newer registration success', async t => {
+  const f = await fixture(t);
+  await f.publish('Current offer');
+  f.registrationReplies.push('hold');
+  const first = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const viewer = await f.start(); await first;
+  assert.equal(f.heldRegistrations.length, 1);
+  const token = randomUUID();
+  const accepted = signal(viewer.events, 'registered', value => value.accepted && value.scope?.controlOffer?.token === token);
+  const painted = signal(viewer.events, 'snapshot', value => value.snapshot.target.content === 'Current offer');
+  await f.writeState({ ...f.state, controlOffer: { ...f.state.controlOffer, token } });
+  await accepted; await painted;
+  assert.equal(viewer.state.availability, 'current');
+  let controlErrors = 0;
+  viewer.events.on('control-error', () => controlErrors++);
+  const stale = signal(viewer.events, 'registration-stale');
+  f.releaseRegistration('denied');
+  const settlement = await stale;
+  assert.equal(settlement.accepted, false);
+  assert.equal(controlErrors, 0);
+  assert.equal(viewer.state.availability, 'current');
+  assert.equal(viewer.state.error, '');
+  assert.equal(viewer.state.snapshot.target.content, 'Current offer');
+  assert.equal(f.requests.filter(value => value.type === 'register').length, 2);
+  f.time.advance(5000);
+  assert.equal(f.requests.filter(value => value.type === 'register').length, 2, 'the obsolete reply starts no retry');
+  assert.equal(viewer.state.availability, 'current');
+});
+
+test('a changed control offer retires the pending retry of its previous epoch', async t => {
+  const f = await fixture(t);
+  await f.publish('Epoch target');
+  f.registrationReplies.push('denied');
+  const first = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const viewer = await f.start(); await first;
+  await f.time.waitForTimeout(100);
+  assert.ok(f.time.timeoutDelays().includes(100));
+  const token = randomUUID();
+  const accepted = signal(viewer.events, 'registered', value => value.accepted && value.scope?.controlOffer?.token === token);
+  const painted = signal(viewer.events, 'snapshot', value => value.snapshot.target.content === 'Epoch target');
+  await f.writeState({ ...f.state, controlOffer: { ...f.state.controlOffer, token } });
+  await accepted; await painted;
+  assert.equal(f.requests.filter(value => value.type === 'register').length, 2);
+  assert.ok(!f.time.timeoutDelays().includes(100), 'the old epoch retry timer is cleared by retire');
+  f.time.advance(5000);
+  assert.equal(f.requests.filter(value => value.type === 'register').length, 2, 'the old epoch cannot reconnect');
+  assert.equal(viewer.state.availability, 'current');
+  assert.equal(viewer.state.error, '');
+});
+
+test('close during a pending registration retry cancels the timer without a stale error', async t => {
+  const f = await fixture(t);
+  f.registrationReplies.push('denied');
+  const first = signal(f.controlEvents, 'request', value => value.type === 'register');
+  const viewer = await f.start(); await first;
+  await f.time.waitForTimeout(100);
+  assert.ok(f.time.timeoutDelays().includes(100));
+  await viewer.close(false);
+  assert.ok(!f.time.timeoutDelays().includes(100));
+  const registers = f.requests.filter(value => value.type === 'register').length;
+  f.time.advance(5000);
+  assert.equal(f.requests.filter(value => value.type === 'register').length, registers);
+  assert.equal(viewer.state.availability, 'waiting');
+  assert.equal(viewer.state.error, '');
 });
 
 test('source failure and disconnect keep only labelled same-scope last-known; read errors never imply empty', async t => {

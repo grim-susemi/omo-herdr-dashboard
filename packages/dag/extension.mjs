@@ -7,6 +7,7 @@ import { FixedDagPane } from './src/controller.mjs';
 import { createHerdr, herdrSession } from './src/herdr.mjs';
 import { resolveViewerNode } from './src/runtime.mjs';
 import { t, languageOf } from './src/i18n.mjs';
+import { RECOVERY_V1, validScope } from '../coordination/src/recovery.mjs';
 
 export default function extension(pi, { createController = options => new FixedDagPane(options), recoveryTimeoutMs = 20000 } = {}) {
   let language = languageOf(process.env.OMO_HERDR_DAG_LANG ?? 'en');
@@ -17,6 +18,7 @@ export default function extension(pi, { createController = options => new FixedD
   const channels = { query: 'omo.herdr.dashboard.query', reply: 'omo.herdr.dashboard.reply',
     provider: 'omo.herdr.dashboard.provider', retired: 'omo.herdr.dashboard.retired' };
   let managedService, managedAvailable = false;
+  let todoOwner;
   let managedStateDir = process.env.OMO_HERDR_TODO_STATE_DIR ?? join(homedir(), '.omo', 'agent', 'herdr-todo');
   const staticBinding = { socketPath: process.env.HERDR_SOCKET_PATH, parentPaneId: process.env.HERDR_PANE_ID };
   const availability = event => {
@@ -39,9 +41,19 @@ export default function extension(pi, { createController = options => new FixedD
   };
   const viewer = join(dirname(fileURLToPath(import.meta.url)), 'src/viewer.mjs');
   const stateDir = process.env.OMO_HERDR_DAG_STATE_DIR ?? join(homedir(), '.omo', 'agent', 'herdr-dag');
+  // The legacy Collab proof must use the locale the coordination component was
+  // installed with; the same env override wins there. Passing it explicitly
+  // keeps the DAG's yield proof and the satellite's argv in one language.
+  const coordinationLanguage = (() => {
+    let installed = 'en';
+    try { installed = JSON.parse(readFileSync(new URL('../coordination/locale.json', import.meta.url), 'utf8')).language; }
+    catch { /* English without an installed locale */ }
+    return languageOf(process.env.OMO_HERDR_COORDINATION_LANG ?? installed);
+  })();
 
   async function stop() {
     generation++;
+    todoOwner = undefined;
     unsubscribe?.();
     unsubscribe = undefined;
     for (const off of offDashboard) off();
@@ -61,6 +73,7 @@ export default function extension(pi, { createController = options => new FixedD
     await retiring;
     if (wanted !== generation) return;
     const todo = await managedService?.start(event, ctx);
+    if (todo) todoOwner = todo;
     if (wanted !== generation) return;
     let installedLanguage = 'en';
     try { installedLanguage = JSON.parse(readFileSync(new URL('./locale.json', import.meta.url), 'utf8')).language; }
@@ -70,6 +83,7 @@ export default function extension(pi, { createController = options => new FixedD
     controller = createController({ sessionId: ctx.sessionManager.getSessionId(),
       parentPane: process.env.HERDR_PANE_ID, socket: process.env.HERDR_SOCKET_PATH,
       stateDir, cwd: pi.cwd, node: () => resolveViewerNode({ language }), viewer, herdr: createHerdr(), cacheReads: true, language,
+      events: pi.events, coordinationLanguage,
       taskStateDir: process.env.OMO_HERDR_DAG_TASK_STATE_DIR,
       scopeEpoch: todo?.scopeEpoch, managedAvailable, managedStateDir,
       notify: message => ctx.ui.notify(message, 'warning') });
@@ -151,15 +165,33 @@ export default function extension(pi, { createController = options => new FixedD
   pi.on('session_tree', start);
   pi.on('session_shutdown', async () => { await stop(); await lifecycle; });
   pi.registerCommand('dashboard', {
-    description: 'Open or reopen the Todo, worker and DAG dashboard.',
+    description: 'Open or reopen the Todo, workers, DAG and collaboration dashboard.',
     handler: async (_args, ctx) => {
-      if (!eligible(ctx)) return;
+      if (!eligible(ctx)) return { status: 'waiting', fourPaneComplete: false, core: { ready: false },
+        collab: { current: false }, pending: true, reason: 'not-eligible' };
       if (coordinatorLost()) {
         reattachCoordinator();
         if (coordinatorLost()) await recoverCoordinator(ctx);
       }
-      if (!controller) return;
+      if (!controller) return { status: 'waiting', fourPaneComplete: false, core: { ready: false },
+        collab: { current: false }, pending: true, reason: 'no-controller' };
       await controller.open().catch(() => {});
+      // The live Todo controller is the scope authority and owns the single
+      // explicit pass. The root entry bounds the returned waiter; without that
+      // controller (older/adjoining entry) the replay query remains available.
+      const scope = todoOwner?.recoveryScope?.();
+      if (!scope || !validScope(scope)) return { status: 'waiting', fourPaneComplete: false,
+        core: { ready: false }, collab: { current: false }, pending: true, reason: 'scope-unsettled' };
+      const commandId = randomUUID();
+      let pending;
+      if (typeof todoOwner.requestRecovery === 'function') {
+        try { pending = todoOwner.requestRecovery({ commandId, explicit: true }); }
+        catch (error) { pending = Promise.reject(error); }
+      }
+      if (!pending)
+        pi.events?.emit(RECOVERY_V1.layoutQuery, { v: 1, kind: 'layout-query', scope,
+          commandId, requestId: randomUUID() });
+      return { scope, commandId, pending };
     },
   });
 }

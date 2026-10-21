@@ -3,13 +3,14 @@ import { test } from 'node:test';
 import { EventEmitter, once } from 'node:events';
 import fs, { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TodoPane, dashboardChannels, readRoleState, registerRoleViewer, requestRoleClose, viewerProcess, paneViewerProcess, canCleanupPane, parseLaunchCommand, queryShellProcesses, cachedProcessQuery } from '../src/controller.mjs';
 import net from 'node:net';
 import extension from '../extension.mjs';
 import { createRoleClient } from '../src/presence.mjs';
+import { createRecoveryCoordinator, layoutIssues, queryIssues, RECOVERY_V1 } from '../../coordination/src/recovery.mjs';
 
 const snapshot = { type: 'custom', customType: 'senpi.todo-state', data: {
   schema: 'v2', phases: [{ name: 'Build', tasks: [{ content: 'Native work', status: 'in_progress' }] }],
@@ -21,8 +22,9 @@ async function fixture(t, branch = [snapshot], options = {}) {
   await mkdir(directory);
   const environment = { HERDR_SOCKET_PATH: 'synthetic-socket', HERDR_PANE_ID: 'qa:parent' };
   const events = new EventEmitter();
-  const calls = [], panes = new Map([['qa:parent', { pane_id: 'qa:parent', tab_id: 'qa:tab' }],
-    ['qa:dag', { pane_id: 'qa:dag', tab_id: 'qa:tab' }], ['qa:workers', { pane_id: 'qa:workers', tab_id: 'qa:tab' }]]);
+  const calls = [], panes = new Map([['qa:parent', { pane_id: 'qa:parent', tab_id: 'qa:tab', rect: { x: 0, y: 0, width: 80, height: 40 } }],
+    ['qa:dag', { pane_id: 'qa:dag', tab_id: 'qa:tab', rect: { x: 58, y: 20, width: 30, height: 20 } }],
+    ['qa:workers', { pane_id: 'qa:workers', tab_id: 'qa:tab', rect: { x: 30, y: 20, width: 28, height: 20 } }]]);
   const processes = new Map();
   const widgets = new Map();
   const ctx = { hasUI: true, mode: 'tui', ui: { widgets,
@@ -51,7 +53,9 @@ async function fixture(t, branch = [snapshot], options = {}) {
     return {};
   };
   const controller = new TodoPane({ ctx, environment, stateDir: directory, cwd: directory,
-    node: 'node', viewer: join(directory, 'viewer.mjs'), herdr, clock: options.clock });
+    node: 'node', viewer: join(directory, 'viewer.mjs'), herdr, clock: options.clock,
+    readCoordinationRecord: options.readCoordinationRecord,
+    readCoordinationProof: options.readCoordinationProof });
   console.log(JSON.stringify({ event: 'resource-planned', pid: process.pid, controlPipe: controller.controlPath,
     presencePipe: controller.presencePath }));
   t.after(async () => {
@@ -67,11 +71,14 @@ async function fixture(t, branch = [snapshot], options = {}) {
     setCoordinator(value) { this.coordinator = value; },
     subscribeSource(callback) { source.on('source', callback); return () => source.off('source', callback); },
     async openPair({ offers, claim }) {
+      if (options.openPairGate) await options.openPairGate;
       assert.equal(controller.presence.state.snapshot?.sequence, 1);
       assert.equal(offers.dag.scopeEpoch, controller.scopeEpoch);
       assert.equal(claim.tabId, 'qa:tab');
-      return { dag: { ...controller.binding, role: 'dag', tabId: 'qa:tab', paneId: 'qa:dag' },
-        workers: { ...controller.binding, role: 'workers', tabId: 'qa:tab', paneId: 'qa:workers' } };
+      return { dag: { ...controller.binding, role: 'dag', tabId: 'qa:tab', paneId: 'qa:dag',
+        ready: true, scopeEpoch: controller.scopeEpoch, processId: 6101, manualClose: false },
+        workers: { ...controller.binding, role: 'workers', tabId: 'qa:tab', paneId: 'qa:workers',
+          ready: true, scopeEpoch: controller.scopeEpoch, processId: 6102, manualClose: false } };
     },
   };
   const bus = new EventEmitter();
@@ -735,4 +742,660 @@ test('hard loss: managed readiness checks every later role before Todo ack lag',
     controller.actor = null;
     closeClients(clients);
   }
+});
+
+// --- shared recovery contract (todo 1) -------------------------------------
+const collabRecord = { paneId: 'qa:collab', parentPaneId: 'qa:parent', sessionId: 'synthetic-session',
+  tabId: 'qa:tab', workers: 'qa:workers', dag: 'qa:dag' };
+const collabPane = { pane_id: 'qa:collab', tab_id: 'qa:tab', rect: { x: 2, y: 20, width: 28, height: 20 } };
+async function settledDashboard(t, options = {}) {
+  const f = await fixture(t, [snapshot], options);
+  if (options.withCollab) f.panes.set('qa:collab', { ...collabPane });
+  for (const pane of options.extraPanes ?? []) f.panes.set(pane.pane_id, pane);
+  f.ready.resolve(); f.controller.bind(f.pi);
+  const layouts = [], results = [];
+  f.bus.on(RECOVERY_V1.layout, message => layouts.push(message));
+  f.bus.on(RECOVERY_V1.result, message => results.push(message));
+  f.pi.events.emit(dashboardChannels.provider,
+    { v: 1, kind: 'dag-provider', ...f.controller.binding, provider: f.provider });
+  await f.controller.tail;
+  return { f, layouts, results };
+}
+
+test('settled pass publishes one scoped layout, replays it late and keeps identity across a no-op', async t => {
+  const { f, layouts } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => collabRecord,
+    extraPanes: [{ pane_id: 'qa:foreign', tab_id: 'qa:tab', rect: { x: -30, y: 20, width: 28, height: 20 } }] });
+  assert.equal(layouts.length, 1);
+  const [first] = layouts;
+  assert.deepEqual(layoutIssues(first), []);
+  assert.equal(first.passSeq, 1);
+  assert.equal(first.explicit, false);
+  assert.equal(first.todo, 'qa:todo1');
+  assert.equal(first.workers, 'qa:workers');
+  assert.equal(first.dag, 'qa:dag');
+  assert.deepEqual(first.cells.map(cell => cell.role), ['collab', 'workers', 'dag']);
+  assert.deepEqual(first.band, { x: 2, y: 20, width: 86, height: 20 });
+  assert.equal(first.cells.some(cell => cell.paneId === 'qa:foreign'), false,
+    'a foreign pane in the same tab never enters the band');
+  assert.equal(first.scope.ownerKey, f.controller.binding.ownerKey);
+  assert.equal(first.scope.sessionId, 'synthetic-session');
+  assert.equal(first.scope.lifetimeId, f.controller.lifetimeId);
+  assert.equal(first.scope.scopeEpoch, f.controller.scopeEpoch);
+  assert.equal(first.scope.tabId, 'qa:tab');
+  console.log(JSON.stringify({ event: 'recovery-layout', layout: first }));
+
+  // The pre-armed listener missed the sole publication; the query replays it.
+  f.pi.events.emit(RECOVERY_V1.layoutQuery,
+    { v: 1, kind: 'layout-query', scope: first.scope, commandId: 'late-query', requestId: 'late' });
+  assert.equal(layouts.length, 2);
+  assert.deepEqual(layouts[1], first);
+
+  // Malformed scope and a mismatched core identity are rejected by the shared checks.
+  assert.ok(queryIssues({ v: 1, kind: 'layout-query', scope: { ...first.scope, lifetimeId: '' },
+    commandId: 'bad' }).length > 0);
+  assert.ok(layoutIssues({ ...first, workers: 'qa:foreign' }).length > 0);
+
+  // An explicit no-op still settles and advances passSeq, but identity stays stable.
+  const beforeNoop = f.calls.length;
+  await f.controller.schedule({ forceRoles: ['todo', 'dag', 'workers'] });
+  assert.equal(layouts.length, 3);
+  assert.equal(layouts[2].passSeq, 2);
+  assert.equal(layouts[2].explicit, true);
+  assert.equal(layouts[2].bindingRevision, first.bindingRevision);
+  assert.equal(layouts[2].geometryRevision, first.geometryRevision);
+  assert.equal(f.calls.filter(call => call[0] === 'split').length, 1);
+  const noopVerbs = f.calls.slice(beforeNoop).map(call => call[0])
+    .filter(verb => ['split', 'swap', 'resize', 'move', 'close', 'run'].includes(verb));
+  assert.deepEqual(noopVerbs, [], 'a settled five-area band is not split, swapped, resized or re-run');
+});
+
+test('without a scoped Collab the band spans Workers+DAG and carries no collab cell', async t => {
+  const { f, layouts } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => null });
+  assert.equal(layouts.length, 1);
+  assert.deepEqual(layouts[0].cells.map(cell => cell.role), ['workers', 'dag']);
+  assert.deepEqual(layouts[0].band, { x: 30, y: 20, width: 58, height: 20 });
+  assert.equal(f.calls.some(call => call[0] === 'split' && call[1] === 'qa:collab'), false);
+});
+
+test('a closed scoped coordination record contributes no collab cell', async t => {
+  const { layouts } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => ({ ...collabRecord, manualClose: true }) });
+  assert.equal(layouts.length, 1);
+  assert.deepEqual(layouts[0].cells.map(cell => cell.role), ['workers', 'dag']);
+  assert.deepEqual(layouts[0].band, { x: 30, y: 20, width: 58, height: 20 });
+});
+
+const v2CollabRecord = (overrides = {}) => ({
+  v: 2, paneId: 'qa:collab', parentPaneId: 'qa:parent', sessionId: 'synthetic-session',
+  tabId: 'qa:tab', workers: 'qa:workers', dag: 'qa:dag', phase: 'running', pendingEffect: null,
+  launch: { token: 'L1', at: '2026-10-20T11:59:58.000Z' },
+  scope: { ownerKey: 'synthetic-owner', sessionId: 'synthetic-session', lifetimeId: 'synthetic-lifetime',
+    scopeEpoch: 1, generation: 1, tabId: 'qa:tab' },
+  binding: { workers: 'qa:workers', dag: 'qa:dag', revision: 'rev1' },
+  revisions: { binding: 'rev1', geometry: null }, ...overrides,
+});
+const v2CollabProof = (record, overrides = {}) => ({
+  v: 1, scope: record.scope, bindingRevision: 'rev1', pane: record.paneId,
+  launch: { token: record.launch.token, at: record.launch.at },
+  viewer: { pid: 2468, startedAt: '2026-10-20T11:59:59.000Z', parentPid: 1357 },
+  firstPaint: { seq: 1, at: new Date().toISOString() },
+  heartbeat: { seq: 1, at: new Date().toISOString() },
+  exit: null, ownerClose: null, error: null, ...overrides,
+});
+
+test('a v2 coordination record without a current viewer proof is not published as a current Collab cell', async t => {
+  const record = v2CollabRecord();
+  for (const [label, proof] of [['missing', null],
+    ['stale', v2CollabProof(record, { heartbeat: { seq: 1, at: '2026-10-20T00:00:00.000Z' } })],
+    ['mismatched launch', v2CollabProof(record, { launch: { token: 'other', at: record.launch.at } })]]) {
+    const { layouts } = await settledDashboard(t, { withCollab: true,
+      readCoordinationRecord: async () => record, readCoordinationProof: async () => proof });
+    assert.deepEqual(layouts[0].cells.map(cell => cell.role), ['workers', 'dag'], label);
+    assert.deepEqual(layouts[0].band, { x: 30, y: 20, width: 58, height: 20 }, label);
+  }
+});
+
+test('a current v2 viewer proof or an explicit proven-current coordination flag publishes the scoped Collab cell', async t => {
+  const record = v2CollabRecord();
+  const { layouts } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => record,
+    readCoordinationProof: async () => v2CollabProof(record) });
+  assert.deepEqual(layouts[0].cells.map(cell => cell.role), ['collab', 'workers', 'dag']);
+  assert.deepEqual(layouts[0].band, { x: 2, y: 20, width: 86, height: 20 });
+
+  const flagged = v2CollabRecord({ provenCurrent: true, phase: 'running', pendingEffect: null });
+  const second = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => flagged });
+  assert.deepEqual(second.layouts[0].cells.map(cell => cell.role), ['collab', 'workers', 'dag']);
+});
+
+// --- 11-d: 4/4 only from four current, effect-free, proven panes -------------
+// A managed READY core is the baseline: todo, workers and dag are owned and
+// current. Each test then makes exactly one pane fail one condition.
+function completionCore(f) {
+  const scopeEpoch = f.controller.scopeEpoch;
+  const owned = (role, paneId, processId) => ({ ...f.controller.binding, role, tabId: 'qa:tab',
+    paneId, scopeEpoch, processId, ready: true, manualClose: false });
+  f.controller.ownedRoles.set('todo', owned('todo', 'qa:todo1', 5001));
+  f.controller.ownedRoles.set('workers', owned('workers', 'qa:workers', 6102));
+  f.controller.ownedRoles.set('dag', owned('dag', 'qa:dag', 6101));
+  f.controller.managed = true;
+  f.controller.actor = { leaseHeld: true, blocked: false, draining: false, snapshot: {
+    sessionId: 'synthetic-session', generation: 1, phase: 'READY', operations: [], roles: {},
+    participants: { todo: { lifetimeId: f.controller.lifetimeId } } } };
+}
+
+// One settled four-pane status. `record` is either a fixed coordination record
+// or a function of the base v2 record; v2 proofs are derived from the record so
+// a scope change stays internally consistent and only the completion gate sees it.
+async function fourPaneStatus(t, { record = null, proof = null, mutate, proofRead, adjust } = {}) {
+  const { f } = await settledDashboard(t, { withCollab: true, readCoordinationRecord: async () => null });
+  const settled = f.controller.recovery.inspect().last;
+  const base = { v: 2, paneId: 'qa:collab', parentPaneId: 'qa:parent', sessionId: 'synthetic-session',
+    tabId: 'qa:tab', workers: settled.workers, dag: settled.dag, phase: 'running', pendingEffect: null,
+    launch: { token: 'L1', at: '2026-10-20T11:59:58.000Z' }, scope: { ...settled.scope },
+    binding: { workers: settled.workers, dag: settled.dag, revision: 'rev1' },
+    revisions: { binding: 'rev1', geometry: null }, rect: { ...collabPane.rect },
+    layout: { commandId: settled.commandId, passSeq: settled.passSeq,
+      bindingRevision: settled.bindingRevision, geometryRevision: settled.geometryRevision } };
+  const collab = typeof record === 'function' ? record(base) : record;
+  const viewerProof = collab?.v === 2 ? proof ?? v2CollabProof(collab) : null;
+  f.controller.readCoordinationRecord = async () => collab;
+  f.controller.readCoordinationProof = async () => viewerProof;
+  completionCore(f);
+  mutate?.(f);
+  try {
+    const layout = await f.controller.settleRecoveryLayout({ pair: null, tabId: 'qa:tab',
+      explicit: true, commandId: '11d' });
+    assert.ok(layout, 'the four-pane layout settles for the status under test');
+    // The coordination pane records the metadata of the layout it accepted, so
+    // the steady-state record proves the final four-pane geometry.
+    if (collab?.v === 2 && collab.layout) {
+      const collabCell = layout.cells.find(cell => cell.role === 'collab');
+      collab.layout = { ...collab.layout, geometryRevision: layout.geometryRevision };
+      if (collabCell) collab.rect = { ...collabCell.rect };
+    }
+    adjust?.(collab, layout);
+    // A completion-only hook lets a test hold a pane snapshot then change live
+    // state inside the awaited proof read. The settle above already read the
+    // untouched steady-state proof.
+    if (proofRead) f.controller.readCoordinationProof = async () => {
+      await proofRead(f); return viewerProof;
+    };
+    const status = await f.controller.recoveryResult({ scope: f.controller.recoveryScope('qa:tab'),
+      commandId: '11d', layout });
+    console.log(JSON.stringify({ event: '11d-status', status }));
+    return { f, settled, layout, status };
+  } finally {
+    f.controller.managed = false;
+    f.controller.actor = null;
+  }
+}
+
+test('11-d (a) a pending close effect keeps 4/4 false and names the pane and effect', async t => {
+  const at = new Date().toISOString();
+  const { status } = await fourPaneStatus(t, { record: base => ({ ...base, phase: 'retiring',
+    pendingEffect: { kind: 'close', at, launchToken: base.launch.token, paneId: base.paneId,
+      reason: 'retirement' } }) });
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.collab.current, false);
+  assert.equal(status.collab.paneId, 'qa:collab');
+  const failure = status.waiting.find(entry => entry.role === 'collab');
+  assert.deepEqual([failure.paneId, failure.condition], ['qa:collab', 'unresolved-effect']);
+  assert.match(failure.detail, /close/);
+  assert.match(failure.detail, /EFFECT_UNKNOWN/);
+  assert.match(status.reason, /qa:collab/);
+  assert.match(status.reason, /EFFECT_UNKNOWN/);
+});
+
+test('11-d (b) a Collab record from another lifetime keeps 4/4 false', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => ({ ...base,
+    scope: { ...base.scope, lifetimeId: 'other-lifetime' } }) });
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.collab.current, false);
+  const failure = status.waiting.find(entry => entry.role === 'collab');
+  assert.equal(failure.condition, 'scope-mismatch');
+  assert.match(failure.detail, /lifetimeId/);
+  assert.match(status.reason, /qa:collab/);
+});
+
+test('11-d (c) a v1 legacy-waiting Collab record without proof keeps 4/4 false', async t => {
+  const { status } = await fourPaneStatus(t, { record: () => ({ paneId: 'qa:collab',
+    parentPaneId: 'qa:parent', sessionId: 'synthetic-session', tabId: 'qa:tab',
+    workers: 'qa:workers', dag: 'qa:dag' }) });
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.collab.current, false);
+  const failure = status.waiting.find(entry => entry.role === 'collab');
+  assert.equal(failure.condition, 'unproven');
+  assert.match(failure.detail, /legacy/);
+  assert.match(status.reason, /qa:collab/);
+});
+
+test('11-d (d) four proven current panes are complete with the unchanged status shape', async t => {
+  const { f, settled, status } = await fourPaneStatus(t, { record: base => base });
+  assert.equal(status.fourPaneComplete, true);
+  assert.equal(status.collab.current, true);
+  assert.deepEqual(status, { v: 1, kind: 'result', scope: f.controller.recoveryScope('qa:tab'),
+    commandId: '11d', status: 'settled', fourPaneComplete: true,
+    core: { ready: true, workers: settled.workers, dag: settled.dag },
+    collab: { current: true, paneId: 'qa:collab' } });
+  assert.deepEqual(Object.keys(status),
+    ['v', 'kind', 'scope', 'commandId', 'status', 'fourPaneComplete', 'core', 'collab'],
+    'a healthy four-pane status keeps the exact pre-11-d key set');
+});
+
+test('11-g (a) a width-only layout change invalidates a proof minted for the previous geometry', async t => {
+  const { f, layout: previous } = await fourPaneStatus(t, { record: base => base });
+  completionCore(f);
+  try {
+    f.panes.set('qa:collab', { ...f.panes.get('qa:collab'),
+      rect: { x: 2, y: 20, width: 24, height: 20 } });
+    f.panes.set('qa:workers', { ...f.panes.get('qa:workers'),
+      rect: { x: 26, y: 20, width: 30, height: 20 } });
+    f.panes.set('qa:dag', { ...f.panes.get('qa:dag'),
+      rect: { x: 56, y: 20, width: 32, height: 20 } });
+    f.controller.layoutPanes = async () => [...f.panes.values()];
+    const layout = await f.controller.settleRecoveryLayout({ pair: null, tabId: 'qa:tab',
+      explicit: true, commandId: '11g-width' });
+    assert.ok(layout, 'the same panes with different widths settle again');
+    assert.equal(layout.bindingRevision, previous.bindingRevision,
+      'a width-only change keeps the scoped pane binding');
+    assert.notEqual(layout.geometryRevision, previous.geometryRevision,
+      'a width-only change is a different settled geometry');
+    const status = await f.controller.recoveryResult({ scope: f.controller.recoveryScope('qa:tab'),
+      commandId: '11g-width', layout });
+    console.log(JSON.stringify({ event: '11g-status', scenario: 'geometry-mismatch', status }));
+    assert.equal(status.fourPaneComplete, false);
+    assert.equal(status.collab.current, false);
+    const failure = status.waiting.find(entry => entry.role === 'collab');
+    assert.equal(failure.condition, 'geometry-mismatch');
+    assert.match(failure.detail, /geometry/);
+  } finally { f.controller.managed = false; f.controller.actor = null; }
+});
+
+test('11-g (b) a READY to WAITING core transition during completion reads is never complete', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: f => { f.controller.actor.snapshot.phase = 'WAITING'; } });
+  console.log(JSON.stringify({ event: '11g-status', scenario: 'core-transition', status }));
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.core.ready, false);
+  const failure = status.waiting.find(entry => entry.role === 'core');
+  assert.equal(failure.condition, 'core-not-ready');
+  assert.match(status.reason, /core/);
+});
+
+test('11-g (b) a pane ownership change during completion reads is never complete', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: f => { f.controller.ownedRoles.get('workers').ready = false; } });
+  console.log(JSON.stringify({ event: '11g-status', scenario: 'pane-transition', status }));
+  assert.equal(status.fourPaneComplete, false);
+  const failure = status.waiting.find(entry => entry.role === 'workers');
+  assert.equal(failure.condition, 'unproven');
+});
+
+test('11-g (c) a healthy four-proof steady state keeps the pre-fix status bytes', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base });
+  const normalized = { ...status, scope: { ...status.scope, lifetimeId: '<lifetime>' } };
+  console.log(JSON.stringify({ event: '11g-status', scenario: 'steady-state', status: normalized }));
+  assert.equal(JSON.stringify(normalized), JSON.stringify({
+    v: 1, kind: 'result',
+    scope: { ownerKey: status.scope.ownerKey, sessionId: 'synthetic-session',
+      lifetimeId: '<lifetime>', scopeEpoch: status.scope.scopeEpoch, generation: 1, tabId: 'qa:tab' },
+    commandId: '11d', status: 'settled', fourPaneComplete: true,
+    core: { ready: true, workers: 'qa:workers', dag: 'qa:dag' },
+    collab: { current: true, paneId: 'qa:collab' },
+  }));
+});
+
+// --- 11-i: a READY phase is not authority; the live lease and custody are ----
+// The completion reads hold their coordination snapshot, then the live actor
+// loses its lease while the phase stays READY. Both the verdict and its final
+// synchronous recheck must refuse 4/4 and name the lost authority.
+test('11-i (a) a lease loss during completion reads is never complete', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: f => { f.controller.actor.leaseHeld = false; } });
+  console.log(JSON.stringify({ event: '11i-status', scenario: 'lease-loss', status }));
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.core.ready, false);
+  const failure = status.waiting.find(entry => entry.role === 'core');
+  assert.equal(failure.condition, 'lease-lost');
+  assert.match(status.reason, /lease-lost/);
+});
+
+test('11-i (b) a custody loss during completion reads is never complete', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: f => { f.controller.custodyLost = true; } });
+  console.log(JSON.stringify({ event: '11i-status', scenario: 'custody-loss', status }));
+  assert.equal(status.fourPaneComplete, false);
+  assert.equal(status.core.ready, false);
+  const failure = status.waiting.find(entry => entry.role === 'core');
+  assert.equal(failure.condition, 'custody-lost');
+  assert.match(status.reason, /custody-lost/);
+});
+
+test('11-i (c) a held lease keeps the healthy four-pane status byte-identical', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base });
+  const normalized = { ...status, scope: { ...status.scope, lifetimeId: '<lifetime>' } };
+  console.log(JSON.stringify({ event: '11i-status', scenario: 'steady-state', status: normalized }));
+  assert.equal(status.fourPaneComplete, true);
+  assert.equal(status.core.ready, true);
+  assert.equal('waiting' in status, false);
+  assert.equal(JSON.stringify(normalized), JSON.stringify({
+    v: 1, kind: 'result',
+    scope: { ownerKey: status.scope.ownerKey, sessionId: 'synthetic-session',
+      lifetimeId: '<lifetime>', scopeEpoch: status.scope.scopeEpoch, generation: 1, tabId: 'qa:tab' },
+    commandId: '11d', status: 'settled', fourPaneComplete: true,
+    core: { ready: true, workers: 'qa:workers', dag: 'qa:dag' },
+    collab: { current: true, paneId: 'qa:collab' },
+  }));
+});
+
+test('11-h (b) a Todo owner change during completion reads is never complete', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: f => { f.controller.ownedRoles.get('todo').paneId = 'qa:todo-replaced'; } });
+  console.log(JSON.stringify({ event: '11h-status', scenario: 'todo-owner-change', status }));
+  assert.equal(status.fourPaneComplete, false);
+  const failure = status.waiting.find(entry => entry.role === 'todo');
+  assert.equal(failure.condition, 'pane-mismatch');
+  assert.match(failure.detail, /qa:todo-replaced/);
+});
+
+test('11-h (b) a Todo record replacement during completion reads is never complete', async t => {
+  let original = null;
+  const { f, status } = await fourPaneStatus(t, { record: base => base,
+    proofRead: async fixture => {
+      original ??= await readFile(fixture.controller.recordFile, 'utf8');
+      const record = JSON.parse(original);
+      await writeFile(fixture.controller.recordFile,
+        JSON.stringify({ ...record, paneId: 'qa:todo-replaced' }));
+    } });
+  try {
+    console.log(JSON.stringify({ event: '11h-status', scenario: 'todo-record-change', status }));
+    assert.equal(status.fourPaneComplete, false);
+    const failure = status.waiting.find(entry => entry.role === 'todo');
+    assert.equal(failure.condition, 'pane-mismatch');
+    assert.match(failure.detail, /does not name the settled pane/);
+  } finally {
+    if (original !== null) await writeFile(f.controller.recordFile, original);
+  }
+});
+
+test('11-h (c) Collab geometry is current only with both a matching revision and rect', async t => {
+  const collabGeometryDigest = (paneId, rect) => createHash('sha256')
+    .update(JSON.stringify([paneId, rect])).digest('hex').slice(0, 16);
+  const cases = [
+    ['both match', () => {}, true],
+    ['explicit digest only', record => { delete record.layout.geometryRevision;
+      record.revisions = { ...record.revisions,
+        geometry: collabGeometryDigest(record.paneId, record.rect) }; }, true],
+    ['explicit digest stale', record => { delete record.layout.geometryRevision;
+      record.revisions = { ...record.revisions, geometry: '0'.repeat(16) }; }, false, /digest/],
+    ['revision mismatch', record => { record.layout = { ...record.layout, geometryRevision: 'f'.repeat(64) }; },
+      false, /revision/],
+    ['rect mismatch', record => { record.rect = { ...record.rect, width: record.rect.width - 1 }; },
+      false, /rect/],
+    ['rect missing', record => { delete record.rect; }, false, /rect/],
+    ['geometry missing', record => { delete record.layout.geometryRevision; }, false, /geometry/],
+  ];
+  for (const [label, adjust, complete, detail] of cases) {
+    const { status } = await fourPaneStatus(t, { record: base => base, adjust });
+    console.log(JSON.stringify({ event: '11h-status', scenario: label, status }));
+    assert.equal(status.fourPaneComplete, complete, label);
+    if (complete) continue;
+    assert.equal(status.collab.current, false, label);
+    const failure = status.waiting.find(entry => entry.role === 'collab');
+    assert.equal(failure.condition, 'geometry-mismatch', label);
+    assert.match(failure.detail, detail, label);
+  }
+});
+
+test('11-d a core pane from another scope keeps 4/4 false', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => base,
+    mutate: f => { f.controller.ownedRoles.get('workers').scopeEpoch = f.controller.scopeEpoch + 1; } });
+  assert.equal(status.fourPaneComplete, false);
+  const failure = status.waiting.find(entry => entry.role === 'workers');
+  assert.equal(failure.condition, 'scope-mismatch');
+  assert.match(status.reason, /qa:workers/);
+});
+
+test('11-d a Collab record bound to another layout revision keeps 4/4 false', async t => {
+  const { status } = await fourPaneStatus(t, { record: base => ({ ...base,
+    layout: { ...base.layout, bindingRevision: 'f'.repeat(64) } }) });
+  assert.equal(status.fourPaneComplete, false);
+  const failure = status.waiting.find(entry => entry.role === 'collab');
+  assert.equal(failure.condition, 'binding-mismatch');
+  assert.match(failure.detail, /revision/);
+  assert.match(status.reason, /qa:collab/);
+});
+
+test('11-d the emitted result carries the unproven pane and condition', async t => {
+  const v1 = { paneId: 'qa:collab', parentPaneId: 'qa:parent', sessionId: 'synthetic-session',
+    tabId: 'qa:tab', workers: 'qa:workers', dag: 'qa:dag' };
+  const { f, results } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => v1 });
+  const result = await f.controller.requestRecovery({ commandId: '11d-bus' });
+  assert.equal(result.fourPaneComplete, false);
+  assert.equal(result.collab.current, false, 'a legacy-waiting pane is never current');
+  assert.equal(result.waiting.find(entry => entry.role === 'collab').condition, 'unproven');
+  assert.deepEqual(results.at(-1), result, 'the truthful status is the emitted protocol result');
+});
+
+test('duplicate command id joins one waiter and one pass; a fresh id is a fresh pass', async t => {
+  const f = await fixture(t, [snapshot]);
+  f.ready.resolve(); f.controller.bind(f.pi);
+  const layouts = [], results = [];
+  f.bus.on(RECOVERY_V1.layout, message => layouts.push(message));
+  f.bus.on(RECOVERY_V1.result, message => results.push(message));
+  f.pi.events.emit(dashboardChannels.provider,
+    { v: 1, kind: 'dag-provider', ...f.controller.binding, provider: f.provider });
+  await f.controller.tail;
+  assert.equal(layouts.length, 1);
+  const gate = deferred(), original = f.provider.openPair;
+  f.provider.openPair = async options => { await gate.promise; return original(options); };
+  const first = f.controller.requestRecovery({ commandId: 'cmd-dup' });
+  const second = f.controller.requestRecovery({ commandId: 'cmd-dup' });
+  assert.equal(first, second, 'the duplicate delivery joins the same waiter');
+  gate.resolve();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.commandId, 'cmd-dup');
+  assert.equal(b.commandId, 'cmd-dup');
+  assert.equal(a.status, 'settled');
+  assert.equal(a.fourPaneComplete, false, 'core ready without a current Collab is not 4/4');
+  assert.equal(f.calls.filter(call => call[0] === 'split').length, 1);
+  assert.equal(layouts.length, 2);
+  assert.equal(layouts[1].passSeq, 2);
+  assert.equal(results.length, 1);
+
+  const fresh = await f.controller.requestRecovery({ commandId: 'cmd-fresh' });
+  assert.equal(fresh.commandId, 'cmd-fresh');
+  assert.equal(fresh.status, 'settled');
+  assert.equal(layouts.length, 3);
+  assert.equal(layouts[2].passSeq, 3);
+  assert.equal(layouts[2].bindingRevision, layouts[0].bindingRevision);
+  assert.equal(f.calls.filter(call => call[0] === 'split').length, 1);
+  assert.equal(results.length, 2);
+  const duplicateAgain = f.controller.requestRecovery({ commandId: 'cmd-dup' });
+  assert.equal(await duplicateAgain, a, 'command dedup is retained while the lifetime is active');
+  assert.equal(layouts.length, 3, 'a retained duplicate starts no new pass');
+});
+
+test('lease loss, stop, scope change, unready or replaced Workers and a moving row publish no false settled layout', async t => {
+  const { f, layouts } = await settledDashboard(t, { withCollab: true,
+    readCoordinationRecord: async () => ({ ...collabRecord, parentPaneId: 'foreign:parent' }),
+    extraPanes: [{ pane_id: 'qa:foreign', tab_id: 'qa:tab', rect: { x: -30, y: 20, width: 28, height: 20 } }] });
+  assert.equal(layouts.length, 1);
+  assert.deepEqual(layouts[0].cells.map(cell => cell.role), ['workers', 'dag'],
+    'a coordination record for another parent cannot contribute a Collab cell');
+  assert.deepEqual(layouts[0].band, { x: 30, y: 20, width: 58, height: 20 });
+  f.pi.events.emit(RECOVERY_V1.layoutQuery, { v: 1, kind: 'layout-query',
+    scope: { ...layouts[0].scope, lifetimeId: 'old-lifetime' }, commandId: 'stale-query' });
+  assert.equal(layouts.length, 1, 'a stale scope cannot replay the current snapshot');
+
+  assert.equal(f.controller.ownedRoles.get('workers')?.ready, true);
+  assert.equal(f.controller.ownedRoles.get('dag')?.ready, true);
+  const todoRecord = JSON.parse(await readFile(f.controller.recordFile, 'utf8'));
+  const todoOwnership = f.controller.ownedRoles.get('todo') ??
+    { ...todoRecord, ready: true, processId: 5001 };
+  f.controller.ownedRoles.set('todo', todoOwnership);
+  // A second owned candidate in the same tab makes an ownership swap observable
+  // even when the final gate only looks for the new pane id in the layout.
+  f.panes.set('qa:workers2', { pane_id: 'qa:workers2', tab_id: 'qa:tab',
+    rect: { x: 30, y: 0, width: 28, height: 20 } });
+  f.controller.layoutPanes = async () => [...f.panes.values()];
+  const readyPair = () => ({
+    workers: { ...f.controller.binding, role: 'workers', tabId: 'qa:tab', paneId: 'qa:workers',
+      ready: true, scopeEpoch: f.controller.scopeEpoch, processId: 6102, manualClose: false },
+    dag: { ...f.controller.binding, role: 'dag', tabId: 'qa:tab', paneId: 'qa:dag',
+      ready: true, scopeEpoch: f.controller.scopeEpoch, processId: 6101, manualClose: false },
+  });
+  const fakeActor = { leaseHeld: true, blocked: false, draining: false, snapshot: {
+    sessionId: 'synthetic-session', generation: 1, phase: 'READY', operations: [], roles: {},
+    participants: { todo: { lifetimeId: f.controller.lifetimeId } } } };
+  const outcomes = [];
+  async function invalidated(label, { pair = readyPair(), managed = false, mutate, restore }) {
+    const beforeLayouts = layouts.length, beforeSeq = f.controller.recovery.inspect().passSeq;
+    const entered = deferred(), release = deferred();
+    f.controller.readCoordinationRecord = async () => { entered.resolve(); await release.promise; return null; };
+    if (managed) { f.controller.managed = true; f.controller.actor = fakeActor; }
+    else { f.controller.managed = false; f.controller.actor = null; }
+    const pending = f.controller.settleRecoveryLayout({ pair, tabId: 'qa:tab', explicit: true,
+      commandId: `inv-${label}` });
+    await entered.promise;
+    mutate();
+    release.resolve();
+    const result = await pending;
+    restore?.();
+    f.controller.managed = false; f.controller.actor = null;
+    f.controller.readCoordinationRecord = async () => null;
+    outcomes.push({ label, published: layouts.length - beforeLayouts,
+      passSeqAdvanced: f.controller.recovery.inspect().passSeq > beforeSeq, abandoned: result === null });
+  }
+
+  // Each invalidation happens after the entry checks and while a record read is
+  // in flight. The final gate must abandon the pass and publish nothing.
+  await invalidated('lease-loss', { managed: true, mutate: () => { fakeActor.leaseHeld = false; },
+    restore: () => { fakeActor.leaseHeld = true; } });
+  await invalidated('stop', { mutate: () => { f.controller.stopped = true; },
+    restore: () => { f.controller.stopped = false; } });
+  await invalidated('scope-change', { mutate: () => { f.controller.scopeEpoch += 1; },
+    restore: () => { f.controller.scopeEpoch -= 1; } });
+  await invalidated('workers-unready', {
+    mutate: () => { f.controller.ownedRoles.get('workers').ready = false; },
+    restore: () => { f.controller.ownedRoles.get('workers').ready = true; } });
+  await invalidated('arrangement-moving', { mutate: () => { f.controller.arrangement = { moving: true }; },
+    restore: () => { f.controller.arrangement = null; } });
+
+  // Same role, new pane id, same session/scope. The layout about to be settled
+  // still names the old id; that old binding must not be published.
+  const stableWorkers = f.controller.ownedRoles.get('workers');
+  await invalidated('ownership-replaced', { managed: true,
+    mutate: () => { f.controller.ownedRoles.set('workers',
+      { ...stableWorkers, paneId: 'qa:workers2', processId: 6103 }); },
+    restore: () => { f.controller.ownedRoles.set('workers', stableWorkers); } });
+  await invalidated('todo-replaced', {
+    mutate: () => { f.controller.ownedRoles.set('todo', { ...todoOwnership, paneId: 'qa:todo2' }); },
+    restore: () => { f.controller.ownedRoles.set('todo', todoOwnership); } });
+  const removable = readyPair(), removableWorkers = removable.workers;
+  await invalidated('pair-workers-removed', { pair: removable,
+    mutate: () => { delete removable.workers; },
+    restore: () => { removable.workers = removableWorkers; } });
+
+  // The command waiter follows the same gate: a deferred reply after a scope
+  // change resolves as waiting, never as settled.
+  {
+    const beforeLayouts = layouts.length, beforeSeq = f.controller.recovery.inspect().passSeq;
+    const entered = deferred(), release = deferred();
+    f.controller.readCoordinationRecord = async () => { entered.resolve(); await release.promise; return null; };
+    const pending = f.controller.requestRecovery({ commandId: 'cmd-invalidated' });
+    await entered.promise;
+    f.controller.scopeEpoch += 1;
+    release.resolve();
+    const result = await pending;
+    f.controller.scopeEpoch -= 1;
+    f.controller.readCoordinationRecord = async () => null;
+    outcomes.push({ label: 'waiter-scope-change', published: layouts.length - beforeLayouts,
+      passSeqAdvanced: f.controller.recovery.inspect().passSeq > beforeSeq,
+      abandoned: result?.status === 'waiting' && result?.fourPaneComplete === false });
+  }
+
+  // Positive control: the same deferred read with unchanged ownership publishes
+  // exactly once and advances passSeq.
+  {
+    const beforeLayouts = layouts.length, beforeSeq = f.controller.recovery.inspect().passSeq;
+    const entered = deferred(), release = deferred();
+    f.controller.readCoordinationRecord = async () => { entered.resolve(); await release.promise; return null; };
+    const pending = f.controller.settleRecoveryLayout({ pair: readyPair(), tabId: 'qa:tab', explicit: true,
+      commandId: 'ownership-unchanged' });
+    await entered.promise;
+    release.resolve();
+    const result = await pending;
+    f.controller.readCoordinationRecord = async () => null;
+    outcomes.push({ label: 'ownership-unchanged', published: layouts.length - beforeLayouts,
+      passSeqAdvanced: f.controller.recovery.inspect().passSeq > beforeSeq, abandoned: result === null });
+  }
+
+  // The command waiter must not settle an old binding after the pair's Workers
+  // record is replaced with a new pane id mid-read.
+  {
+    const beforeLayouts = layouts.length, beforeSeq = f.controller.recovery.inspect().passSeq;
+    const entered = deferred(), release = deferred();
+    f.controller.readCoordinationRecord = async () => { entered.resolve(); await release.promise; return null; };
+    let currentPair;
+    const original = f.provider.openPair;
+    f.provider.openPair = async options => { currentPair = await original(options); return currentPair; };
+    const pending = f.controller.requestRecovery({ commandId: 'cmd-workers-replaced' });
+    await entered.promise;
+    currentPair.workers = { ...currentPair.workers, paneId: 'qa:workers2', processId: 6103 };
+    release.resolve();
+    const result = await pending;
+    f.provider.openPair = original;
+    f.controller.readCoordinationRecord = async () => null;
+    outcomes.push({ label: 'waiter-workers-replaced', published: layouts.length - beforeLayouts,
+      passSeqAdvanced: f.controller.recovery.inspect().passSeq > beforeSeq,
+      abandoned: result?.status === 'waiting' && result?.fourPaneComplete === false });
+  }
+
+  assert.deepEqual(outcomes.map(outcome => [outcome.label, outcome.published,
+    outcome.passSeqAdvanced, outcome.abandoned]), [
+    ['lease-loss', 0, false, true], ['stop', 0, false, true], ['scope-change', 0, false, true],
+    ['workers-unready', 0, false, true], ['arrangement-moving', 0, false, true],
+    ['ownership-replaced', 0, false, true], ['todo-replaced', 0, false, true],
+    ['pair-workers-removed', 0, false, true], ['waiter-scope-change', 0, false, true],
+    ['ownership-unchanged', 1, true, false], ['waiter-workers-replaced', 0, false, true],
+  ]);
+  assert.equal(layouts.length, 2);
+
+  await f.controller.stop();
+  f.pi.events.emit(RECOVERY_V1.layoutQuery, { v: 1, kind: 'layout-query',
+    scope: layouts[0].scope, commandId: 'after-stop' });
+  assert.equal(layouts.length, 2, 'a stopped publisher replays nothing');
+});
+
+test('fresh command ids during one pass coalesce into exactly one rerun', async () => {
+  const scope = { ownerKey: 'owner', sessionId: 'session', lifetimeId: 'life', scopeEpoch: 1,
+    generation: 1, tabId: 'tab' };
+  let calls = 0;
+  const started = [], secondStart = deferred();
+  const coordinator = createRecoveryCoordinator();
+  const reconcile = async () => {
+    calls += 1;
+    if (calls === 2) secondStart.resolve();
+    await new Promise(resolve => started.push(resolve));
+    return { status: 'waiting', layout: null };
+  };
+  const a = coordinator.request({ commandId: 'a', scope, reconcile });
+  const b = coordinator.request({ commandId: 'b', scope, reconcile });
+  const c = coordinator.request({ commandId: 'c', scope, reconcile });
+  assert.equal(calls, 1, 'the first command is the only operation in flight');
+  started.shift()();
+  await a;
+  await secondStart.promise;
+  assert.equal(calls, 2, 'two fresh ids coalesce into one rerun');
+  started.shift()();
+  await Promise.all([b, c]);
+  assert.equal(calls, 2);
+  await assert.rejects(coordinator.request({ commandId: 'a',
+    scope: { ...scope, lifetimeId: 'other' }, reconcile }), /different scope/);
 });

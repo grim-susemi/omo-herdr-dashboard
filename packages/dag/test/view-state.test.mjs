@@ -84,7 +84,7 @@ test('scoped manual navigation restores only the same owner, session and epoch',
   const scope = { ownerKey: 'owner', scopeEpoch: 3 };
   const view = await loadViewState(file, 'session', scope);
   view.navigation = { follow: false, scroll: 12, view: 'tasks', selectedTaskId: 'worker',
-    selectedNodes: [['run', 'node']], completedExpanded: false };
+    selectedNodes: [['run', 'node']], completedExpanded: false, scrollTaskId: 'worker', scrollOffset: 1 };
   setExpanded(view, TASK_SCOPE, 'worker', false);
   await saveViewState(file, view);
   assert.deepEqual(await loadViewState(file, 'session', scope), view);
@@ -95,7 +95,8 @@ test('scoped manual navigation restores only the same owner, session and epoch',
     assert.deepEqual(restored.expanded, {});
   }
   for (const navigation of [{ follow: 'false' }, { follow: false, scroll: -1 },
-    { follow: true, selectedNodes: [['run']] }, { follow: true, selectedTaskId: 1 }]) {
+    { follow: true, selectedNodes: [['run']] }, { follow: true, selectedTaskId: 1 },
+    { follow: false, scrollTaskId: 1 }, { follow: false, scrollTaskId: 'worker', scrollOffset: 1.5 }]) {
     await writeFile(`${file}.view.json`, JSON.stringify({ ...view, navigation }));
     await assert.rejects(loadViewState(file, 'session', scope), /navigation preferences/);
   }

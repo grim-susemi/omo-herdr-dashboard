@@ -15,6 +15,10 @@ import { t } from './i18n.mjs';
 const pathKey = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string' && pathKey(a) === pathKey(b);
 export const VIEWER_FAILURE_GRACE_MS = 2000;
+// One registration attempt at a time per current offer/epoch; capped after the last step.
+export const REGISTRATION_RETRY_DELAYS = Object.freeze([100, 200, 400, 800, 1600, 2000]);
+const registrationRetryDelay = attempt =>
+  REGISTRATION_RETRY_DELAYS[Math.min(Math.max(0, attempt - 1), REGISTRATION_RETRY_DELAYS.length - 1)];
 export function parseViewerArgs(args) {
   const result = { once: false };
   const fields = { '--state': 'statePath', '--close-pane': 'paneId', '--launch-token': 'launchToken' };
@@ -71,7 +75,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   interactive = Boolean(input.isTTY && output.isTTY) && !options.once,
   clock = { now: Date.now, setTimeout, clearTimeout, setInterval, clearInterval },
   watchState = watch, readState = readRoleState, readCache = readViewerCache,
-  pid = process.pid } = {}) {
+  register = registerRoleViewer, pid = process.pid } = {}) {
   // Direct API callers use the same CLI validation.
   if (!isAbsolute(options.statePath ?? '') || !options.paneId || !options.launchToken) {
     throw new TypeError('Absolute role state, pane ID and launch token are required');
@@ -84,6 +88,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   // Every phase is listed by default; c folds closed phases away.
   let prefs = { scroll: 0, askScroll: 0, follow: true, completedExpanded: true }, scroll = 0, target = null;
   let refreshing = null, dirty = false, closing = false, closeJob;
+  let registration = null;
   let painting = Promise.resolve(), saving = Promise.resolve(), lastFrame;
   let resolveClosed;
   const closed = new Promise(done => { resolveClosed = done; });
@@ -115,6 +120,64 @@ export async function startViewer(options, { input = process.stdin, output = pro
     const pending = failures.get(channel);
     if (pending) clock.clearTimeout(pending.timer);
     failures.delete(channel);
+  }
+  function cancelRegistration() {
+    const entry = registration;
+    registration = null;
+    if (entry?.timer !== undefined) clock.clearTimeout(entry.timer);
+  }
+  // A registration reply belongs to the offer/epoch it was sent for. A reply that is no longer
+  // current can neither connect, draw an error nor schedule another attempt.
+  function settleRegistration(entry, epoch, attempt, accepted, cause) {
+    if (registration === entry) entry.inFlight = false;
+    if (closing || epoch !== generation || registration !== entry) {
+      events.emit('registration-stale', { epoch, attempt, accepted,
+        code: cause ? errorCode(cause) : accepted ? 'NONE' : 'DENIED' });
+      return;
+    }
+    events.emit('registered', { accepted, scope: state, pid, attempt });
+    if (accepted) {
+      if (entry.timer !== undefined) clock.clearTimeout(entry.timer);
+      registration = null;
+      recovered('registration');
+      connect(state, epoch);
+      return;
+    }
+    failed('registration', cause ? 'registration-error' : 'registration-denied', cause, () => {
+      availability = snapshot ? 'last-known' : 'error';
+      error = cause ? cause.message : t(state?.language, 'registrationError');
+    });
+    if (cause) events.emit('control-error', cause);
+    void draw();
+    const delayMs = registrationRetryDelay(attempt);
+    entry.timer = clock.setTimeout(() => {
+      if (closing || epoch !== generation || registration !== entry) return;
+      entry.timer = undefined;
+      startRegistration(epoch);
+    }, delayMs);
+    entry.timer?.unref?.();
+  }
+  function startRegistration(epoch) {
+    if (closing || epoch !== generation || !state?.controlOffer) return;
+    if (!registration || registration.epoch !== epoch) {
+      if (registration?.timer !== undefined) clock.clearTimeout(registration.timer);
+      registration = { epoch, attempts: 0, inFlight: false, timer: undefined };
+    }
+    const entry = registration;
+    if (entry.inFlight || entry.timer !== undefined) return;
+    entry.inFlight = true;
+    const attempt = ++entry.attempts;
+    events.emit('registration-attempt', { epoch, attempt, scope: state });
+    let response;
+    try {
+      response = register({ state, paneId: options.paneId, launchToken: options.launchToken, pid });
+    } catch (cause) {
+      settleRegistration(entry, epoch, attempt, false, cause);
+      return;
+    }
+    Promise.resolve(response).then(
+      accepted => settleRegistration(entry, epoch, attempt, accepted === true, null),
+      cause => settleRegistration(entry, epoch, attempt, false, cause));
   }
   function failed(channel, branch, cause, fallback) {
     diagnose(branch, cause);
@@ -242,6 +305,9 @@ export async function startViewer(options, { input = process.stdin, output = pro
   }
   function retire(preserve = false) {
     generation++;
+    cancelRegistration();
+     // Any grace timer from the previous epoch would otherwise expire into the new one.
+    recovered('registration');
     const old = client;
     client = null; message = null;
     if (!preserve) {
@@ -333,26 +399,8 @@ export async function startViewer(options, { input = process.stdin, output = pro
       else installCache();
     }
     if (interactive && reconnect) {
-      if (next.controlOffer) {
-        void registerRoleViewer({ state: next, paneId: options.paneId, launchToken: options.launchToken, pid })
-          .then(accepted => {
-            if (closing || epoch !== generation) return;
-            events.emit('registered', { accepted, scope: next, pid });
-            if (accepted) connect(next, epoch);
-            else {
-              failed('registration', 'registration-denied', null, () => {
-                availability = snapshot ? 'last-known' : 'error'; error = t(next.language, 'registrationError');
-              });
-              void draw();
-            }
-          }, cause => {
-            if (closing || epoch !== generation) return;
-            failed('registration', 'registration-error', cause, () => {
-              availability = snapshot ? 'last-known' : 'error'; error = cause.message;
-            });
-            events.emit('control-error', cause); void draw();
-          });
-      } else connect(next, epoch);
+      if (next.controlOffer) startRegistration(epoch);
+      else { cancelRegistration(); connect(next, epoch); }
     }
   }
   function refresh() {
@@ -416,6 +464,7 @@ export async function startViewer(options, { input = process.stdin, output = pro
   async function close(manual = false) {
     if (closeJob) return closeJob;
     closing = true;
+    cancelRegistration();
     closeJob = (async () => {
       let accepted = false;
       await custodyJobs;

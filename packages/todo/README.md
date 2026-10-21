@@ -1,14 +1,16 @@
 # omo-herdr-todo
 
-Native Todo, workflow DAG and ordinary workers remain visible together in three fixed Herdr panes. Todo reads the selected stock Senpi branch; the dashboard never creates a second checklist store.
+Native Todo, workflow DAG, ordinary workers and the collaboration pane remain visible together in four fixed Herdr views. Todo reads the selected stock Senpi branch; the dashboard never creates a second checklist store.
 
 ## Everyday controls
 
-The unified `omo-herdr-dashboard` extension loads both runtime components in an eligible parent session. Todo sits above ordinary workers in the left dashboard column; DAG uses the full right dashboard column. The conversation keeps 40% of the terminal width. Child sessions cannot own the layout.
+The unified `omo-herdr-dashboard` extension loads both runtime components and the collaboration entry in an eligible parent session. Todo sits above the lower row; the collaboration pane is on the left, ordinary workers in the middle and DAG on the right. The conversation keeps 40% of the terminal width. Child sessions cannot own the layout.
+
+Todo phase divider titles keep their original uppercase Roman ordinal and the existing closed/total counter, for example `I. Plan 1/2`, even when an earlier phase is hidden, folded or scrolled past. The prefix is presentation only and never renumbers stored phases.
 
 Each role starts with automatic follow. Press `f` in one pane to toggle its follow. Scrolling/selecting manually pauses only that pane; `f` resumes it. `c` controls completed work for that role. Completed ordinary workers and closed Todo phases fold automatically; active/error descendants and manual expansions remain accessible. DAG topology stays canonical. Fixed DAG/workers panes ignore `t`.
 
-Press `q` to close one role. Source updates respect that closure. `/dashboard`, issued from the conversation pane, is the single command to open or explicitly reopen all three roles. Restoring the two-column layout can recreate owned role panes; native data and independent view preferences remain intact. Losing current ready coverage restores the actual native inline widget factory. Use the [root README](../../README.md) for the unified installer and [current verification](../../VERIFICATION.md) for current QA.
+Press `q` to close one role. Source updates respect that closure; a verified fault may repair in place, but a recorded owner or unknown-absence close stays closed until a fresh explicit command. `/dashboard`, issued from the conversation pane, is the single command to open or explicitly reopen all four roles and returns a bounded composite result: core and Collab status are separate, and four-pane completion requires both in the same binding. A timeout is waiting, not success. Restoring the layout can recreate owned role panes; native data and independent view preferences remain intact. Losing current ready coverage restores the actual native inline widget factory. Use the [root README](../../README.md) for the unified installer and [current verification](../../VERIFICATION.md) for current QA.
 
 Read errors, valid empty state and disconnected last-known state have distinct labels. A disconnected cache is not live progress. Cost is producer-reported or unknown; zero is shown only when reported. Speed uses generation time, not wall time. These figures are not an invoice.
 
@@ -43,6 +45,7 @@ The SDK is imported read-only and is not redistributed. Reuse origins are record
 
 ## 한국어 요약
 
-- DAG·작업자·Todo를 동시에 봅니다. 각 화면의 `f` 추적과 수동 탐색은 독립적입니다.
-- `c`로 완료 항목을 펼치고 `q`로 해당 화면만 닫습니다. `/dashboard` 하나로 세 화면을 다시 엽니다.
+- DAG·작업자·Todo·협업 네 화면을 함께 봅니다. 각 화면의 `f` 추적과 수동 탐색은 독립적입니다.
+- `c`로 완료 항목을 펼치고 `q`로 해당 화면만 닫습니다. `/dashboard` 하나로 네 화면을 다시 열며, 결과는 제한 시간 안의 부분/대기 상태까지 정확히 보고합니다.
+- Todo 단계 제목은 원래 순서의 로마숫자와 기존 완료 수량을 유지합니다.
 - 설치 파일 복사와 세션 활성화는 다릅니다. 보고된 비용과 연결이 끊긴 화면을 실제 청구·최신 진행으로 혼동하지 마세요.

@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import net from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -13,6 +14,7 @@ import { shellCommand } from './herdr.mjs';
 import { normalizeRun, sessionRuns } from './model.mjs';
 import { t, languageOf } from './i18n.mjs';
 import { TaskData } from './task-data.mjs';
+import { RECOVERY_V1, sameScope, validScope, yieldIssues } from '../../coordination/src/recovery.mjs';
 
 export function viewKey(socket, pane, session) {
   return createHash('sha256').update(JSON.stringify([socket, pane, session])).digest('hex').slice(0, 24);
@@ -754,6 +756,128 @@ export async function legacyPaneIdentity(info, record, inspect) {
   actual.viewer = nativeIdentity(child);
   return actual;
 }
+// Read-only legacy Collab proof (todo 6). A v1 coordination record stores no
+// launch token, node path or shell identity, so a record id alone can never
+// prove or close the pane. The exact Herdr shell PID is queried through the
+// exported cached process machinery; the one Node child must carry the full v1
+// viewer command for this parent, session, record and managed locale, and its
+// native Birth identities must bracket record.createdAt. Any missing or foreign
+// evidence is legacy-waiting, never a fallback to the record's pane id.
+export function legacyCollabCommand(record, paths, language) {
+  if (!record || typeof record.viewer !== 'string' || !record.viewer ||
+    typeof record.sessionId !== 'string' || !record.sessionId ||
+    typeof record.paneId !== 'string' || !record.paneId ||
+    !paths?.record || !paths?.status || !paths?.activity || !language) return null;
+  return [record.viewer, '--status', paths.status, '--activity', paths.activity,
+    '--session', record.sessionId, '--record', paths.record, '--lang', language,
+    '--close-pane', record.paneId];
+}
+export async function observeLegacyCollab(info, record, options = {}, inspect = nativeShellProcesses) {
+  if (!record || record.v !== 1 || record.manualClose === true) return null;
+  if (typeof record.paneId !== 'string' || !record.paneId) return null;
+  if (options.parentPane === undefined || record.parentPaneId !== options.parentPane) return null;
+  if (typeof options.sessionId !== 'string' || record.sessionId !== options.sessionId) return null;
+  if (typeof options.tabId !== 'string' || record.tabId !== options.tabId) return null;
+  const reportedPane = info?.process_info?.pane_id;
+  if (reportedPane !== undefined && reportedPane !== record.paneId) return null;
+  const shellPid = info?.process_info?.shell_pid;
+  if (!Number.isSafeInteger(shellPid) || shellPid < 1) return null;
+  // Off Windows only an injected equivalent Herdr argv inspector is evidence;
+  // the default PowerShell/WMI query is never started as a substitute.
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'win32' && inspect === nativeShellProcesses) return null;
+  const stateDir = options.stateDir ?? process.env.OMO_HERDR_COORDINATION_STATE_DIR;
+  if (!stateDir) return null;
+  const key = String(options.parentPane).replace(/[^A-Za-z0-9_-]/g, '_');
+  const paths = { record: options.recordPath ?? join(stateDir, `${key}.pane.json`),
+    status: options.statusPath ?? join(stateDir, `${key}.status.json`), activity: options.activityPath ?? null };
+  if (!paths.activity) return null;
+  const language = ['en', 'ko', 'zh-cn'].includes(options.language) ? options.language : null;
+  if (!language) return null;
+  const expected = legacyCollabCommand(record, paths, language);
+  if (!expected) return null;
+  // The memo is keyed by one core lifetime, pane id and native shell pid, and it
+  // never bypasses the process observer. Every call re-reads the exact native
+  // tuple — shell pid/birth/creation, the single Node child pid/birth/creation
+  // and the argv after argv[0] — before a cached proof may be reused. A changed
+  // tuple, a missing process, or a changed record/path/locale deletes the entry
+  // and forces a fresh validation; the production inspector is the cached
+  // process query, so an unchanged identity does not start another native scan.
+  const cacheKey = `${options.lifetimeId ?? ''}\u0000${record.paneId}\u0000${shellPid}`;
+  const invalidate = () => { if (options.cache instanceof Map) options.cache.delete(cacheKey); };
+  const sameNative = (left, right) => Boolean(left && right) &&
+    left.shellPid === right.shellPid && left.shellBirth === right.shellBirth &&
+    left.shellCreationDate === right.shellCreationDate && left.viewerPid === right.viewerPid &&
+    left.viewerBirth === right.viewerBirth && left.viewerCreationDate === right.viewerCreationDate &&
+    left.argvDigest === right.argvDigest && Array.isArray(left.argv) && Array.isArray(right.argv) &&
+    left.argv.length === right.argv.length && left.argv.every((value, index) => value === right.argv[index]);
+  let rows;
+  try { rows = await inspect(shellPid); } catch { invalidate(); return null; }
+  if (!Array.isArray(rows) || !rows.length || new Set(rows.map(row => row.ProcessId)).size !== rows.length) {
+    invalidate(); return null;
+  }
+  const shells = rows.filter(row => row.ProcessId === shellPid);
+  if (shells.length !== 1) { invalidate(); return null; }
+  const shell = shells[0], born = Date.parse(shell.CreationDate);
+  if (!Number.isFinite(born) || !shell.ExecutablePath || !shell.CommandLine ||
+    !/^[1-9]\d*$/.test(String(shell.Birth ?? ''))) { invalidate(); return null; }
+  const children = rows.filter(row => row !== shell && row.ParentProcessId === shellPid);
+  // Exactly one child, and no unrelated row in the queried shell's process set.
+  if (children.length !== 1 || children.length !== rows.length - 1) { invalidate(); return null; }
+  const child = children[0], childBorn = Date.parse(child.CreationDate);
+  if (!Number.isSafeInteger(child.ProcessId) || child.ProcessId < 1 || child.ProcessId === shellPid ||
+    !Number.isFinite(childBorn) || childBorn < born || !/^[1-9]\d*$/.test(String(child.Birth ?? '')) ||
+    BigInt(child.Birth) < BigInt(shell.Birth) ||
+    !['node', 'node.exe', 'nodejs', 'nodejs.exe'].includes(basename(child.ExecutablePath ?? '').toLowerCase())) {
+    invalidate(); return null;
+  }
+  const createdAt = Date.parse(record.createdAt);
+  if (!Number.isFinite(createdAt) || born > createdAt || createdAt > childBorn) { invalidate(); return null; }
+  const foreground = info?.process_info?.foreground_processes;
+  if (foreground !== undefined && (!Array.isArray(foreground) || foreground.length !== 1 ||
+    ![shellPid, child.ProcessId].includes(foreground[0]?.pid))) { invalidate(); return null; }
+  const argv = parseLaunchCommand(child.CommandLine);
+  if (!argv || argv.length !== expected.length + 1 || pathKey(argv[0]) !== pathKey(child.ExecutablePath)) {
+    invalidate(); return null;
+  }
+  // argv[0] is the native Node child. Everything after it must match the v1
+  // viewer command exactly: viewer, status, activity, session, record, lang, close-pane.
+  for (let index = 0; index < expected.length; index += 1) {
+    const actual = argv[index + 1], wanted = expected[index];
+    const same = [0, 2, 4, 8].includes(index)
+      ? typeof actual === 'string' && pathKey(actual) === pathKey(wanted)
+      : actual === wanted;
+    if (!same) { invalidate(); return null; }
+  }
+  const native = { shellPid, shellBirth: String(shell.Birth), shellCreationDate: shell.CreationDate,
+    viewerPid: child.ProcessId, viewerBirth: String(child.Birth), viewerCreationDate: child.CreationDate,
+    argv: argv.slice(1), argvDigest: createHash('sha256').update(child.CommandLine).digest('hex') };
+  const cached = options.cache instanceof Map ? options.cache.get(cacheKey) : null;
+  if (!options.fresh && cached && sameNative(cached.native, native) &&
+    cached.lifetimeId === (options.lifetimeId ?? null) && cached.paneId === record.paneId &&
+    cached.recordAt === record.createdAt && cached.viewer === record.viewer &&
+    cached.parentPane === options.parentPane && cached.sessionId === options.sessionId &&
+    cached.tabId === options.tabId && cached.language === language &&
+    cached.paths.record === paths.record && cached.paths.status === paths.status &&
+    cached.paths.activity === paths.activity) return structuredClone(cached.proof);
+  const proof = { v: 1, paneId: record.paneId, parentPaneId: options.parentPane,
+    sessionId: options.sessionId, tabId: options.tabId, createdAt: record.createdAt,
+    shellPid, shellBirth: native.shellBirth, shellCreationDate: native.shellCreationDate,
+    viewerPid: native.viewerPid, viewerBirth: native.viewerBirth, viewerCreationDate: native.viewerCreationDate,
+    viewerPath: record.viewer, language, expected, argv: native.argv, argvDigest: native.argvDigest };
+  if (options.cache instanceof Map) {
+    // One generation per lifetime/pane/shell key; a changed shell pid is a new
+    // native identity and the older generations for this pane are dropped.
+    for (const [other, entry] of options.cache) {
+      if (other !== cacheKey && entry?.lifetimeId === (options.lifetimeId ?? null) && entry?.paneId === record.paneId)
+        options.cache.delete(other);
+    }
+    options.cache.set(cacheKey, { lifetimeId: options.lifetimeId ?? null, paneId: record.paneId,
+      recordAt: record.createdAt, viewer: record.viewer, parentPane: options.parentPane,
+      sessionId: options.sessionId, tabId: options.tabId, language, paths: { ...paths }, native, proof });
+  }
+  return structuredClone(proof);
+}
 export async function paneViewerProcess(info, record, expectedPid, inspect) {
   const foreground = processMatch(info, record, expectedPid);
   if (foreground) return foreground;
@@ -817,11 +941,46 @@ export class FixedDagPane extends DagPane {
     this.pendingLaunches = new Set();
     this.launchRegistrations = new Map();
     this.closureVersions = new Map();
+    this.events = options.events;
+    this.timers = options.timers ?? { setTimeout, clearTimeout };
+    this.yieldTimeoutMs = Number.isSafeInteger(options.yieldTimeoutMs) && options.yieldTimeoutMs > 0
+      ? options.yieldTimeoutMs : 5000;
+    this.coordinationStateDir = options.coordinationStateDir ?? process.env.OMO_HERDR_COORDINATION_STATE_DIR ?? null;
+    const agentDir = options.agentDir ?? process.env.SENPI_CODING_AGENT_DIR ?? process.env.OMO_CODING_AGENT_DIR ??
+      join(homedir(), '.omo', 'agent');
+    this.coordinationActivityPath = options.coordinationActivityPath ?? join(agentDir, 'coordination-activity.jsonl');
+    // The managed legacy component's installed locale, exactly as the coordination
+    // extension chooses it; an env override wins, then the installed file, then en.
+    const installedCoordinationLanguage = (() => {
+      try { return JSON.parse(readFileSync(new URL('../../coordination/locale.json', import.meta.url), 'utf8')).language; }
+      catch { return 'en'; }
+    })();
+    const coordinationLanguage = options.coordinationLanguage ??
+      process.env.OMO_HERDR_COORDINATION_LANG ?? installedCoordinationLanguage;
+    this.coordinationLanguage = ['en', 'ko', 'zh-cn'].includes(coordinationLanguage) ? coordinationLanguage : 'en';
+    this.readCoordinationRecord = options.readCoordinationRecord;
+    this.inspectLegacyCollab = options.inspectLegacyCollab;
+    this.legacyCollabCache = new Map();
     this.sourceReady = new Promise((resolve, reject) => { this.sourceSaved = resolve; this.sourceRejected = reject; });
     this.sourceReady.catch(() => {});
   }
   roleFile(role) { return join(this.directory, `${role}.json`); }
   paneFile(role) { return join(this.directory, `${role}.pane.json`); }
+  coordinationRecordPath() {
+    if (!this.coordinationStateDir) return null;
+    return join(this.coordinationStateDir, `${String(this.parentPane).replace(/[^A-Za-z0-9_-]/g, '_')}.pane.json`);
+  }
+  async coordinationRecord(tabId) {
+    let record;
+    try {
+      if (typeof this.readCoordinationRecord === 'function') record = await this.readCoordinationRecord();
+      else { const path = this.coordinationRecordPath(); record = path ? await readJson(path) : null; }
+    } catch { record = null; }
+    if (!record?.paneId || record.manualClose === true) return null;
+    if (record.parentPaneId !== this.parentPane || record.sessionId !== this.sessionId) return null;
+    if (record.tabId && record.tabId !== tabId) return null;
+    return record;
+  }
   roleWrite(job) {
     const result = this.roleTail.then(job);
     this.roleTail = result.catch(() => {});
@@ -988,6 +1147,7 @@ export class FixedDagPane extends DagPane {
   // A pane mutation changes which processes run where: cached identity rows are dropped before and after.
   async mutate(role, type, paneId, args, effect, check) {
     bumpProcessQueryEpoch();
+    this.legacyCollabCache?.clear();
     try {
     if (!this.managedAvailable) return await this.herdr(...args);
     if (!this.coordinator?.actor) { this.status = 'BLOCKED'; throw blocked('managed W coordinator unavailable; restart this OmO window'); }
@@ -1615,8 +1775,7 @@ export class FixedDagPane extends DagPane {
       const geometry = async () => (await this.herdr('layout', '--pane', this.parentPane))?.layout;
       let layout = await geometry();
       // Decision #185: the collaboration pane recorded for this chat is owned while it is in this tab.
-      const collab = process.env.OMO_HERDR_COORDINATION_STATE_DIR && await readJson(join(process.env.OMO_HERDR_COORDINATION_STATE_DIR,
-        `${String(this.parentPane).replace(/[^A-Za-z0-9_-]/g, '_')}.pane.json`)).catch(() => null);
+      const collab = typeof this.coordinationRecord === 'function' ? await this.coordinationRecord(tabId) : null;
       if (collab?.paneId && layout?.panes?.some(pane => pane?.pane_id === collab.paneId)) ids.coordination = collab.paneId;
       // A matching shape is left as it is (G9): the band under a band claim, judged
       // within the owned panes' own rectangle so a pane the owner opened elsewhere
@@ -1628,7 +1787,18 @@ export class FixedDagPane extends DagPane {
       const [right, bottom] = [2, 3].map(index => Math.max(...edges.map(edge => edge[index])));
       const ownedArea = { x: left, y: top, width: right - left, height: bottom - top };
       const ownedBand = owned.length === Object.keys(ids).length && isBandDashboard({ area: ownedArea, panes: owned }, ids);
-      if (claimed === 'band' ? ownedBand : !this.managedAvailable && isColumnDashboard(layout, ids)) return;
+      // Consult the unresolved journal before the shape no-op: a visible five-area
+      // band may still be the target of an explicitly stuck four-area migration.
+      // Reading it mutates nothing; the placement journal is written only after
+      // the scoped yield and the matching native disappearance.
+      const placementPath = () => join(this.directory, 'placement.json');
+      let stuck;
+      if (this.managedAvailable) {
+        stuck = await readJson(placementPath()).catch(() => ({ phase: 'UNREADABLE' }));
+        if (stuck?.phase === 'COMPLETE') stuck = undefined;
+      }
+      // A resolved/absent journal keeps today's no-op path.
+      if (!stuck && (claimed === 'band' ? ownedBand : !this.managedAvailable && isColumnDashboard(layout, ids))) return;
       // The single mutation gate, asked before the placement journal or any move:
       // an automatic pass never rearranges (r4) and keeps a live columns
       // dashboard, or owned panes already in the band shape (G9), exactly as
@@ -1649,7 +1819,69 @@ export class FixedDagPane extends DagPane {
           throw this.managedAvailable && !error?.code && /^layout-waiting: /.test(error?.message ?? '') ? wait(error.message) : error;
         }
       };
-      const placementPath = () => join(this.directory, 'placement.json');
+      // A scoped explicit yield before the four-area migration journals its first
+      // move. Collab alone closes its own proved pane; core only observes the
+      // matching native disappearance and never closes or runs it. No reply and no
+      // disappearance keep the wait, with no journal mutation.
+      const yieldCollab = async record => {
+        const events = this.events;
+        if (!events || typeof events.emit !== 'function' || typeof events.on !== 'function')
+          throw wait('layout-waiting: the collaboration pane must yield before this migration; no recovery bus is connected');
+        const scope = { ownerKey: this.coordinator?.binding?.ownerKey ?? this.binding.ownerKey,
+          sessionId: this.binding.sessionId, lifetimeId: this.coordinator?.lifetimeId ?? this.lifetimeId,
+          scopeEpoch: this.scopeEpoch,
+          generation: this.coordinator?.actor?.snapshot?.generation ?? this.managedActor?.snapshot?.generation ?? 1,
+          tabId };
+        if (!validScope(scope)) throw wait('layout-waiting: the collaboration yield has no current scope');
+        let legacyProof = null;
+        if (record.v === 1) {
+          let info = null;
+          try { info = await this.herdr('process-info', '--pane', record.paneId); } catch { info = null; }
+          legacyProof = await observeLegacyCollab(info, record, {
+            parentPane: this.parentPane, sessionId: this.sessionId, tabId,
+            stateDir: this.coordinationStateDir, recordPath: this.coordinationRecordPath(),
+            activityPath: this.coordinationActivityPath, language: this.coordinationLanguage,
+            lifetimeId: scope.lifetimeId, cache: this.legacyCollabCache },
+          this.inspectLegacyCollab ?? nativeShellProcesses);
+          if (!legacyProof)
+            throw wait('layout-waiting: the legacy collaboration pane cannot be proved in this tab; ' +
+              'leave it in place and restart the collaboration pane before /dashboard');
+        }
+        const commandId = randomUUID();
+        const message = { v: 1, kind: 'yield', scope, commandId, reason: 'layout-migration',
+          paneId: record.paneId, ...(legacyProof ? { legacyProof } : {}) };
+        if (yieldIssues(message).length) throw wait('layout-waiting: the collaboration yield request is invalid');
+        let timer, waiting, signalled = false;
+        const offs = [];
+        const wake = () => {
+          if (waiting) { const done = waiting; waiting = undefined; done(); } else signalled = true;
+        };
+        const matches = value => value?.v === 1 && typeof value.kind === 'string' && sameScope(value.scope, scope);
+        try {
+          offs.push(events.on(RECOVERY_V1.layout, value => { if (matches(value)) wake(); }));
+          offs.push(events.on(RECOVERY_V1.result, value => {
+            if (matches(value) && (value.commandId === undefined || value.commandId === commandId)) wake();
+          }));
+          const deadline = new Promise(resolve => { timer = this.timers.setTimeout(resolve, this.yieldTimeoutMs); });
+          // Arm the listeners first; the reply alone is never evidence, so every
+          // wake re-reads the native layout until the exact pane is gone.
+          events.emit(RECOVERY_V1.yield, message);
+          for (;;) {
+            const current = await freshReads(() => geometry());
+            if (current && !current.panes?.some(pane => pane?.pane_id === record.paneId)) {
+              this.legacyCollabCache?.clear(); bumpProcessQueryEpoch();
+              return current;
+            }
+            const signal = signalled ? (signalled = false, Promise.resolve())
+              : new Promise(resolve => { waiting = resolve; });
+            if (await Promise.race([signal.then(() => true), deadline.then(() => false)]) === false)
+              throw wait('layout-waiting: the collaboration pane has not yielded; run /dashboard again');
+          }
+        } finally {
+          if (timer !== undefined) this.timers.clearTimeout(timer);
+          for (const off of offs) try { off?.(); } catch { /* detached */ }
+        }
+      };
       // The claim becomes 'band' only after the band shape is verified: the DAG
       // and workers records here, the Todo record last by its controller. File
       // writes only, never a native mutation.
@@ -1669,16 +1901,23 @@ export class FixedDagPane extends DagPane {
         this.status = 'current';
         return { layout: 'band' };
       };
-      // Todo 8: an unresolved placement journal no longer blocks; this explicit
-      // pass resolves it through the actor below, or waits.
-      let stuck;
+      // An unresolved placement journal is resolved through the actor below, or
+      // waits. Its target is the four-area planner: only the core role panes are
+      // named. A visible five-area band is not a reason to skip an explicit yield.
+      const stuckOwned = Boolean(stuck) && stuck.schema === placementSchema &&
+        sameOwner(stuck, this.binding) && ['right', 'down'].includes(stuck.direction) &&
+        [stuck.source?.paneId, stuck.anchor?.paneId].every(id => [ids.todo, ids.workers, ids.dag].includes(id));
       if (this.managedAvailable) {
-        stuck = await readJson(placementPath()).catch(() => ({ phase: 'UNREADABLE' }));
-        if (stuck?.phase === 'COMPLETE') stuck = undefined;
         // G9: the owned panes already have the band shape under a columns claim
         // (the owner arranged them, or a migration stopped after its moves).
         // Nothing moves and no ratio is re-applied; only the claim follows.
         if (!stuck && ownedBand) return promote();
+        // An explicit migration of an incorrect/stuck band: the scoped yield runs
+        // before the placement journal. The four-area planner below stays unchanged.
+        if (ids.coordination && (!stuck || stuckOwned)) {
+          layout = await yieldCollab(collab);
+          delete ids.coordination;
+        }
       }
       // Moving a pane collapses its old branch. A foreign pane must never be
       // resized as an incidental result of that collapse. The unresolved
@@ -2129,6 +2368,7 @@ export class FixedDagPane extends DagPane {
     if (this.stopping) return this.stopping;
     if (this.stopped) return;
     this.stopped = true; this.taskData.stop();
+    this.legacyCollabCache?.clear();
     const coordinator = this.coordinator, actor = this.managedActor;
     this.stopSignal.abort();
     this.roleEvents.emit('stopped');
