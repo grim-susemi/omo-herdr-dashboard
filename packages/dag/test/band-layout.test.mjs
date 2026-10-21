@@ -233,3 +233,12 @@ test('band dashboard refuses the collaboration pane unless recorded and directly
   extra.panes.push({ pane_id: 'foreign', rect: { x: 0, y: 0, width: 1, height: 1 } });
   assert.equal(isBandDashboard(extra, { ...ids, coordination: 'collab' }), false, 'foreign extra pane');
 });
+
+test('the five-area band accepts only the exact recorded collaboration pane', () => {
+  assert.equal(isBandDashboard(collabLayout(), { ...ids, coordination: 'collab' }), true);
+  const otherParent = collabLayout();
+  otherParent.panes[2].pane_id = 'other-parent-collab';
+  assert.equal(isBandDashboard(otherParent, { ...ids, coordination: 'collab' }), false,
+    'another parent pane cannot sit in the recorded cell');
+  assert.equal(isBandDashboard(otherParent, ids), false, 'an unrecorded fifth pane is foreign');
+});

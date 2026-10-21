@@ -96,10 +96,213 @@ const paintAt = (line, at, text, color, enabled) => enabled && line.startsWith(t
   `${line.slice(0, at)}${paint(text, color, enabled)}${line.slice(at + text.length)}` : line;
 const taskStatuses = new Set([...Object.keys(icons), 'error', 'interrupted', 'lost']);
 
+const activeStatuses = new Set(['pending', 'running', 'scheduled', 'blocked']);
+const historyStatuses = new Set(['completed', 'cancelled', 'error', 'failed', 'interrupted', 'lost', 'skipped', 'paused']);
+// A collapsed card may hide safely finished descendants, but never a failed,
+// paused, unknown or still-actionable one.
+const attentionStatuses = new Set([...activeStatuses, 'failed', 'error', 'lost', 'paused']);
+const needsAttention = child => attentionStatuses.has(child.status) || !taskStatuses.has(child.status);
+
+const noTasks = Object.freeze([]);
+
+const taskRecord = task => ({ task, id: task?.id, status: task?.status, parentTaskId: task?.parentTaskId });
+function sameTasks(records, tasks) {
+  if (records.length !== tasks.length) return false;
+  for (let index = 0; index < tasks.length; index++) {
+    const record = records[index], task = tasks[index];
+    if (record.task !== task || record.id !== task?.id || record.status !== task?.status ||
+        record.parentTaskId !== task?.parentTaskId) return false;
+  }
+  return true;
+}
+
+// One current record per task ID. A repeated external entry is superseded by
+// the later one, matching the task store's map semantics. The deduped array is
+// reused while the source array still holds the same task identities.
+const currentTaskCache = new WeakMap();
+function currentTasks(state) {
+  const source = Array.isArray(state?.tasks) ? state.tasks : noTasks;
+  const cached = currentTaskCache.get(source);
+  if (cached && sameTasks(cached.records, source)) return cached.tasks;
+  const current = new Map();
+  for (const task of source) if (task && typeof task.id === 'string') current.set(task.id, task);
+  const tasks = [...current.values()];
+  currentTaskCache.set(source, { records: source.map(taskRecord), tasks });
+  return tasks;
+}
+
+// Descendant work is derived from the parentTaskId forest, not from the task
+// list's order. A task view is one child index over a task array; a rebuilt
+// view reuses every per-task record whose subtree identity is unchanged.
+const taskViews = new WeakMap();
+function taskView(tasks) {
+  const cached = taskViews.get(tasks);
+  if (cached && sameTasks(cached.records, tasks)) return cached.view;
+  const children = new Map();
+  for (const task of tasks) {
+    if (!task || typeof task.id !== 'string' || !task.parentTaskId) continue;
+    const list = children.get(task.parentTaskId);
+    if (list) list.push(task); else children.set(task.parentTaskId, [task]);
+  }
+  const view = { keyOf: task => structureToken(task, children), descendants: task => descendantWalk(task, children) };
+  taskViews.set(tasks, { records: tasks.map(taskRecord), view });
+  return view;
+}
+
+// A subtree token changes exactly when the task object, one of the fields the
+// walk reads (id/status/parentTaskId), or any descendant's identity changes.
+// Tokens are compact, so a deep tree cannot turn the cache into O(n^2) text.
+let nextStructureToken = 1;
+const structureRecords = new WeakMap();
+const sameRefs = (left, right) => {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
+  return true;
+};
+function structureToken(task, children) {
+  const kids = children.get(task.id) ?? noTasks;
+  const own = `${task.id}\u0000${task.status ?? ''}\u0000${task.parentTaskId ?? ''}`;
+  const cached = structureRecords.get(task);
+  // A back edge is a cycle marker, not one participant's token: a token would
+  // be rewritten each pass and never reach a fixed point.
+  if (cached?.visiting) return 0;
+  if (cached && cached.own === own && sameRefs(cached.children, kids)) {
+    cached.visiting = true;
+    try {
+      const tokens = kids.map(child => structureToken(child, children));
+      if (sameRefs(cached.childTokens, tokens)) return cached.token;
+      cached.childTokens = tokens;
+      cached.token = nextStructureToken++;
+      return cached.token;
+    } finally { cached.visiting = false; }
+  }
+  const record = cached ?? { own, children: kids, childTokens: noTasks, token: nextStructureToken++, visiting: false };
+  record.own = own;
+  record.children = kids;
+  record.visiting = true;
+  // Store the visiting record before descending so a cycle can find it.
+  structureRecords.set(task, record);
+  try { record.childTokens = kids.map(child => structureToken(child, children)); }
+  finally { record.visiting = false; }
+  if (cached) record.token = nextStructureToken++;
+  return record.token;
+}
+
+// The single descendant computation. Children keep task order and each subtree
+// runs before the next sibling, matching the previous task-list walk; the
+// visited set cuts cycles and duplicate IDs.
+function descendantWalk(task, children) {
+  const visited = new Set([task.id]);
+  const descendants = [];
+  const pending = (children.get(task.id) ?? noTasks).map(child => ({ task: child, depth: 1 }));
+  while (pending.length) {
+    const { task: child, depth } = pending.shift();
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
+    descendants.push({ task: child, depth });
+    const grandchildren = children.get(child.id) ?? noTasks;
+    for (let index = grandchildren.length - 1; index >= 0; index--) {
+      pending.unshift({ task: grandchildren[index], depth: depth + 1 });
+    }
+  }
+  return descendants;
+}
+
+// A descendant walk result is reused while the root's subtree token is the
+// same. The record is keyed by the root object, so a changed child invalidates
+// its ancestors only; unrelated roots keep their walk.
+const walkRecords = new WeakMap();
+function hasActiveDescendant(descendants) {
+  return descendants.some(({ task: child }) => activeStatuses.has(child.status));
+}
+function walkRecord(task, view) {
+  const key = view.keyOf(task);
+  const cached = walkRecords.get(task);
+  if (cached && cached.key === key) return cached;
+  const descendants = view.descendants(task);
+  const record = { key, descendants, active: hasActiveDescendant(descendants) };
+  walkRecords.set(task, record);
+  return record;
+}
+
+// History is one total tuple: undated first by ID, then createdAt falling back
+// to startedAt ascending, with ID breaking ties. Both buckets keep every root.
+function historyTime(task) {
+  for (const value of [task.createdAt, task.startedAt]) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+// Group, order and section membership are derived from the same subtree
+// identity, plus the timestamps that only affect ordering. A clock tick with
+// the same identities reuses every record.
+const sectionRecords = new WeakMap();
+function sectionRecord(task, view) {
+  const key = `${view.keyOf(task)}\u0002${task.createdAt ?? ''}\u0002${task.startedAt ?? ''}\u0002${task.updatedAt ?? ''}\u0002${task.reportedAt ?? ''}\u0002${task.completedAt ?? ''}`;
+  const cached = sectionRecords.get(task);
+  if (cached && cached.key === key) return cached;
+  // A status that is already active (or unknown) needs no descendant walk to
+  // decide its section; only historical roots consult the cached walk.
+  const knownActive = activeStatuses.has(task.status) || !historyStatuses.has(task.status);
+  const record = { key, historyTime: historyTime(task),
+    group: knownActive || walkRecord(task, view).active ? 'active' : 'history' };
+  sectionRecords.set(task, record);
+  return record;
+}
+
+const cloneSections = sections => ({ active: [...sections.active], history: [...sections.history], roots: [...sections.roots] });
+const sectionCache = new WeakMap();
+// The single eligible-root index shared by counts, rendering, navigation and
+// follow. A DAG-linked task stays in the DAG; verified children stay nested
+// under their parent. roots is the navigation order: active then history.
+export function workersSections(state) {
+  const source = Array.isArray(state?.tasks) ? state.tasks : noTasks;
+  const tasks = currentTasks(state);
+  const runs = Array.isArray(state?.runs) ? state.runs : [];
+  const linked = new Set(runs.flatMap(run => (Array.isArray(run?.nodes) ? run.nodes : []).map(node => node?.taskId)));
+  const view = taskView(tasks);
+  const entries = [], parts = [];
+  for (const task of tasks) {
+    if (task.parentTaskId || linked.has(task.id)) continue;
+    const record = sectionRecord(task, view);
+    entries.push({ task, record }); parts.push(record.key);
+  }
+  const key = `${[...linked].sort().join(',')}\u0003${parts.join('\u0003')}`;
+  const cached = sectionCache.get(source);
+  if (cached && cached.key === key) return cloneSections(cached.sections);
+  const active = [], history = [];
+  for (const { task, record } of entries) {
+    if (record.group === 'active') active.push(task);
+    else history.push({ task, time: record.historyTime });
+  }
+  active.sort((a, b) => Number(b.status === 'running') - Number(a.status === 'running') || a.id.localeCompare(b.id));
+  history.sort((a, b) => {
+    const at = a.time, bt = b.time;
+    if (at === undefined || bt === undefined) {
+      if (at !== bt) return at === undefined ? -1 : 1;
+    } else if (at !== bt) return at - bt;
+    return a.task.id.localeCompare(b.task.id);
+  });
+  const ordered = history.map(entry => entry.task);
+  const sections = { active, history: ordered, roots: [...active, ...ordered] };
+  sectionCache.set(source, { key, sections });
+  return cloneSections(sections);
+}
+
 export function standaloneTasks(state) {
-  const linked = new Set((state?.runs ?? []).flatMap(run => run.nodes.map(node => node.taskId)));
-  return (state?.tasks ?? []).filter(task => !task.parentTaskId && !linked.has(task.id))
-    .sort((a, b) => Number(b.status === 'running') - Number(a.status === 'running') || a.id.localeCompare(b.id));
+  return workersSections(state).roots;
+}
+
+// The default Workers selection keeps the pre-grouping contract: live work opens
+// selected, otherwise the first task in the store. Both are looked up in task
+// order and filtered to the eligible roots, never read from active/history mount
+// order, so regrouping a section cannot change which card a fresh open selects.
+export function defaultTaskId(state, roots) {
+  const eligible = new Set((roots ?? []).map(task => task.id));
+  const ordered = currentTasks(state).filter(task => eligible.has(task.id));
+  return (ordered.find(task => task.status === 'running') ?? ordered[0])?.id;
 }
 
 // Follow execution identity, not array order or the user's detail selection.
@@ -147,7 +350,7 @@ function nodeTitle(node, task, language, timing, room, color, selected, hint = '
   return partsLine([{ text: head, color: colors[status], bold: selected }, desc, ...tail].filter(Boolean), room, color);
 }
 // Card rows under the title: role and model, live activity or progress, counts and cost, then subtasks.
-function nodeDetail(task, tasks, language, timing, room, color) {
+function nodeDetail(task, tasks, language, timing, room, color, view = taskView(tasks)) {
   if (!task) return [];
   const rows = [];
   const identity = [task.agent, task.category].map(part => clean(part).trim()).filter(Boolean).join('/');
@@ -162,14 +365,14 @@ function nodeDetail(task, tasks, language, timing, room, color) {
     task[key] !== undefined && task[key] !== null ? [t(language, label, { count: clean(task[key]) })] : []).join(' · ');
   const cost = task.metrics ? metricSummary(task, language, false) : '';
   if (counts || cost) rows.push(partsLine([{ text: [counts, cost].filter(Boolean).join(' · '), color: roleColors.counts }], room, color));
-  for (const { task: child } of taskDescendants(task, tasks)) {
+  for (const { task: child } of walkRecord(task, view).descendants) {
     const time = foldedStatuses.has(child.status) ? '' : durationText(child, timing, child.status, language);
     rows.push(partsLine([{ text: `↳ ${statusIcon(child.status, timing.frame)} ${clean(child.description)}`, color: colors[child.status] },
       time && { text: ` · ${time}`, color: roleColors.time }].filter(Boolean), room, color));
   }
   return rows;
 }
-export function laneLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 } } = {}) {
+export function laneLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 }, view = taskView(tasks) } = {}) {
   const out = [], ranges = Object.create(null);
   const steps = layers(run, language);
   const stageOf = new Map(steps.flatMap((step, index) => step.map(node => [node.id, index])));
@@ -218,7 +421,7 @@ export function laneLines(run, columns, color = true, language = 'en', { selecte
     const kids = run.edges.filter(edge => edge.from === node.id).map(edge => edge.to);
     if (open) {
       const under = laneCells(own, kids.length ? line('│') : ' ');
-      for (const row of nodeDetail(task, tasks, language, timing, room, color)) push(`${under} ${bar}${row}`);
+      for (const row of nodeDetail(task, tasks, language, timing, room, color, view)) push(`${under} ${bar}${row}`);
       cardOpen = true;
     }
     lanes[own] = kids[0] ?? null;
@@ -239,7 +442,7 @@ export function laneLines(run, columns, color = true, language = 'en', { selecte
 // nodes listed one per row behind a single tree mark (├, └ for the last), so the left margin stays one cell
 // however many nodes run in parallel (23 parallel nodes took 45 cells of lanes). A node fed by only part of
 // the previous stage names its first parent (← a +2). Open nodes keep the bar card and dotted parting row.
-export function stageLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 } } = {}) {
+export function stageLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 }, view = taskView(tasks) } = {}) {
   const out = [], ranges = Object.create(null);
   const steps = layers(run, language);
   const line = text => paint(text, dim, color);
@@ -262,7 +465,7 @@ export function stageLines(run, columns, color = true, language = 'en', { select
       out.push(`${line(last ? '└' : '├')}${bar}${nodeTitle(node, task, language, timing, columns - 2, color, node.id === selectedNodeId, hint)}`);
       // An open node's card rows are the worker pane's card rows under the title, subtasks included.
       const detail = open && task ? [...compactTaskLines(task, language, timing, columns, { node, color, room: columns - 2, titleRow: false }).slice(1),
-        ...descendantLines(task, tasks, language, timing, columns + 2, color)] : [];
+        ...descendantLines(task, tasks, language, timing, columns + 2, color, undefined, view)] : [];
       for (const row of detail) out.push(`${line(last ? ' ' : '│')}${bar}${row}`);
       ranges[node.id] = { start, end: out.length };
     });
@@ -450,30 +653,17 @@ function compactTaskLines(task, language, timing, columns, { selected = false, n
   return lines.filter((line, index) => !index || line.trim());
 }
 
-function taskDescendants(task, tasks) {
-  // Only parentTaskId establishes ownership. DAG edges never imply subtasks.
-  const visited = new Set(task ? [task.id] : []);
-  const descendants = [];
-  const pending = task ? tasks.filter(child => child.parentTaskId === task.id).map(child => ({ task: child, depth: 1 })) : [];
-  while (pending.length) {
-    const { task: child, depth } = pending.shift();
-    if (visited.has(child.id)) continue;
-    visited.add(child.id);
-    descendants.push({ task: child, depth });
-    pending.unshift(...tasks.filter(task => task.parentTaskId === child.id).map(task => ({ task, depth: depth + 1 })));
-  }
-  return descendants;
-}
-
 export function completedTasks(state) {
+  const tasks = Array.isArray(state?.tasks) ? state.tasks : noTasks;
+  const view = taskView(tasks);
   return standaloneTasks(state).filter(task => task.status === 'completed' &&
-    taskDescendants(task, state?.tasks ?? []).every(({ task: child }) =>
+    walkRecord(task, view).descendants.every(({ task: child }) =>
       terminal.has(child.status) && !['failed', 'error', 'lost'].includes(child.status)));
 }
 
 const foldedStatuses = new Set(['completed', 'cancelled', 'skipped', 'interrupted']);
-function descendantLines(task, tasks, language, timing, columns, color) {
-  const descendants = taskDescendants(task, tasks);
+function descendantLines(task, tasks, language, timing, columns, color, only, view = taskView(tasks)) {
+  const descendants = task ? walkRecord(task, view).descendants.filter(({ task: child }) => !only || only(child)) : [];
   const title = fit(`─ ${t(language, 'subtasksCount', { count: descendants.length })} `, columns - 4);
   return descendants.length ? [title + '─'.repeat(Math.max(0, columns - 4 - width(title))),
     // A finished subtask folds to its title row; failed, blocked and running ones keep their details.
@@ -511,18 +701,22 @@ function barCard(lines, columns, color, status, selected = false) {
   return lines.map((line, index) => `${bar}${index || line.includes('\x1b[') ? line : paint(fit(line, columns - 1), colors[status], color, selected)}`);
 }
 
-function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }) {
+function taskCard(task, tasks, columns, color, language, timing, { selected, expanded, verbose, node, compactCompleted = false }, view = taskView(tasks)) {
   const detailed = selected && verbose;
   const status = node?.state ?? task?.status;
   if (!detailed) {
     const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: !expanded, color, room: columns - 1 });
-    const text = expanded ? [...compact, ...descendantLines(task, tasks, language, timing, columns + 3, color)] : compact.slice(0, 1);
-    return barCard(compactCompleted && !expanded ? compact.slice(0, 1) : text, columns, color, status, selected);
+    // A collapse trims the parent's own rows. Failed/actionable descendants
+    // keep a compact attention line either way, so detail state cannot hide them.
+    const descendants = expanded ? descendantLines(task, tasks, language, timing, columns + 3, color, undefined, view) :
+      descendantLines(task, tasks, language, timing, columns + 3, color, needsAttention, view);
+    const text = expanded ? [...compact, ...descendants] : [...compact.slice(0, 1), ...descendants];
+    return barCard(text, columns, color, status, selected);
   }
   const compact = compactTaskLines(task, language, timing, columns, { selected, node, collapsed: false, color });
   const text = [compact[0], ...(node ? [`${clean(node.label)} (${clean(node.id)})`, `${statusIcon(node.state, timing.frame)} ${t(language, node.state)}`] : []),
     ...taskLines(task, language, timing, node?.state, columns)];
-  text.push(...descendantLines(task, tasks, language, timing, columns, color));
+  text.push(...descendantLines(task, tasks, language, timing, columns, color, undefined, view));
   return detailBox(text, columns, color, status, node?.label ?? node?.id);
 }
 
@@ -531,6 +725,55 @@ const separator = (columns, color, label) => {
   return paint(title + '─'.repeat(Math.max(0, columns - width(title))), dim, color);
 };
 
+// History cards are stable between clock ticks. TaskData replaces task objects
+// on every changed snapshot, so the task object is the data identity; width,
+// colour, language and detail depth form its style key. Clock state
+// (now/frame/scroll) and a fresh empty runs array never enter the key.
+const historyCardCache = new WeakMap();
+const taskListIds = new WeakMap();
+const historyTaskIds = new WeakMap();
+let nextTaskListId = 1, nextHistoryTaskId = 1;
+function taskListId(tasks) {
+  let id = taskListIds.get(tasks);
+  if (id === undefined) { id = nextTaskListId++; taskListIds.set(tasks, id); }
+  return id;
+}
+function historyTaskId(task) {
+  let id = historyTaskIds.get(task);
+  if (id === undefined) { id = nextHistoryTaskId++; historyTaskIds.set(task, id); }
+  return id;
+}
+// Collapsed attention rows depend only on failed/actionable descendants;
+// expanded and selected-verbose detail rows read every descendant. Their
+// object identity and status invalidate a reused parent/task list without
+// keying on clock state.
+// Descendant signatures are derived from the same cached walk. The two forms
+// (attention-only and full) are built once per subtree identity, so a clock
+// tick reuses both the walk and the card cache key.
+function descendantSignature(descendants, full) {
+  return descendants.filter(({ task: child }) => full || needsAttention(child))
+    .map(({ task: child }) => `${historyTaskId(child)}:${child.status ?? ''}`).join(',');
+}
+function historyDescendants(task, view, full) {
+  const record = walkRecord(task, view);
+  const signatures = record.signatures ??= { attention: null, full: null };
+  const name = full ? 'full' : 'attention';
+  if (signatures[name] === null) signatures[name] = descendantSignature(record.descendants, full);
+  return signatures[name];
+}
+function historyCardLines(task, tasks, context, draw) {
+  let styles = historyCardCache.get(task);
+  if (!styles) { styles = new Map(); historyCardCache.set(task, styles); }
+  // Expanded and selected-verbose cards read the task list; collapsed
+  // attention rows read only the descendant identities/statuses above.
+  // Neither depends on now/frame/scroll.
+  const key = [context.columns, context.color ? 1 : 0, context.language,
+    context.selected ? 1 : 0, context.expanded ? 1 : 0, context.verbose ? 1 : 0,
+    context.listId ?? 0, context.descendants ?? ''].join('\u0000');
+  let lines = styles.get(key);
+  if (!lines) { lines = draw(); styles.set(key, lines); }
+  return lines;
+}
 
 export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scroll = 0, color = true, error = '', language = state?.language ?? 'en',
   selectedNodeId, selectedTaskId, view, viewState, verbose = false, revealSelection = false, notice = '', now = Date.now(), completedExpanded = false,
@@ -539,7 +782,9 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   rows = Math.max(1, rows);
   const all = state?.runs ?? [];
   const run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
-  const roots = standaloneTasks(state);
+  const sections = workersSections(state);
+  const roots = sections.roots;
+  const rootsDone = roots.filter(task => task.status === 'completed').length;
   // The fixed DAG role stays a DAG pane with no run yet; only the standalone viewer falls back to tasks.
   const dagRole = fixed && view === 'dag';
   const tasksView = view === 'tasks' || !all.length && !dagRole;
@@ -551,7 +796,6 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     if (rest < 0) return inset + paint(fit(`${name} ${tally}`, room), accent, color, true);
     return `${inset}${paint(name, accent, color, true)} ${paint(tally, roleColors.time, color, true)}${rest >= 2 && detail ? `  ${paint(fit(detail, rest), dim, color)}` : ''}`;
   };
-  const rootsDone = roots.filter(task => task.status === 'completed').length;
   // The standalone viewer switches views with t, so it names the other view's count; a fixed role pane does not.
   const switchHint = fixed ? '' : tasksView ? (all.length ? ` · DAG (${all.length})` : '') : ` · ${t(language, 'tasks')} (${roots.length})`;
   const head = [headLine(t(language, 'tasks'), rootsDone, roots.length,
@@ -562,22 +806,52 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     ...(state?.connected ? [] : [t(language, 'disconnected')]), '');
   if (tasksView && (roots.length || all.length)) {
     const completed = new Set(completedTasks(state).map(task => task.id));
-    if (completed.size) head[0] = headLine(t(language, 'tasks'), rootsDone, roots.length,
-      `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })} · ${t(language, 'completedTasks', { count: completed.size })} ${completedExpanded ? '▾' : '▸'}${switchHint}`);
-    let cards = 0;
-    for (const task of roots) {
+    if (rootsDone) head[0] = headLine(t(language, 'tasks'), rootsDone, roots.length,
+      `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })} · ${t(language, 'completedTasks', { count: rootsDone })} ${completedExpanded ? '▾' : '▸'}${switchHint}`);
+    const tasks = Array.isArray(state?.tasks) ? state.tasks : noTasks;
+    const view = taskView(tasks);
+    const parentIds = new Set();
+    for (const task of tasks) if (task?.parentTaskId) parentIds.add(task.parentTaskId);
+    const timing = { now, connected: state?.connected, updatedAt: state?.updatedAt, frame };
+    const drawCard = (task, history) => {
       const compactCompleted = completed.has(task.id);
       const explicit = viewState?.expanded?.[JSON.stringify([TASK_SCOPE, task.id])];
       const protectedParent = task.status === 'completed' && !compactCompleted;
-      const expanded = typeof explicit === 'boolean' ? explicit :
+      const detail = typeof explicit === 'boolean' ? explicit :
         protectedParent || isExpanded(viewState, TASK_SCOPE, task.id, task.status);
-      if (compactCompleted && !completedExpanded && !expanded && task.id !== selectedTaskId) continue;
+      // A history detail toggle changes card depth, never membership. The old
+      // completed-group control now opens completed cards instead of hiding them.
+      const expanded = detail || (history && compactCompleted && completedExpanded);
+      const options = { selected: task.id === selectedTaskId, expanded, verbose, compactCompleted };
+      const draw = () => taskCard(task, tasks, columns, color, language, timing, options, view);
+      // The verbose detail path draws unfiltered descendants even when the
+      // explicit preference keeps the compact card collapsed.
+      const fullDetail = expanded || (options.selected && verbose);
+      const descendants = history && parentIds.has(task.id) ? historyDescendants(task, view, fullDetail) : '';
+      return history ? historyCardLines(task, tasks,
+        { columns, color, language, selected: options.selected, expanded, verbose, descendants,
+          listId: fullDetail ? taskListId(tasks) : 0 }, draw) : draw();
+    };
+    let cards = 0;
+    for (const task of sections.active) {
       if (cards++) body.push(separator(columns, color));
       const start = body.length;
-      body.push(...taskCard(task, state?.tasks ?? [], columns, color, language,
-        { now, connected: state?.connected, updatedAt: state?.updatedAt, frame },
-        { selected: task.id === selectedTaskId, expanded, verbose, compactCompleted }));
+      body.push(...drawCard(task, false));
       taskRanges[task.id] = { start, end: body.length };
+    }
+    if (sections.history.length) {
+      body.push(separator(columns, color, t(language, 'historyCount', { count: sections.history.length })));
+      let historyRows = 0;
+      for (const task of sections.history) {
+        const lines = drawCard(task, true);
+        // Compact history rows run flush; an expanded/detail card keeps the
+        // existing separator so its extra depth stays distinct. The section
+        // divider already separates the first card from active work.
+        if (historyRows++ && lines.length > 1) body.push(separator(columns, color));
+        const start = body.length;
+        body.push(...lines);
+        taskRanges[task.id] = { start, end: body.length };
+      }
     }
     if (!roots.length) body.push(t(language, 'none'));
   } else if (run && !tasksView) {
@@ -593,8 +867,9 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     head[0] = headLine('DAG', done, run.nodes.length,
       all.length > 1 && width(prefixed) <= runRoom ? prefixed : `${clean(run.name)}${runTail}`);
     const timing = { now, connected: state?.connected, updatedAt: state?.updatedAt, frame };
+    const tasks = state?.tasks ?? noTasks, view = taskView(tasks);
     try {
-      const { rows: flow, ranges } = stageLines(run, columns, color, language, { selectedNodeId, viewState, tasks: state?.tasks ?? [], timing });
+      const { rows: flow, ranges } = stageLines(run, columns, color, language, { selectedNodeId, viewState, tasks, timing, view });
       const start = body.length;
       body.push(...flow);
       for (const [id, range] of Object.entries(ranges)) graphRanges[id] = nodeRanges[id] = { start: start + range.start, end: start + range.end };
@@ -605,7 +880,7 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     if (inspected) {
       const start = body.length;
       body.push(...taskCard(state?.tasks?.find(task => task.id === inspected.taskId), state?.tasks ?? [], columns, color, language,
-        timing, { selected: true, expanded: true, verbose, node: inspected }));
+        timing, { selected: true, expanded: true, verbose, node: inspected }, view));
       nodeRanges[inspected.id] = { start, end: body.length };
     }
     for (const node of run.nodes) if (node.error) body.push('', `× ${clean(node.id)}: ${node.error}`);

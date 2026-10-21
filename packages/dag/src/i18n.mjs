@@ -2,6 +2,7 @@ export const messages = {
   en: {
     subtask: 'sub', subtasksCount: 'Subtasks ({count})',
     completedTasks: 'Completed tasks ({count})',
+    historyCount: 'History ({count})',
     followShortOn: 'Follow ON', followShortOff: 'Follow OFF', liveShort: 'LIVE', offlineShort: 'OFFLINE',
     workerGroupKeys: 'j/k c Done tasks', dagGroupKeys: 'j/k ←→ c Done runs', detailCloseKeys: 'd Details q Close',
     workerControls: 'j/k Scroll  c Completed tasks  d Details  q Close',
@@ -49,6 +50,7 @@ export const messages = {
   ko: {
     subtask: 'sub', subtasksCount: 'Subtasks ({count})',
     completedTasks: 'done {count}',
+    historyCount: '기록 ({count})',
     followShortOn: 'Follow ON', followShortOff: 'Follow OFF', liveShort: 'LIVE', offlineShort: 'OFFLINE',
     workerGroupKeys: 'j/k c Done tasks', dagGroupKeys: 'j/k ←→ c Done runs', detailCloseKeys: 'd Details q Close',
     workerControls: 'j/k Scroll  c Completed tasks  d Details  q Close',
@@ -96,6 +98,7 @@ export const messages = {
   'zh-cn': {
     subtask: '子任务', subtasksCount: '子任务（{count}）',
     completedTasks: '已完成任务（{count}）',
+    historyCount: '历史（{count}）',
     followShortOn: '跟随 ON', followShortOff: '跟随 OFF', liveShort: '在线', offlineShort: '离线',
     workerGroupKeys: 'j/k c 完成任务', dagGroupKeys: 'j/k ←→ c 完成流程', detailCloseKeys: 'd 详情 q 关闭',
     workerControls: 'j/k 滚动  c 已完成任务  d 详情  q 关闭',

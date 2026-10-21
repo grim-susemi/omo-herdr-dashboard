@@ -27,6 +27,18 @@ const layout = { taskInset: 4, askMaxRows: 2, sectionGap: 1, minimumWorkRows: 2,
 const marks = { pending: '[ ]', in_progress: '[•]', completed: '[✓]', abandoned: '[×]', cancelled: '[×]' };
 export const STRIKE_INTERVAL_MS = 65;
 export const STRIKE_TOTAL_FRAMES = 14;
+// Presentation-only ordinal for a phase divider. The phase index this receives is the original
+// snapshot index, so hiding or folding an earlier phase cannot renumber the later ones.
+function roman(value) {
+  const table = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'],
+    [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+  let number = Math.max(1, Math.floor(value));
+  let result = '';
+  for (const [amount, glyph] of table) {
+    while (number >= amount) { result += glyph; number -= amount; }
+  }
+  return result;
+}
 const paint = (text, token, enabled, heading = false) => enabled && style[token] ?
   `\x1b[${heading ? '1;' : token === 'completed' ? '9;' : ''}${style[token]}m${text}\x1b[0m` : text;
 // Two hold frames followed by twelve reveal frames, as in Pi's Todo widget.
@@ -151,9 +163,15 @@ export function renderFrame(snapshot, { columns = 80, rows = 24, language = 'en'
     const start = bodyLines.length;
     const count = counts(phase.tasks);
     const summary = `${count.closed}/${count.total}${count.dropped ? ` ${t(language, 'dropped')}:${count.dropped}` : ''}${folded ? ' ▸' : ''}`;
-    // Each phase title is a divider row "─ name n/m ───"; only the phase holding the current work keeps a colour.
-    const nameRoom = columns - width(summary) - 5;
-    const label = fit(nameRoom > 0 ? `${fit(phase.name, nameRoom)} ${summary}` : summary, Math.max(1, columns - 3));
+    // Each phase title is a divider row "─ <ordinal>. name n/m ───"; only the phase holding the
+    // current work keeps a colour. The ordinal and counter are budgeted first, so a long name
+    // truncates before either is dropped at a supported width.
+    const prefix = `${roman(phaseIndex + 1)}. `;
+    const budget = Math.max(1, columns - 3);
+    const nameRoom = budget - width(prefix) - width(summary) - 1;
+    const label = fit(nameRoom > 0
+      ? `${prefix}${fit(phase.name, nameRoom)} ${summary}`
+      : fit(`${prefix}${summary}`, budget), budget);
     const tail = '─'.repeat(Math.max(0, columns - width(label) - 3));
     bodyLines.push(openPhases.has(phaseIndex) && !isClosedPhase(phase)
       ? `${paint('─ ', 'muted', color)}${paint(label, 'activePhase', color, true)}${paint(` ${tail}`, 'muted', color)}`

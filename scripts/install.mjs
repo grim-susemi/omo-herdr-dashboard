@@ -2,7 +2,7 @@ import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/pro
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 const source = dirname(fileURLToPath(import.meta.url));
 const marker = '// managed by omo-herdr-dashboard';
 async function text(file) {
@@ -39,7 +39,7 @@ export async function install(args) {
   const previous = pointerBefore === undefined ? undefined : JSON.parse(pointerBefore).generation;
   if (previous !== undefined && (!/^generation-\d{6}$/.test(previous) || await text(join(container, previous, '.installed-by')) !== marker)) throw Error('Invalid previous generation');
   const runtime = ['extension.mjs', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'todo/extension.mjs', 'dag/extension.mjs', 'coordination/extension.mjs',
-    ...['activity', 'controller', 'i18n', 'render', 'viewer'].map(file => `coordination/src/${file}.mjs`),
+    ...['activity', 'controller', 'i18n', 'proof', 'recovery', 'render', 'viewer'].map(file => `coordination/src/${file}.mjs`),
     ...['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => `todo/src/${file}.mjs`),
     ...['controller', 'herdr', 'i18n', 'model', 'render', 'retention', 'runtime', 'storage', 'stream-tap', 'task-data', 'terminal-input', 'view-state', 'viewer'].map(file => `dag/src/${file}.mjs`)];
   for (const file of runtime) await readFile(join(source, file));
@@ -77,6 +77,17 @@ export async function install(args) {
     await writeFile(join(staged, '.installed-by'), marker);
     await writeFile(join(staged, 'legacy-wrapper-backup.json'), JSON.stringify(legacy, null, 2), { mode: 0o600 });
     for (const file of runtime) await readFile(join(staged, file));
+    // Presence alone is not a runtime check: the staged participants must be
+    // able to load the exact shared protocol and first-paint proof reader.
+    const protocol = await import(pathToFileURL(join(staged, 'coordination/src/recovery.mjs')).href +
+      `?install=${randomUUID()}`);
+    if (protocol.RECOVERY_V1?.layout !== 'omo.herdr.dashboard.layout.v1' ||
+      typeof protocol.createRecoveryCoordinator !== 'function' || typeof protocol.layoutIssues !== 'function')
+      throw Error('Shared four-pane recovery protocol did not load');
+    const proof = await import(pathToFileURL(join(staged, 'coordination/src/proof.mjs')).href +
+      `?install=${randomUUID()}`);
+    if (typeof proof.inspectViewerProof !== 'function')
+      throw Error('Shared viewer proof reader did not load');
     await rename(staged, integration); promoted = true;
     await atomic(wrapper, `${marker}\nexport { default } from '../herdr-dashboard/integration/${generation}/extension.mjs';\n`); switched = true;
     for (const item of legacy) {

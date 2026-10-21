@@ -62,7 +62,8 @@ export function normalizeTask(raw) {
       text(raw.resolved_model?.display, 256) ?? text(raw.model, 256),
     reasoningEffort: text(raw.resolved_model?.reasoning_effort ?? raw.requested_model?.reasoning_effort ??
       raw.effective_model?.reasoning_effort, 64),
-    status: text(raw.status, 64), startedAt: iso(live?.started_at) ?? iso(raw.created_at),
+    status: text(raw.status, 64), createdAt: iso(raw.created_at),
+    startedAt: iso(live?.started_at) ?? iso(raw.created_at),
     completedAt: iso(raw.terminal_at) ?? (terminal.has(raw.status) ? iso(raw.updated_at) : undefined),
     progress: terminal.has(raw.status) ? undefined : text(progress, 512) ?? text(live?.activity, 512),
     turns: count(live?.turns) ?? count(stats?.turns), toolCalls: count(live?.tool_calls) ?? count(stats?.tool_calls),
@@ -90,9 +91,9 @@ export class TaskData {
     for (const raw of tasks) {
       const task = normalizeTask({ task_id: raw.id, description: raw.description, agent_type: raw.agent,
         model: raw.model, resolved_model: { reasoning_effort: raw.reasoningEffort },
-        status: raw.status, created_at: raw.startedAt, terminal_at: raw.completedAt,
+        status: raw.status, created_at: raw.createdAt, terminal_at: raw.completedAt,
         updated_at: raw.reportedAt,
-        live_progress: { activity: raw.progress, turns: raw.turns, tool_calls: raw.toolCalls } });
+        live_progress: { activity: raw.progress, started_at: raw.startedAt, turns: raw.turns, tool_calls: raw.toolCalls } });
       if (!task) continue;
       const restoredMetrics = metrics(raw.metrics, undefined, raw.metrics?.reportedAt, raw.metrics?.source);
       if (restoredMetrics) task.metrics = restoredMetrics;

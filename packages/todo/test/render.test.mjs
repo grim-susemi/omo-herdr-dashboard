@@ -81,7 +81,7 @@ test('every phase shell and every actual status remain accessible by basic body 
     assert.ok(frame.lines.some(line => line.includes(phase.name)));
   }
   const shell = renderFrame(project([{ name: 'Empty', tasks: [] }]), { columns: 40, rows: 16, color: false });
-  assert.match(shell.text, /─ Empty 0\/0 ─/);
+  assert.match(shell.text, /─ I\. Empty 0\/0 ─/);
   assert.doesNotMatch(shell.text, /100%/);
 });
 
@@ -91,7 +91,7 @@ test('closed includes dropped; dropped never becomes completed', () => {
   ] }]);
   const frame = renderFrame(snapshot, { color: false, completedExpanded: true });
   assert.match(frame.text, /Todo \[2\/2\]  done:0 · drop:2/);
-  assert.match(frame.text, /─ Dropped 2\/2 drop:2 /);
+  assert.match(frame.text, /─ I\. Dropped 2\/2 drop:2 /);
   assert.equal(snapshot.target, null);
   assert.deepEqual(Object.values(frame.taskRanges).map(range => range.status), ['abandoned', 'abandoned']);
 });
@@ -172,9 +172,9 @@ test('fully closed nonempty phases have no row until expanded, and the header ke
   assert.doesNotMatch(folded.text,/DONE_HIDE|DROP_HIDE/);
   assert.match(folded.text,/Todo \[2\/3\]  done:1 · drop:1/);
   assert.doesNotMatch(folded.text,/─ Closed /);
-  assert.match(folded.text,/─ Empty 0\/0 /);
+  assert.match(folded.text,/─ II\. Empty 0\/0 /);
   assert.equal(Object.keys(folded.phaseRanges).length,2);
-  assert.match(expanded.text,/─ Closed 2\/2 drop:1 /);
+  assert.match(expanded.text,/─ I\. Closed 2\/2 drop:1 /);
   assert.equal(Object.keys(expanded.phaseRanges).length,3);
   assert.match(expanded.text,/DONE_HIDE/);assert.match(expanded.text,/DROP_HIDE/);
   assert.ok(expanded.bodyLines.length>folded.bodyLines.length);
@@ -216,7 +216,7 @@ test('reference hierarchy emphasizes active work and exposes body-relative click
   assert.ok(frame.bodyLines[done.start].startsWith('\x1b[9;2;32m'));
   assert.equal(frame.lines[frame.bodyStart + active.start - frame.scroll], frame.bodyLines[active.start]);
   // Phases are separated by their own divider title row, not by a blank row.
-  assert.match(stripVTControlCharacters(frame.bodyLines[phase.start]), /^─ Open 0\/2 ─/);
+  assert.match(stripVTControlCharacters(frame.bodyLines[phase.start]), /^─ II\. Open 0\/2 ─/);
   assert.equal(renderFrame(project([]), { color: false }).closedRange, null);
 });
 
@@ -237,19 +237,19 @@ test('following pins the phase holding current work to the first body row', () =
     { name: 'Now', tasks: [{ content: 'N1', status: 'completed' }, { content: 'N2', status: 'in_progress' }] },
     { name: 'Next', tasks: [{ content: 'X1', status: 'pending' }] }]);
   const followed = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true, revealTarget: true });
-  assert.match(followed.lines[followed.bodyStart], /─ Now /);
+  assert.match(followed.lines[followed.bodyStart], /─ II\. Now /);
   assert.ok(followed.lines.includes(followed.bodyLines[followed.taskRanges[snapshot.target.key].start]));
   assert.ok(followed.lines.some(line => line.startsWith('[•] N2')));
   assert.ok(followed.lines.some(line => line.includes('X1')));
   const paused = renderFrame(snapshot, { columns: 40, rows: 12, color: false, completedExpanded: true });
-  assert.match(paused.lines[paused.bodyStart], /─ Done /);
+  assert.match(paused.lines[paused.bodyStart], /─ I\. Done /);
 });
 
 test('a phase longer than the pane keeps its title on top while the current work scrolls under it', () => {
   const snapshot = project([{ name: 'Long', tasks: Array.from({ length: 20 }, (_, index) => ({
     content: `ROW_${index}`, status: index === 15 ? 'in_progress' : 'pending' })) }]);
   const frame = renderFrame(snapshot, { columns: 40, rows: 10, color: false, revealTarget: true });
-  assert.match(frame.lines[frame.bodyStart], /─ Long /);
+  assert.match(frame.lines[frame.bodyStart], /─ I\. Long /);
   assert.equal(frame.lines[frame.bodyStart + 1], frame.bodyLines[frame.taskRanges[snapshot.target.key].start]);
   assert.match(frame.lines[frame.bodyStart + 1], /^\[•\] ROW_15/);
   assert.ok(!frame.lines.some(line => /ROW_0\b/.test(line)));
@@ -324,6 +324,76 @@ test('wrapped task continuations keep the four-cell text inset', () => {
     // Wrap points may replace a separator space with the line break; no other character may change.
     const joined = `${rows[0].slice(4)}${rows.slice(1).map(row => row.slice(4)).join('')}`.replace(/\s+/g, '');
     assert.equal(joined, content.replace(/\s+/g, ''), `task text survives wrapping at ${columns}`);
+  }
+});
+
+test('phase dividers carry the original uppercase Roman ordinal with the unchanged counter', () => {
+  const phases = [
+    { name: '계획 준비', tasks: [{ content: 'KEEP_DONE', status: 'completed' },
+      { content: 'KEEP_OPEN', status: 'pending' }] },
+    { name: 'Second', tasks: [{ content: 'S2', status: 'pending' }] },
+    { name: 'Third', tasks: [{ content: 'S3', status: 'pending' }] },
+    { name: 'Fourth', tasks: [{ content: 'S4', status: 'pending' }] },
+    { name: 'Fifth', tasks: [{ content: 'S5', status: 'pending' }] },
+    { name: 'Sixth', tasks: [{ content: 'S6', status: 'pending' }] },
+    { name: 'Seventh', tasks: [{ content: 'S7', status: 'pending' }] },
+    { name: 'Eighth', tasks: [{ content: 'S8', status: 'pending' }] },
+    { name: 'Ninth', tasks: [{ content: 'S9', status: 'pending' }] },
+  ];
+  const snapshot = project(phases);
+  const frame = renderFrame(snapshot, { columns: 80, rows: 40, color: false, completedExpanded: true });
+  assert.match(frame.text, /─ I\. 계획 준비 1\/2 /);
+  assert.match(frame.text, /─ II\. Second 0\/1 /);
+  assert.match(frame.text, /─ III\. Third 0\/1 /);
+  assert.match(frame.text, /─ IV\. Fourth 0\/1 /);
+  assert.match(frame.text, /─ IX\. Ninth 0\/1 /);
+  assert.deepEqual(snapshot.counts,
+    { total: 10, closed: 1, open: 9, completed: 1, dropped: 0, inProgress: 0, pending: 9 });
+  assert.deepEqual(snapshot.phases.map(phase => phase.name), phases.map(phase => phase.name));
+});
+
+test('hiding, folding, following or scrolling earlier phases does not renumber the remaining ones', () => {
+  const snapshot = project([
+    { name: 'Done first', tasks: [{ content: 'DONE_FIRST', status: 'completed' }] },
+    { name: 'Live second', tasks: [{ content: 'LIVE_SECOND', status: 'in_progress' }] },
+    { name: 'Third', tasks: [{ content: 'THIRD_TASK', status: 'pending' }] },
+  ]);
+  const keys = snapshot.phaseSummaries.map(summary => summary.key);
+  const folded = renderFrame(snapshot, { columns: 80, rows: 20, color: false });
+  assert.doesNotMatch(folded.text, /─ I\. Done first/);
+  assert.match(folded.text, /─ II\. Live second 0\/1 /);
+  assert.match(folded.text, /─ III\. Third 0\/1 /);
+  assert.deepEqual(Object.keys(folded.phaseRanges), [keys[1], keys[2]]);
+  const followed = renderFrame(snapshot, { columns: 80, rows: 20, color: false, revealTarget: true });
+  assert.match(followed.text, /─ II\. Live second 0\/1 /);
+  const expanded = renderFrame(snapshot, { columns: 80, rows: 20, color: false, completedExpanded: true, scroll: 0 });
+  assert.match(expanded.text, /─ I\. Done first 1\/1 /);
+  assert.match(expanded.text, /─ II\. Live second 0\/1 /);
+  const scrolled = renderFrame(snapshot, { columns: 80, rows: 8, color: false, completedExpanded: true, scroll: 0 });
+  assert.match(scrolled.lines[scrolled.bodyStart], /─ I\. Done first 1\/1 /);
+  assert.deepEqual(snapshot.phaseSummaries.map(summary => summary.key), keys);
+  assert.equal(snapshot.counts.closed, 1);
+  assert.equal(snapshot.target.key, snapshot.phaseSummaries[1].taskKeys[0]);
+});
+
+test('narrow dividers keep the ordinal and counter while the long name truncates first', () => {
+  const longName = '계획 준비 및 검증을 위한 아주 긴 단계 이름입니다';
+  const snapshot = project([
+    { name: 'Closed', tasks: [{ content: 'DONE', status: 'completed' }] },
+    { name: longName, tasks: [{ content: 'P1', status: 'pending' }, { content: 'P2', status: 'pending' },
+      { content: 'C1', status: 'completed' }] },
+  ]);
+  for (const columns of [54, 25]) {
+    const frame = renderFrame(snapshot, { columns, rows: 12, color: false });
+    const heading = frame.bodyLines.find(line => line.includes('II.'));
+    assert.ok(heading, `the second phase heading renders at ${columns}`);
+    const plain = stripVTControlCharacters(heading);
+    assert.match(plain, /─ II\. /);
+    assert.match(plain, / 1\/3/);
+    assert.ok(fixtureCells(plain) <= columns, `heading fits ${columns}: ${JSON.stringify(plain)}`);
+    assert.ok(plain.includes('~'), `the name is truncated first at ${columns}: ${JSON.stringify(plain)}`);
+    assert.ok(!plain.includes(longName));
+    for (const line of frame.lines) assert.ok(fixtureCells(line) <= columns, JSON.stringify(line));
   }
 });
 

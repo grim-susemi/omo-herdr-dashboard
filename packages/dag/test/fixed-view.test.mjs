@@ -151,16 +151,21 @@ test('completed ordinary roots shrink to unboxed summaries while manual expansio
   assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 3);
 });
 
-test('completed group keeps canonical counts and selected hidden summary reachable', () => {
+test('completed history keeps canonical counts and every root reachable', () => {
   const sample = { connected: true, runs: [], tasks: Array.from({ length: 9 }, (_, i) => ({ id: String(i), status: 'completed', description: 'DONE_'+i })) };
   const original = structuredClone(sample);
   const folded = renderFixedFrame(sample, { columns: 80, rows: 60, color: false }, 'tasks');
   const selected = renderFixedFrame(sample, { columns: 80, rows: 60, color: false, selectedTaskId: '8', revealSelection: true }, 'tasks');
   const opened = renderFixedFrame(sample, { columns: 80, rows: 60, color: false, completedExpanded: true }, 'tasks');
-  assert.equal(Object.keys(folded.taskRanges).length, 0);
-  assert.equal(Object.keys(selected.taskRanges).length, 1);
+  const ids = Object.keys(folded.taskRanges);
+  assert.equal(ids.length, 9);
+  const plain = stripVTControlCharacters(folded.text);
+  assert.match(plain, /\[9\/9\]/);
+  assert.match(plain, /Completed tasks \(9\)/);
+  assert.match(plain, /History \(9\)/);
+  assert.deepEqual(Object.keys(selected.taskRanges), ids);
   assert.match(selected.text, /DONE_8/);
-  assert.equal(Object.keys(opened.taskRanges).length, 9);
+  assert.deepEqual(Object.keys(opened.taskRanges), ids);
   for (const r of Object.values(opened.taskRanges)) assert.equal(r.end-r.start,1);
   assert.deepEqual(sample, original);
 });

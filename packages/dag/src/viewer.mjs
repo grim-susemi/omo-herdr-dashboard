@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
-import { completedTasks, fit, renderFrame, runningTarget, standaloneTasks } from './render.mjs';
+import { completedTasks, defaultTaskId, renderFrame, runningTarget, workersSections } from './render.mjs';
 import { readJson } from './storage.mjs';
 import { TASK_SCOPE, emptyViewState, isExpanded, loadViewState, saveViewState, setExpanded } from './view-state.mjs';
 
@@ -19,6 +19,10 @@ export function renderFixedFrame(state, options, view) {
 const controlKeys = ['token', 'ownerKey', 'sessionId', 'scopeEpoch', 'role', 'launchToken', 'paneId', 'statePath'];
 const sameControl = (a, b) => a?.v === 1 && b?.v === 1 && controlKeys.every(key => a[key] === b[key]);
 const sameScope = (a, b) => a && b && ['ownerKey', 'sessionId', 'scopeEpoch'].every(key => a[key] === b[key]);
+const samePath = (a, b) => {
+  const left = resolve(a), right = resolve(b);
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+};
 function receive(socket, callback) {
   socket.setEncoding('utf8');
   let buffer = '';
@@ -104,7 +108,7 @@ let scroll = 0, error = '', timer, drawing = false, again = false;
 let viewState = emptyViewState(state?.sessionId), viewError = '', saving = Promise.resolve(), closing = false;
 const selectedNodes = new Map();
 let revealSelection = false, verbose = false, detailSelection, completedExpanded = false;
-let follow = true, target, lastFrame, dragY, disposeFocus;
+let follow = true, target, lastFrame, dragY, disposeFocus, scrollAnchor;
 let presenceClient, presenceMessage, presenceKey, controlKey, presenceNotice = '';
 let retirementServer;
 const retirementSockets = new Set();
@@ -153,11 +157,21 @@ function bindPresence() {
 function selectableRuns() { return state?.runs ?? []; }
 async function restorePreferences() {
   const scope = fixedView ? state : undefined;
-  try { viewState = await loadViewState(file, state?.sessionId, scope); viewError = ''; }
+  try {
+    // A managed state names its own preference sidecar. Accept that exact path
+    // only, so a foreign or rekeyed conversation cannot lend its detail state.
+    if (fixedView && state?.prefsPath !== undefined &&
+      (typeof state.prefsPath !== 'string' || !samePath(state.prefsPath, `${file}.view.json`)))
+      throw new Error('Foreign DAG view preferences.');
+    viewState = await loadViewState(file, state?.sessionId, scope); viewError = '';
+  }
   catch (cause) { viewState = emptyViewState(state?.sessionId, scope); viewError = cause.message; }
   const navigation = viewState.navigation;
   follow = true;
   scroll = navigation?.scroll ?? 0;
+  const anchorOffset = Number.isSafeInteger(navigation?.scrollOffset) ? navigation.scrollOffset : 0;
+  scrollAnchor = typeof navigation?.scrollTaskId === 'string' ?
+    { id: navigation.scrollTaskId, offset: anchorOffset, candidates: [navigation.scrollTaskId] } : undefined;
   view = fixedView ?? navigation?.view ?? view;
   selectedId = navigation?.selectedId ?? selectedId;
   selectedTaskId = navigation?.selectedTaskId;
@@ -169,9 +183,10 @@ await restorePreferences();
 const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
 function draw() {
   if (closing) return;
+  const sections = workersSections(state);
   if (interactive) animation.update(state);
   if (!error) target = runningTarget(!fixedView ? state : fixedView === 'dag' ?
-    { ...state, tasks: [] } : { ...state, runs: [], tasks: standaloneTasks(state) }, target);
+    { ...state, tasks: [] } : { ...state, runs: [], tasks: sections.roots }, target);
   const running = !error && follow && state?.connected ? target : undefined;
   if (running) {
     if (view !== running.view || running.view === 'dag' && selectedId !== running.runId) scroll = 0;
@@ -182,18 +197,38 @@ function draw() {
   if (runIndex < 0) { runIndex = 0; selectedId = state?.runs?.[0]?.id; }
   const run = state?.runs?.[runIndex];
   if (!fixedView && !state?.runs?.length) view = 'tasks';
-  const roots = standaloneTasks(state);
-  if (!roots.some(task => task.id === selectedTaskId)) selectedTaskId = roots[0]?.id;
+  const roots = sections.roots;
+  if (!roots.some(task => task.id === selectedTaskId)) selectedTaskId = defaultTaskId(state, roots);
+  if (scrollAnchor &&
+    ![scrollAnchor.id, ...(scrollAnchor.candidates ?? [])].some(id => roots.some(task => task.id === id)))
+    scrollAnchor = undefined;
   if (!run?.nodes.some(node => node.id === selectedNodes.get(selectedId))) selectedNodes.set(selectedId, run?.nodes[0]?.id);
   const selection = JSON.stringify([state?.sessionId, view, view === 'tasks' ? null : selectedId,
     view === 'tasks' ? selectedTaskId : selectedNodes.get(selectedId)]);
   if (selection !== detailSelection) { verbose = false; detailSelection = selection; }
+  // With no execution target, Follow ON pins the newest history card. Passing
+  // its range through the existing runningTaskId seam keeps the viewport follow
+  // behavior in render.mjs untouched.
+  const followHistoryId = !running && !error && follow && state?.connected && view === 'tasks' ?
+    sections.history.at(-1)?.id : undefined;
   const options = { columns: process.stdout.columns ?? 54, rows: process.stdout.rows ?? 48, runIndex, scroll, color: interactive,
     offline: Boolean(presenceKey && !presenceMessage),
     error, notice: viewError ? t(state?.language, 'viewError', { error: viewError }) : presenceNotice, completedExpanded,
     selectedNodeId: selectedNodes.get(selectedId), selectedTaskId, view, viewState, verbose, revealSelection, follow,
-    runningNodeId: running?.nodeId, runningTaskId: running?.taskId, frame: animation.frame, now: clock.now() };
-  const result = fixedView ? renderFixedFrame(state, options, fixedView) : renderFrame(state, options);
+    runningNodeId: running?.nodeId, runningTaskId: running?.taskId ?? followHistoryId, frame: animation.frame, now: clock.now() };
+  const render = () => fixedView ? renderFixedFrame(state, options, fixedView) : renderFrame(state, options);
+  let result = render();
+  // The task ranges are produced by the same ordered body. Resolve the manual
+  // anchor to its task start plus the within-card offset; relayout only when
+  // that row moved (arrivals/removals above it). A metrics-only update resolves
+  // to the exact same row and keeps the visible window unchanged.
+  if (!follow && !revealSelection && view === 'tasks' && scrollAnchor) {
+    const anchored = scrollForAnchor(scrollAnchor, result.taskRanges);
+    if (anchored !== undefined && result.scroll !== anchored) {
+      options.scroll = anchored;
+      result = render();
+    }
+  }
   lastFrame = result;
   scroll = result.scroll;
   const frame = result.text;
@@ -206,6 +241,36 @@ function draw() {
     client.write(`${JSON.stringify({ type: 'ack', v: offer.v, token: offer.token, ownerKey: offer.ownerKey,
       sessionId: offer.sessionId, scopeEpoch: offer.scopeEpoch, role, sequence: message.sequence })}\n`);
   });
+}
+// A manual scroll is anchored to the task under the viewport top plus the row
+// offset inside that card, not to an absolute row that arrivals above it would
+// silently replace. Candidates preserve the nearest surviving anchor if the
+// primary card disappears.
+function scrollForAnchor(anchor, ranges) {
+  const primary = ranges?.[anchor.id];
+  if (primary) {
+    const offset = Math.min(anchor.offset, Math.max(0, primary.end - primary.start - 1));
+    return Math.max(0, primary.start + offset);
+  }
+  for (const id of anchor.candidates ?? []) {
+    const range = ranges?.[id];
+    if (range) return range.start;
+  }
+  return undefined;
+}
+function captureScrollAnchor() {
+  const ranges = view === 'tasks' ? lastFrame?.taskRanges : undefined;
+  if (!ranges) return undefined;
+  const entries = Object.entries(ranges);
+  if (!entries.length) return undefined;
+  const within = entries.findIndex(([, range]) => scroll >= range.start && scroll < range.end);
+  const index = within >= 0 ? within : entries.findIndex(([, range]) => range.end > scroll);
+  if (index < 0) return undefined;
+  const [id, range] = entries[index];
+  const ids = entries.map(([taskId]) => taskId);
+  const candidates = [...new Set([...ids.slice(index, index + 4),
+    ...ids.slice(Math.max(0, index - 2), index).reverse()])];
+  return { id, offset: scroll - range.start, candidates };
 }
 async function refresh() {
   if (drawing) { again = true; return; }
@@ -220,7 +285,7 @@ async function refresh() {
       readGrace.clear(); state = next; error = '';
       if (sessionChanged) {
         await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0;
-        selectedId = state?.runs?.[0]?.id; completedExpanded = false;
+        selectedId = state?.runs?.[0]?.id; completedExpanded = false; scrollAnchor = undefined;
         follow = true; target = undefined; revealSelection = false;
         view = fixedView ?? (state?.runs?.length ? 'dag' : 'tasks');
         await restorePreferences();
@@ -282,10 +347,15 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   const key = pressed.sequence || pressed.name || text;
   if (key === 'q' || key === '\x03' || key === '\x04') return void close(true);
   let manual = false, movedScroll = false, movedSelection = false;
-  if (key === 'f') { follow = !follow; revealSelection = false; }
+  if (key === 'f') {
+    follow = !follow;
+    revealSelection = false;
+    scrollAnchor = follow ? undefined : captureScrollAnchor();
+  }
   if (['\x1b[B', 'j', '\x1b[A', 'k', '\x1b[6~', '\x1b[5~'].includes(key)) {
     follow = false; revealSelection = false;
     manual = movedScroll = true;
+    scrollAnchor = undefined;
   }
   if (key === '\x1b[B' || key === 'j') scroll++;
   if (key === '\x1b[A' || key === 'k') scroll = Math.max(0, scroll - 1);
@@ -295,14 +365,14 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     follow = false;
     manual = movedSelection = true;
     view = view === 'dag' ? 'tasks' : 'dag';
-    scroll = 0; revealSelection = true;
+    scroll = 0; revealSelection = true; scrollAnchor = undefined;
   }
   if ((key === 'c' || pressed.name === 'c') && (view === 'tasks' ? completedTasks(state).length :
       (state?.runs?.length ?? 0) > 1)) {
     follow = false;
     manual = movedSelection = true;
     completedExpanded = !completedExpanded;
-    scroll = 0; revealSelection = true;
+    scroll = 0; revealSelection = true; scrollAnchor = undefined;
   }
   if ((!fixedView || view === 'dag') && (key === '\x1b[C' || key === '\x1b[D')) {
     follow = false;
@@ -311,15 +381,16 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     const current = Math.max(0, runs.findIndex(run => run.id === selectedId));
     selectedId = runs[(current + (key === '\x1b[C' ? 1 : -1) + runs.length) % runs.length]?.id;
     if (runs.length) view = fixedView ?? 'dag';
-    scroll = 0; revealSelection = false;
+    scroll = 0; revealSelection = false; scrollAnchor = undefined;
   }
   const run = state?.runs?.find(run => run.id === selectedId);
-  const items = view === 'tasks' ? standaloneTasks(state) : run?.nodes ?? [];
+  const items = view === 'tasks' ? workersSections(state).roots : run?.nodes ?? [];
   const scope = view === 'tasks' ? TASK_SCOPE : run?.id;
   const itemId = view === 'tasks' ? selectedTaskId : selectedNodes.get(selectedId);
   if (items.length && (pressed.name === 'tab' || key === 'n' || key === 'p')) {
     follow = false;
     manual = movedSelection = true;
+    scrollAnchor = undefined;
     const current = Math.max(0, items.findIndex(item => item.id === itemId));
     const direction = pressed.shift || key === 'p' ? -1 : 1;
     const nextId = items[(current + direction + items.length) % items.length].id;
@@ -330,6 +401,7 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   if (items.length && key === 'd') {
     follow = false;
     manual = true;
+    scrollAnchor = undefined;
     // A temporary detail peek never writes or replaces the saved fold state.
     verbose = !verbose;
     revealSelection = true;
@@ -337,6 +409,7 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   if (items.length && (key === ' ' || key === '\r' || key === '\n')) {
     follow = false;
     manual = true;
+    scrollAnchor = undefined;
     verbose = false;
     const item = items.find(item => item.id === itemId);
     const status = view === 'tasks' ? item.status : item.state;
@@ -344,10 +417,21 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     revealSelection = true;
   }
   draw();
+  if (follow) scrollAnchor = undefined;
+  else if (view === 'tasks') scrollAnchor = captureScrollAnchor();
   if (manual || key === 'f') {
     viewState.navigation ??= { follow };
     viewState.navigation.follow = follow;
-    if (movedScroll || movedSelection) viewState.navigation.scroll = scroll;
+    if (movedScroll || movedSelection) {
+      viewState.navigation.scroll = scroll;
+      if (view === 'tasks' && scrollAnchor) {
+        viewState.navigation.scrollTaskId = scrollAnchor.id;
+        viewState.navigation.scrollOffset = scrollAnchor.offset;
+      } else if (view === 'tasks') {
+        delete viewState.navigation.scrollTaskId;
+        delete viewState.navigation.scrollOffset;
+      }
+    }
     if (movedSelection) {
       viewState.navigation.view = view;
       viewState.navigation.selectedId = selectedId;
@@ -365,16 +449,16 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   }
 }, focus: focused => {
   if (focused || closing) return;
-  dragY = undefined; follow = true; revealSelection = false; verbose = false;
+  dragY = undefined; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined;
   draw();
 }, pointer: mouse => {
   if (closing) return;
   if (mouse.release) { dragY = undefined; return; }
   if (mouse.button & 64) {
-    follow = false; revealSelection = false;
+    follow = false; revealSelection = false; scrollAnchor = undefined;
     scroll = Math.max(0, scroll + (mouse.button & 1 ? 3 : -3));
   } else if ((mouse.button & 3) === 0) {
-    follow = false; revealSelection = false;
+    follow = false; revealSelection = false; scrollAnchor = undefined;
     if (mouse.button & 32) {
       if (dragY !== undefined) scroll = Math.max(0, scroll + dragY - mouse.y);
     } else {
@@ -389,7 +473,7 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
         const id = hit[0];
         if (view === 'tasks') selectedTaskId = id;
         else selectedNodes.set(selectedId, id);
-        const item = view === 'tasks' ? standaloneTasks(state).find(item => item.id === id) :
+        const item = view === 'tasks' ? workersSections(state).roots.find(item => item.id === id) :
           state.runs?.find(run => run.id === selectedId)?.nodes.find(item => item.id === id);
         if (item) setExpanded(viewState, view === 'tasks' ? TASK_SCOPE : selectedId, id,
           !isExpanded(viewState, view === 'tasks' ? TASK_SCOPE : selectedId, id, item.status ?? item.state));
@@ -398,10 +482,11 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     dragY = mouse.y;
   } else return;
   draw();
+  if (!follow && view === 'tasks') scrollAnchor = captureScrollAnchor();
 } });
 disposeFocus = await watchHerdrFocus(paneId ?? process.env.HERDR_PANE_ID, () => {
   if (closing) return;
-  dragY = undefined; follow = true; revealSelection = false; verbose = false; draw();
+  dragY = undefined; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined; draw();
 }, cause => { presenceNotice = `Focus: ${cause.message}`; draw(); })
   .catch(cause => { presenceNotice = `Focus: ${cause.message}`; return () => {}; });
 process.on('SIGTERM', () => { void close(); }); process.on('SIGINT', () => { void close(); }); process.on('SIGHUP', () => { void close(); });

@@ -845,3 +845,259 @@ test('fixed dag viewer ACKs a painted waiting presence snapshot (no native Todo)
   child.stdin.write('q');
   assert.equal((await exited)[0], 0, stderr);
 });
+
+// The Windows PTY bridge needs node-pty, which this worktree intentionally does
+// not install. These cases still drive the real viewer key handler in a child
+// process through a fake TTY; frames are bounded renderer output, not native panes.
+const interactiveShim = (columns, rows) => `data:text/javascript,${encodeURIComponent(
+  'for (const stream of [process.stdin, process.stdout]) ' +
+  "Object.defineProperty(stream, 'isTTY', { value: true, configurable: true });" +
+  `Object.defineProperty(process.stdout, 'columns', { value: ${columns}, configurable: true });` +
+  `Object.defineProperty(process.stdout, 'rows', { value: ${rows}, configurable: true });` +
+  'process.stdin.setRawMode = () => process.stdin;')}`;
+
+function openInteractiveViewer(file, t, options = [], { rows = 26, columns = 80 } = {}) {
+  const events = new EventEmitter();
+  const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file, ...options];
+  const child = spawn(process.execPath, ['--import', interactiveShim(columns, rows), ...viewerArgs],
+    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, HERDR_ENV: '0' } });
+  let buffer = '', stderr = '', lastFrame = '', lastRaw = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', data => { stderr += data; });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', data => {
+    buffer += data;
+    while (true) {
+      const start = buffer.indexOf('\x1b[H');
+      if (start < 0) { if (buffer.length > 2) buffer = buffer.slice(-2); return; }
+      if (start > 0) buffer = buffer.slice(start);
+      const body = buffer.slice(3), next = body.indexOf('\x1b[H');
+      const rawFrame = next >= 0 ? body.slice(0, next) : body;
+      if (next < 0 && !(rawFrame.endsWith('\x1b[K') && rawFrame.split('\x1b[K').length - 1 >= rows)) return;
+      buffer = next >= 0 ? buffer.slice(3 + next) : '';
+      if (!rawFrame) { if (next < 0) return; continue; }
+      const text = stripVTControlCharacters(rawFrame.replaceAll('\x1b[K\r\n', '\n').replace(/\x1b\[K$/, ''));
+      lastFrame = text;
+      lastRaw = rawFrame;
+      events.emit('frame', text, rawFrame);
+      if (next < 0) return;
+    }
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+      child.stdin.end();
+      try { await exited; } catch { child.kill(); await once(child, 'exit').catch(() => {}); }
+    }
+  });
+  const send = keys => child.stdin.write(keys);
+  function frame(predicate, action = () => {}, { raw: keepRaw = false, current = false } = {}) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error(`interactive frame timeout\n${lastFrame}\nRAW ${JSON.stringify(lastRaw.slice(0, 4000))}\n${stderr}`)), 8000);
+      const onFrame = (text, raw) => { if (predicate(text, raw)) finish(null, keepRaw ? { text, raw } : text); };
+      const onExit = code => finish(new Error(`Viewer exited ${code}: ${stderr}\n${lastFrame}`));
+      function finish(error, text) {
+        clearTimeout(timer); events.off('frame', onFrame); child.off('exit', onExit);
+        if (error) reject(error); else resolve(text);
+      }
+      events.on('frame', onFrame); child.on('exit', onExit);
+      if (current && lastFrame && predicate(lastFrame, lastRaw)) { finish(null, keepRaw ? { text: lastFrame, raw: lastRaw } : lastFrame); return; }
+      Promise.resolve().then(action).catch(finish);
+    });
+  }
+  return { frame, send, async close() {
+    const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+    send('q');
+    try { assert.equal((await exited)[0], 0, stderr); }
+    catch (error) { child.kill(); throw error; }
+  } };
+}
+
+test('Workers metrics-only refresh preserves the Follow OFF row window and a surviving anchor offset', { timeout: 35000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'workers-anchor-offset-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'role.json');
+  const tasks = Array.from({ length: 40 }, (_, index) => historyTask(index));
+  Object.assign(tasks[0], { agent: 'worker', model: 'MODEL_0', turns: 2 });
+  Object.assign(tasks[6], { agent: 'worker', model: 'MODEL_6', turns: 2 });
+  const state = { sessionId: 'workers-anchor-offset', connected: true, language: 'en', runs: [], tasks };
+  await writeJson(file, state);
+  await writeJson(`${file}.view.json`, { version: 1, sessionId: state.sessionId,
+    expanded: { '[null,"st_h000"]': true, '[null,"st_h006"]': true },
+    navigation: { follow: false, selectedTaskId: 'st_h000' } });
+  const viewer = openInteractiveViewer(file, t, [], { rows: 12, columns: 80 });
+  await viewer.frame(text => text.includes(messages.en.followOn), () => {}, { current: true });
+  await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send('f'));
+  await viewer.frame(text => /1–8\/46/.test(text) && text.includes(messages.en.followOff),
+    () => viewer.send('\x1b[5~'.repeat(10)));
+  await viewer.frame(text => /3–10\/46/.test(text) && text.includes(messages.en.followOff), () => viewer.send('jj'));
+
+  // Identical IDs/order/card membership and card height: only a metric value changes.
+  state.tasks[0].turns = 9;
+  const updated = await viewer.frame(text => text.includes('9 turns') && text.includes(messages.en.followOff),
+    () => writeJson(file, state));
+  assert.match(updated, /3–10\/46/, 'metrics-only refresh must keep the exact visible row window');
+
+  // Move to a row inside a later card, then remove an earlier compact card.
+  const anchorSaved = preferenceWritten(file, value => value.navigation?.scrollTaskId === 'st_h006' &&
+    value.navigation?.scrollOffset === 1, () => {});
+  await viewer.frame(text => /12–19\/46/.test(text) && text.includes(messages.en.followOff),
+    () => viewer.send('j'.repeat(9)));
+  const saved = await anchorSaved;
+  assert.equal(saved.navigation.scrollOffset, 1, 'the within-card offset is persisted with the anchor');
+  state.tasks.splice(1, 1);
+  const removed = await viewer.frame(text => text.includes('[39/39]') && text.includes(messages.en.followOff),
+    () => writeJson(file, state));
+  assert.match(removed, /11–18\/45/, 'the surviving anchor keeps its offset instead of jumping to the top');
+  assert.doesNotMatch(removed, /1–8\//);
+  state.tasks.splice(state.tasks.findIndex(task => task.id === 'st_h006'), 1);
+  const fallback = await viewer.frame(text => text.includes('[38/38]') && text.includes(messages.en.followOff),
+    () => writeJson(file, state));
+  assert.match(fallback, /HISTORY_007/, 'the nearest surviving candidate becomes the anchor');
+  assert.doesNotMatch(fallback, /1–8\//);
+  await viewer.close();
+});
+
+const historyAt = index => new Date(Date.parse('2026-10-01T00:00:00Z') + index * 60000).toISOString();
+const historyTask = index => ({ id: `st_h${String(index).padStart(3, '0')}`, status: 'completed',
+  createdAt: historyAt(index), description: `HISTORY_${String(index).padStart(3, '0')}` });
+
+// Renderer fixtures below are text frames produced by the real viewer process;
+// they are not native live pane captures.
+test('real Workers navigation reaches oldest, middle and newest of 127 roots and keeps the manual anchor across arrivals', { timeout: 40000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'workers-nav-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'role.json');
+  const state = { sessionId: 'workers-navigation', connected: true, language: 'en', runs: [],
+    tasks: Array.from({ length: 127 }, (_, index) => historyTask(index)) };
+  await writeJson(file, state);
+  const viewer = openInteractiveViewer(file, t);
+
+  const followed = await viewer.frame(text => text.includes('HISTORY_126') && text.includes(messages.en.followOn),
+    () => {}, { current: true });
+  assert.match(followed, /\[127\/127\]/);
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ HISTORY_126') && text.includes(messages.en.followOff),
+    () => viewer.send('p'));
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ HISTORY_000') && text.includes(messages.en.followOff),
+    () => viewer.send('n'));
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ HISTORY_063') && text.includes(messages.en.followOff),
+    () => viewer.send('n'.repeat(63)));
+  const detail = await viewer.frame(text => text.includes('Completed tasks (127)') && text.includes(messages.en.followOff),
+    () => viewer.send('c'));
+  assert.match(detail, /\[127\/127\]/, 'detail depth must not change root membership');
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ HISTORY_063') && text.includes(messages.en.followOff),
+    () => viewer.send('c'));
+
+  await viewer.frame(text => text.includes('HISTORY_126') && text.includes(messages.en.followOn), () => viewer.send('f'));
+  state.tasks.push({ ...historyTask(999), id: 'st_h999', description: 'HISTORY_999' });
+  await viewer.frame(text => text.includes('HISTORY_999') && text.includes(messages.en.followOn),
+    () => writeJson(file, state), { current: true });
+  state.tasks.push({ id: 'st_run', status: 'running', createdAt: historyAt(1001),
+    description: 'RUNNING_HANDOFF' });
+  await viewer.frame((text) => spinnerFrames.some(glyph => text.includes(`${glyph} RUNNING_HANDOFF`)) &&
+    text.includes(messages.en.followOn), () => writeJson(file, state), { current: true });
+  state.tasks.find(task => task.id === 'st_run').status = 'completed';
+  await viewer.frame(text => text.includes('✓ ▸ RUNNING_HANDOFF') && text.includes(messages.en.followOn),
+    () => writeJson(file, state), { current: true });
+  const paused = await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send('f'));
+  const firstStart = Number(/(\d+)–(\d+)\/(\d+)/.exec(paused)?.[1]);
+  assert.ok(Number.isSafeInteger(firstStart));
+  const moved = await viewer.frame(text => {
+    const match = /(\d+)–(\d+)\/(\d+)/.exec(text);
+    return match && Number(match[1]) < firstStart;
+  }, () => viewer.send('kk'));
+  const anchor = /HISTORY_\d{3}/.exec(moved)?.[0];
+  assert.ok(anchor);
+  state.tasks.unshift({ id: 'st_newtop', status: 'running', createdAt: historyAt(1000), description: 'NEWTOP' });
+  const anchored = await viewer.frame(text => text.includes(anchor) && !text.includes('NEWTOP') &&
+    text.includes(messages.en.followOff), () => writeJson(file, state), { current: true });
+  assert.ok(anchored.includes(anchor), 'the manually anchored history row stays at the viewport top');
+  await viewer.close();
+  const saved = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
+  assert.equal(saved.navigation.follow, false);
+  assert.equal(saved.navigation.selectedTaskId, 'st_h063');
+  assert.equal(typeof saved.navigation.scrollTaskId, 'string');
+  assert.ok(state.tasks.some(task => task.id === saved.navigation.scrollTaskId),
+    'the saved anchor names a still-valid root, not a removed row');
+});
+
+test('Workers selection and one card survive a paused -> running -> completed group move', { timeout: 25000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'workers-move-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'role.json');
+  const state = { sessionId: 'workers-move', connected: true, language: 'en', runs: [], tasks: [
+    { id: 'st_old', status: 'completed', createdAt: historyAt(1), description: 'OLD_DONE' },
+    { id: 'st_move', status: 'paused', createdAt: historyAt(2), description: 'MOVE_ME' },
+  ] };
+  await writeJson(file, state);
+  const viewer = openInteractiveViewer(file, t);
+  await viewer.frame((text, raw) => selectedTitle(raw, 'Ⅱ ▸ MOVE_ME') && text.includes(messages.en.followOff),
+    () => viewer.send('p'));
+  state.tasks[1].status = 'running';
+  await viewer.frame((text, raw) => includesRunning(raw, 'MOVE_ME') && text.includes('History (1)') &&
+    text.includes(messages.en.followOff) && (text.match(/MOVE_ME/g) ?? []).length === 1,
+  () => writeJson(file, state), { current: true });
+  state.tasks[1].status = 'completed';
+  state.tasks[1].completedAt = historyAt(3);
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ MOVE_ME') && text.includes('History (2)') &&
+    text.includes(messages.en.followOff) && (text.match(/MOVE_ME/g) ?? []).length === 1,
+  () => writeJson(file, state), { current: true });
+  await viewer.close();
+});
+
+test('Workers replacement binding carries explicit detail state and rejects foreign scope or prefs path', { timeout: 35000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'workers-replace-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'role.json');
+  const sessionId = 'replacement-session';
+  const tasks = [
+    { id: 'st_a', status: 'completed', createdAt: historyAt(1), description: 'EXPANDED_TARGET',
+      agent: 'worker', category: 'visual', model: 'MODEL_A', turns: 2 },
+    { id: 'st_b', status: 'completed', createdAt: historyAt(2), description: 'OTHER_COMPACT', model: 'MODEL_B' },
+  ];
+  const ownerKey = createHash('sha256').update(JSON.stringify(['fixture', 'fixture-parent', sessionId]))
+    .digest('hex').slice(0, 24);
+  const stateFor = ({ paneId, launchToken, scopeEpoch = 1, prefsPath }) => {
+    const value = { schema: 'omo-herdr-dashboard/role/1', version: 1, sessionId, socketPath: 'fixture',
+      parentPaneId: 'fixture-parent', tabId: 'fixture-tab', paneId, launchToken, scopeEpoch, role: 'workers',
+      ownerKey, connected: true, language: 'en', controlOffer: null, presenceOffer: null, runs: [], tasks };
+    if (prefsPath !== undefined) value.prefsPath = prefsPath;
+    return value;
+  };
+  const view = { version: 1, sessionId, ownerKey, scopeEpoch: 1,
+    expanded: { '[null,"st_a"]': true },
+    navigation: { follow: false, scroll: 0, view: 'tasks', selectedTaskId: 'st_a', selectedNodes: [],
+      completedExpanded: false, scrollTaskId: 'st_a' } };
+  await writeJson(`${file}.view.json`, view);
+
+  const first = stateFor({ paneId: 'pane-a', launchToken: 'launch-a', prefsPath: `${file}.view.json` });
+  await writeJson(file, first);
+  let viewer = openInteractiveViewer(file, t, ['--view', 'tasks', '--close-pane', 'pane-a', '--launch-token', 'launch-a']);
+  await viewer.frame((text, raw) => text.includes('MODEL_A') && !text.includes('▸ EXPANDED_TARGET') &&
+    selectedTitle(raw, '✓ EXPANDED_TARGET'), () => {}, { current: true });
+  await viewer.close();
+
+  const replacement = stateFor({ paneId: 'pane-b', launchToken: 'launch-b', prefsPath: `${file}.view.json` });
+  await writeJson(file, replacement);
+  viewer = openInteractiveViewer(file, t, ['--view', 'tasks', '--close-pane', 'pane-b', '--launch-token', 'launch-b']);
+  await viewer.frame((text, raw) => text.includes('MODEL_A') && !text.includes('▸ EXPANDED_TARGET') &&
+    selectedTitle(raw, '✓ EXPANDED_TARGET'), () => {}, { current: true });
+  await viewer.close();
+  assert.deepEqual(JSON.parse(await readFile(`${file}.view.json`, 'utf8')), view,
+    'same-conversation replacement reuses the exact sidecar without a global rekey');
+
+  const foreign = stateFor({ paneId: 'pane-c', launchToken: 'launch-c', scopeEpoch: 2, prefsPath: `${file}.view.json` });
+  await writeJson(file, foreign);
+  viewer = openInteractiveViewer(file, t, ['--view', 'tasks', '--close-pane', 'pane-c', '--launch-token', 'launch-c']);
+  await viewer.frame(text => text.includes('▸ EXPANDED_TARGET') && !text.includes('MODEL_A'),
+    () => {}, { current: true });
+  await viewer.close();
+
+  await writeJson(join(dir, 'foreign.view.json'), view);
+  const pointed = stateFor({ paneId: 'pane-d', launchToken: 'launch-d', prefsPath: join(dir, 'foreign.view.json') });
+  await writeJson(file, pointed);
+  viewer = openInteractiveViewer(file, t, ['--view', 'tasks', '--close-pane', 'pane-d', '--launch-token', 'launch-d']);
+  await viewer.frame(text => text.includes('▸ EXPANDED_TARGET') && !text.includes('MODEL_A'),
+    () => {}, { current: true });
+  await viewer.close();
+});

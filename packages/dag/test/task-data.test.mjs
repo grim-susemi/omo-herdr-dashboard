@@ -28,7 +28,7 @@ test('actual RPC fields normalize to a bounded whitelist with ISO timestamps and
       last_assistant_line: 'LATEST_PROGRESS_EXCERPT', current_tool: 'bash' },
     spawn_spec: { prompt: 'PRIVATE PROMPT' }, final_response: 'PRIVATE OUTPUT' })), {
     id: 'st_root', description: 'Investigate', agent: 'explore', model: 'provider/model', status: 'running',
-    startedAt: '2026-09-06T00:00:00.000Z', progress: '[bash] LATEST_PROGRESS_EXCERPT', turns: 0, toolCalls: 3,
+    createdAt: '2026-09-06T00:00:00.000Z', startedAt: '2026-09-06T00:00:00.000Z', progress: '[bash] LATEST_PROGRESS_EXCERPT', turns: 0, toolCalls: 3,
     reportedAt: '2026-09-06T00:00:01.000Z',
   });
   assert.deepEqual(normalizeTask({ task_id: 'st_missing' }), { id: 'st_missing' });
@@ -164,7 +164,7 @@ test('RPC-first residency snapshot is corrected by the matching durable terminal
   await save(record('st_root', { status: 'completed', terminal_at: '2026-09-06T00:01:00Z',
     updated_at: '2026-09-06T00:10:00Z', residency_state: 'evicted' }));
   const tasks = await data.refresh([]);
-  assert.deepEqual(tasks[0], { ...fallback, startedAt: '2026-09-06T00:00:00.000Z',
+  assert.deepEqual(tasks[0], { ...fallback, createdAt: '2026-09-06T00:00:00.000Z', startedAt: '2026-09-06T00:00:00.000Z',
     completedAt: '2026-09-06T00:01:00.000Z' });
   assert.deepEqual(await data.refresh([]), tasks);
 });

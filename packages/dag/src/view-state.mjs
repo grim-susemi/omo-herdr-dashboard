@@ -18,6 +18,8 @@ export async function loadViewState(stateFile, sessionId, scope) {
       navigation.scroll !== undefined && (!Number.isSafeInteger(navigation.scroll) || navigation.scroll < 0) ||
       navigation.view !== undefined && !['dag', 'tasks'].includes(navigation.view) ||
       ['selectedId', 'selectedTaskId'].some(key => navigation[key] !== undefined && typeof navigation[key] !== 'string') ||
+      navigation.scrollTaskId !== undefined && typeof navigation.scrollTaskId !== 'string' ||
+      navigation.scrollOffset !== undefined && !Number.isSafeInteger(navigation.scrollOffset) ||
       navigation.completedExpanded !== undefined && typeof navigation.completedExpanded !== 'boolean' ||
       navigation.selectedNodes !== undefined && (!Array.isArray(navigation.selectedNodes) ||
         navigation.selectedNodes.some(pair => !Array.isArray(pair) || pair.length !== 2 ||

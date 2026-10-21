@@ -11,6 +11,9 @@ import { displayOwnerKey, installDisplayBridge } from './display-bridge.mjs';
 import { createPresence } from './presence.mjs';
 import { createSnapshotStorage, sameSnapshotScope } from './storage.mjs';
 import { claimParentSlot, cooperativelyReleasedParentSlot, parentSlotPaths, validParentSlot } from './parent-slot.mjs';
+import { assertResult, bindingRevision, CORE_ORDER, createRecoveryCoordinator, deriveLowerBand, protocolError,
+  queryIssues, RECOVERY_SCOPE_KEYS, RECOVERY_V1, sameScope, validScope } from '../../coordination/src/recovery.mjs';
+import { inspectViewerProof, readViewerProof, VIEWER_HEARTBEAT_LIMIT_MS } from '../../coordination/src/proof.mjs';
 
 // The automatic or explicit Todo pass a managed mutation belongs to.
 const passes = new AsyncLocalStorage();
@@ -22,6 +25,13 @@ export const dashboardChannels = Object.freeze({
 });
 export const sameDashboardOwner = (a, b) => a && b &&
   ['socketPath', 'parentPaneId', 'sessionId', 'ownerKey'].every(key => a[key] === b[key]);
+const sameRect = (a, b) => Boolean(a && b) &&
+  ['x', 'y', 'width', 'height'].every(key => a[key] === b[key]);
+// The coordination record's explicit geometry digest is SHA-256 over
+// [paneId, rect], truncated to 16 hex characters. It is recomputed over the
+// record's own rect and accepted only when that rect is the settled cell.
+const collabGeometryDigest = (paneId, rect) => createHash('sha256')
+  .update(JSON.stringify([paneId, rect])).digest('hex').slice(0, 16);
 const lifecycles = globalThis[Symbol.for('omo.herdr.dashboard.lifecycle/2')] ??= new Map();
 export function registerManagedDashboard(pi, { stateDir, environment = process.env, createController }) {
   const root = resolve(stateDir);
@@ -97,6 +107,22 @@ export function registerManagedDashboard(pi, { stateDir, environment = process.e
 const roles = new Set(['todo', 'dag', 'workers']);
 const send = (socket, message) => socket.write(`${JSON.stringify(message)}\n`);
 const pathKey = path => process.platform === 'win32' ? String(path).replaceAll('\\', '/').toLowerCase() : String(path);
+// A journaled effect that has no observed postcondition is unresolved, whatever
+// its kind: it may still land after this verdict, so it can never count as current.
+const effectDetail = effect => `pending ${effect?.kind ?? 'unknown'} effect (EFFECT_UNKNOWN)`;
+// A v1 coordination record predates launch identity. Only the native shell/viewer
+// proof taken immediately before a legacy yield can make it current, and only
+// while that proof is fresh.
+const legacyProofFresh = (record, now) => {
+  const proof = record?.legacyProof;
+  if (!proof || typeof proof !== 'object') return false;
+  if (proof.paneId !== record.paneId || proof.sessionId !== record.sessionId) return false;
+  if (!Number.isSafeInteger(proof.shellPid) || proof.shellPid < 1) return false;
+  if (!Number.isSafeInteger(proof.viewerPid) || proof.viewerPid < 1) return false;
+  if (!Array.isArray(proof.argv) || !proof.argv.length) return false;
+  const at = Date.parse(proof.at ?? '');
+  return Number.isFinite(at) && now - at <= VIEWER_HEARTBEAT_LIMIT_MS && at - now <= VIEWER_HEARTBEAT_LIMIT_MS;
+};
 export const authoritativePaneNotFound = error => error?.code === 'pane_not_found';
 export async function discoverLegacyRecords(root, binding) {
   const directory = await realpath(resolve(root)), paths = [];
@@ -1008,7 +1034,8 @@ export async function canCleanupPane(info, record, inspect) {
 export class TodoPane {
   constructor({ ctx, environment = process.env, stateDir, cwd, node = process.execPath,
     viewer, herdr = createDashboardHerdr(environment), inspectShell, language = 'en', notify = () => {}, managed = false,
-    retirementObservations = new Map(), retireViewer = retireVerifiedViewer, cacheReads = false, clock }) {
+    retirementObservations = new Map(), retireViewer = retireVerifiedViewer, cacheReads = false, clock,
+    readCoordinationRecord, readCoordinationProof }) {
     Object.assign(this, { ctx, environment, stateDir, cwd, node, viewer, herdr: cacheReads ? herdrRead(herdr) : herdr, inspectShell, language, notify, managed, retireViewer, clock });
     this.binding = { socketPath: environment.HERDR_SOCKET_PATH, parentPaneId: environment.HERDR_PANE_ID,
       sessionId: ctx.sessionManager.getSessionId() };
@@ -1045,6 +1072,12 @@ export class TodoPane {
     this.unavailableDiagnosed = false;
     this.retainedTargets = new Map();
     this.closureVersions = new Map();
+    this.lastPanes = null;
+    this.readCoordinationRecord = readCoordinationRecord;
+    this.readCoordinationProof = readCoordinationProof;
+    this.recovery = createRecoveryCoordinator({
+      publish: message => this.pi?.events?.emit(RECOVERY_V1.layout, message),
+    });
   }
   assertManaged() {
     if (this.stopped || this.managedBlocked || this.custodyLost || !this.actor?.leaseHeld || this.actor.draining || this.actor.blocked) {
@@ -1081,6 +1114,25 @@ export class TodoPane {
     });
     this.managedTail = result.catch(() => {});
     return result;
+  }
+  // 11-i: a READY phase is not authority. Completion must also observe, at
+  // verdict time, that the publisher lease and custody are still live; a
+  // snapshot held across an awaited read cannot outlive the authority it
+  // described. Returns the named failure or null when authority is current.
+  completionAuthority() {
+    if (!this.managed) return null;
+    if (this.stopped) return { condition: 'stopped', detail: 'stopped: the controller is stopped' };
+    if (this.managedBlocked)
+      return { condition: 'managed-blocked', detail: 'managed-blocked: managed recovery is blocked' };
+    if (this.custodyLost)
+      return { condition: 'custody-lost', detail: 'custody-lost: the publisher lost original custody' };
+    if (!this.actor?.leaseHeld)
+      return { condition: 'lease-lost', detail: 'lease-lost: the publisher lease is not held' };
+    if (this.actor.draining)
+      return { condition: 'lease-draining', detail: 'lease-draining: the publisher lease is draining' };
+    if (this.actor.blocked)
+      return { condition: 'lease-blocked', detail: 'lease-blocked: the publisher lease is blocked' };
+    return null;
   }
   async managedIdle() { await this.managedTail; }
   async nativePane(paneId, record) {
@@ -1784,11 +1836,347 @@ export class TodoPane {
   }
   async membership(paneId) {
     const panes = (await this.herdr('list'))?.panes ?? [];
+    this.lastPanes = panes;
     const parents = panes.filter(pane => pane.pane_id === this.binding.parentPaneId);
     const matches = panes.filter(pane => pane.pane_id === paneId);
     if (parents.length !== 1 || matches.length !== 1 || !parents[0].tab_id ||
       matches[0].tab_id !== parents[0].tab_id) throw new Error('layout-waiting: missing or ambiguous owned anchor');
     return { pane: matches[0], tabId: parents[0].tab_id };
+  }
+  // The shared scope is the only identity a layout publication or replay may
+  // use. generation is the current slot generation when managed.
+  recoveryScope(tabId = this.claim?.tabId) {
+    return { ownerKey: this.binding.ownerKey, sessionId: this.binding.sessionId,
+      lifetimeId: this.lifetimeId, scopeEpoch: this.scopeEpoch,
+      generation: this.actor?.snapshot?.generation ?? this.publisherScope?.generation ?? 1, tabId };
+  }
+  coordinationRecordPath() {
+    const directory = this.environment.OMO_HERDR_COORDINATION_STATE_DIR;
+    if (!directory) return null;
+    const pane = String(this.binding.parentPaneId).replace(/[^A-Za-z0-9_-]/g, '_');
+    return join(directory, `${pane}.pane.json`);
+  }
+  async scopedCoordinationRecord(tabId) {
+    const { record, proof } = await this.coordinationSnapshot();
+    if (!record?.paneId || record.manualClose === true) return null;
+    if (record.parentPaneId !== this.binding.parentPaneId || record.sessionId !== this.binding.sessionId ||
+      record.tabId && record.tabId !== tabId) return null;
+    // A v2 record is current only while its viewer sidecar proves the exact
+    // launch first paint and a live heartbeat. A stale record is not published
+    // as a Collab cell; coordination may instead assert provenCurrent after it
+    // revalidated the same identity. v1 has no launch identity and remains
+    // legacy-waiting in the coordination controller; its scoped pane is still
+    // the band's leftmost cell until the core proves and yields it.
+    if (record.v === 2) {
+      const now = typeof this.clock === 'function' ? this.clock() : Date.now();
+      const current = inspectViewerProof(record, proof, { now }).ready === true;
+      const asserted = record.provenCurrent === true && record.phase === 'running' && !record.pendingEffect;
+      if (!current && !asserted) return null;
+    }
+    return record;
+  }
+  // The coordination record and its viewer proof are read through the same
+  // injectable readers the layout pass uses. A missing or corrupt read is
+  // absence, never evidence.
+  async coordinationSnapshot() {
+    let record = null, path = null, proof = null;
+    try {
+      path = this.coordinationRecordPath();
+      record = typeof this.readCoordinationRecord === 'function'
+        ? await this.readCoordinationRecord() : path ? await readJson(path) : null;
+    } catch { record = null; } // A corrupt satellite record is absence, never a cell.
+    if (record?.v === 2) {
+      try {
+        if (typeof this.readCoordinationProof === 'function') proof = await this.readCoordinationProof(record, path);
+        else if (path) proof = readViewerProof(path);
+      } catch { proof = null; }
+    }
+    return { record, path, proof };
+  }
+  // 11-d/11-g: 4/4 is the conjunction of four pane verdicts. A pane counts only
+  // while its record still names the settled pane, belongs to this exact scope
+  // and binding, proves the exact settled geometry, journals no unresolved
+  // effect, and carries a proven identity. A v1 coordination record has no
+  // launch identity, so it stays unproven unless it also carries the fresh
+  // native legacy proof taken before a legacy yield.
+  //
+  // Every external read is awaited before the verdict runs. The verdict itself
+  // is one synchronous pass over the live scope, ownership and actor phase, so
+  // a READY->WAITING or ownership transition during a read cannot be rounded up.
+  // The durable Todo record is read only after the coordination read: a pane
+  // replacement that lands while that read is in flight must not be counted
+  // from an earlier snapshot.
+  async completionEvidence({ scope, layout }) {
+    const tabId = layout?.scope?.tabId ?? scope?.tabId;
+    const { record, proof } = await this.coordinationSnapshot();
+    const todoRecord = await readJson(this.recordFile).catch(() => null);
+    const verdict = () => this.completionVerdict({ layout, tabId, todoRecord, record, proof });
+    return { ...verdict(), recheck: verdict };
+  }
+  completionVerdict({ layout, tabId, todoRecord, record, proof }) {
+    const now = typeof this.clock === 'function' ? this.clock() : Date.now();
+    const currentScope = this.recoveryScope(tabId);
+    // The live owned Todo is the owner at verdict time. The durable record and
+    // the settled layout must both still name that same pane.
+    const ownedTodo = this.ownedRoles?.get?.('todo') ?? null;
+    const panes = {}, waiting = [];
+    const current = (role, paneId) => {
+      panes[role] = { current: true, paneId: paneId ?? null, condition: 'current', detail: null };
+      return true;
+    };
+    const fail = (role, paneId, condition, detail) => {
+      panes[role] = { current: false, paneId: paneId ?? null, condition, detail };
+      waiting.push({ role, paneId: paneId ?? null, condition, detail });
+      return false;
+    };
+    const scopeKey = candidate => validScope(currentScope) && candidate
+      ? RECOVERY_SCOPE_KEYS.find(key => String(candidate[key] ?? null) !== String(currentScope[key])) ?? null
+      : 'scope';
+    // The settled layout is one frozen identity; its scope and binding must still
+    // be the live four-pane identity before any pane can count.
+    let layoutCurrent = true;
+    if (!validScope(currentScope) || !validScope(layout?.scope) || !sameScope(layout.scope, currentScope))
+      layoutCurrent = fail('layout', null, 'scope-mismatch',
+        `layout scope is no longer current (scope-mismatch: ${scopeKey(layout?.scope) ?? 'scope'})`);
+    else {
+      let live = null;
+      try {
+        live = bindingRevision({ scope: currentScope, todo: ownedTodo?.paneId ?? layout.todo,
+          workers: layout.workers, dag: layout.dag, order: CORE_ORDER });
+      } catch { live = null; }
+      if (live !== layout.bindingRevision)
+        layoutCurrent = fail('layout', null, 'binding-mismatch', 'layout binding revision is no longer current');
+    }
+    // Todo: its durable record is the proof of its pane and viewer identity, and
+    // the live owned role must still name the same pane in the same scope.
+    if (!ownedTodo)
+      fail('todo', layout.todo, 'pane-mismatch', 'no live todo owner names the settled pane');
+    else if (ownedTodo.paneId !== layout.todo)
+      fail('todo', layout.todo, 'pane-mismatch', `the live todo owner names ${ownedTodo.paneId}`);
+    else if (!this.recordMatches(todoRecord) || todoRecord.paneId !== layout.todo)
+      fail('todo', layout.todo, 'pane-mismatch', 'the todo record does not name the settled pane');
+    else if (!sameDashboardOwner(ownedTodo, this.binding) || ownedTodo.tabId !== tabId ||
+      ownedTodo.scopeEpoch !== currentScope.scopeEpoch)
+      fail('todo', layout.todo, 'scope-mismatch', !sameDashboardOwner(ownedTodo, this.binding)
+        ? 'scope-mismatch: owner' : ownedTodo.tabId !== tabId ? 'scope-mismatch: tabId'
+          : 'scope-mismatch: scopeEpoch');
+    else if (todoRecord.scopeEpoch !== currentScope.scopeEpoch || todoRecord.tabId !== tabId)
+      fail('todo', layout.todo, 'scope-mismatch', todoRecord.tabId !== tabId ? 'scope-mismatch: tabId'
+        : 'scope-mismatch: scopeEpoch');
+    else if (todoRecord.pendingEffect || ownedTodo.pendingEffect)
+      fail('todo', layout.todo, 'unresolved-effect',
+        effectDetail(todoRecord.pendingEffect ?? ownedTodo.pendingEffect));
+    else if (todoRecord.manualClose === true || ownedTodo.manualClose === true)
+      fail('todo', layout.todo, 'role-closed', 'the todo pane is closed');
+    else if (todoRecord.ready !== true || !Number.isSafeInteger(todoRecord.processId) ||
+      ownedTodo.ready !== true || !Number.isSafeInteger(ownedTodo.processId))
+      fail('todo', layout.todo, 'unproven', 'the todo viewer identity is not proven');
+    else current('todo', layout.todo);
+    // Workers and DAG are owned role records from the same scope. They are read
+    // from the live map at verdict time, never from a snapshot taken before a read.
+    for (const role of ['workers', 'dag']) {
+      const owned = this.ownedRoles.get(role), paneId = layout[role];
+      if (!owned || owned.paneId !== paneId)
+        fail(role, paneId, 'pane-mismatch', `the ${role} record does not name the settled pane`);
+      else if (!sameDashboardOwner(owned, this.binding) || owned.tabId !== tabId ||
+        owned.scopeEpoch !== currentScope.scopeEpoch)
+        fail(role, paneId, 'scope-mismatch', !sameDashboardOwner(owned, this.binding) ? 'scope-mismatch: owner'
+          : owned.tabId !== tabId ? 'scope-mismatch: tabId' : 'scope-mismatch: scopeEpoch');
+      else if (owned.pendingEffect) fail(role, paneId, 'unresolved-effect', effectDetail(owned.pendingEffect));
+      else if (owned.manualClose === true) fail(role, paneId, 'role-closed', `the ${role} pane is closed`);
+      else if (owned.ready !== true || !Number.isSafeInteger(owned.processId))
+        fail(role, paneId, 'unproven', `the ${role} viewer identity is not proven`);
+      else current(role, paneId);
+    }
+    // Collab: the fourth pane is its coordination record, never the cell alone.
+    // The record's proof must carry the exact settled geometry as well as the
+    // binding: a width-only re-settle keeps the binding but changes the proof.
+    const collabCell = layout.cells?.find(cell => cell.role === 'collab') ?? null;
+    const collabPane = collabCell?.paneId ?? null;
+    if (!collabCell) fail('collab', null, 'missing', 'the settled layout has no current collab pane');
+    else if (!record?.paneId)
+      fail('collab', collabPane, 'missing', 'no coordination record exists');
+    else if (record.paneId !== collabPane)
+      fail('collab', collabPane, 'pane-mismatch', `the coordination record names ${record.paneId}`);
+    else if (record.manualClose === true)
+      fail('collab', collabPane, 'role-closed', 'the coordination record is closed');
+    else if (record.parentPaneId !== this.binding.parentPaneId || record.sessionId !== this.binding.sessionId ||
+      record.tabId !== tabId)
+      fail('collab', collabPane, 'scope-mismatch', 'scope-mismatch: pinned identity');
+    else if (record.v === 2) {
+      // Both published geometry identities are checked; either one that is
+      // current is enough, because coordination refreshes the explicit digest
+      // on resize while the layout revision may still describe the prior pass.
+      const proofRevision = typeof record.layout?.geometryRevision === 'string' &&
+        record.layout.geometryRevision ? record.layout.geometryRevision : null;
+      const explicitGeometry = typeof record.revisions?.geometry === 'string' &&
+        record.revisions.geometry ? record.revisions.geometry : null;
+      const revisionCurrent = proofRevision !== null && proofRevision === layout.geometryRevision;
+      const digestCurrent = explicitGeometry !== null && Boolean(record.rect && collabPane) &&
+        explicitGeometry === collabGeometryDigest(collabPane, record.rect);
+      if (!sameScope(record.scope, currentScope))
+        fail('collab', collabPane, 'scope-mismatch', `scope-mismatch: ${scopeKey(record.scope) ?? 'scope'}`);
+      else if (record.workers !== layout.workers || record.dag !== layout.dag)
+        fail('collab', collabPane, 'binding-mismatch', 'binding-mismatch: workers/dag');
+      else if (record.layout?.bindingRevision !== layout.bindingRevision)
+        fail('collab', collabPane, 'binding-mismatch', 'binding-mismatch: revision');
+      else if (!record.rect)
+        fail('collab', collabPane, 'geometry-mismatch', 'geometry-mismatch: no current rect');
+      else if (!proofRevision && !explicitGeometry)
+        fail('collab', collabPane, 'geometry-mismatch', 'geometry-mismatch: no current geometry identity');
+      else if (!revisionCurrent && !digestCurrent)
+        fail('collab', collabPane, 'geometry-mismatch', proofRevision
+          ? 'geometry-mismatch: revision' : 'geometry-mismatch: digest');
+      else if (!sameRect(record.rect, collabCell.rect))
+        fail('collab', collabPane, 'geometry-mismatch', 'geometry-mismatch: rect');
+      else if (record.pendingEffect)
+        fail('collab', collabPane, 'unresolved-effect', effectDetail(record.pendingEffect));
+      else {
+        const verdict = inspectViewerProof(record, proof, { now });
+        const asserted = record.provenCurrent === true && record.phase === 'running' && !record.pendingEffect;
+        if (!verdict.ready && !asserted)
+          fail('collab', collabPane, 'unproven', `viewer proof: ${verdict.state}`);
+        else current('collab', collabPane);
+      }
+    } else if (record.v === 1 || record.v === undefined) {
+      if (!legacyProofFresh(record, now))
+        fail('collab', collabPane, 'unproven', 'legacy-unproven: no fresh legacy proof');
+      else current('collab', collabPane);
+    } else fail('collab', collabPane, 'unproven', 'unproven: unknown coordination record version');
+    const authority = this.completionAuthority();
+    const coreReady = this.managed && authority === null && this.actor?.snapshot?.phase === 'READY';
+    return { current: layoutCurrent && panes.todo?.current === true && panes.workers?.current === true &&
+      panes.dag?.current === true && panes.collab?.current === true, panes, waiting, coreReady,
+      coreFailure: authority };
+  }
+  async layoutPanes(tabId) {
+    const layout = (await this.herdr('layout', '--pane', this.binding.parentPaneId))?.layout;
+    if (Array.isArray(layout?.panes)) return !tabId || layout.tab_id === tabId ? layout.panes : [];
+    return Array.isArray(this.lastPanes) ? this.lastPanes : [];
+  }
+  // A settled layout is published only after owned Workers/DAG records are
+  // ready/written and no arrangement is moving. Every successful pass publishes,
+  // including an explicit no-op, so passSeq advances exactly once per settle.
+  async settleRecoveryLayout({ pair, tabId, explicit, commandId }) {
+    if (this.stopped || !tabId || this.layoutActive || this.arrangement?.moving) return null;
+    const lifetime = this.lifetimeId;
+    const scope = this.recoveryScope(tabId);
+    if (!validScope(scope)) return null;
+    const actor = this.managed ? this.actor : null;
+    const validOwned = owned => Boolean(owned) && sameDashboardOwner(owned, this.binding) &&
+      owned.tabId === tabId && owned.manualClose !== true && owned.ready === true &&
+      Number.isSafeInteger(owned.processId);
+    const authorityCurrent = () => {
+      if (!this.managed) return true;
+      if (this.actor !== actor) return false;
+      if (!this.actor?.leaseHeld || this.actor.blocked || this.actor.draining) return false;
+      const snapshot = this.actor.snapshot;
+      return snapshot?.sessionId === this.binding.sessionId &&
+        snapshot.participants?.todo?.lifetimeId === lifetime;
+    };
+    if (!authorityCurrent()) return null;
+    const record = await readJson(this.recordFile);
+    const todo = this.recordMatches(record) && !record.manualClose ? record.paneId : this.ownedRoles.get('todo')?.paneId;
+    const workers = this.managed ? this.ownedRoles.get('workers') : pair?.workers;
+    const dag = this.managed ? this.ownedRoles.get('dag') : pair?.dag;
+    const ownedTodo = this.ownedRoles.get('todo');
+    const nonManagedPair = this.managed ? null : { workers: Boolean(pair?.workers), dag: Boolean(pair?.dag) };
+    if (!todo || !workers?.paneId || !dag?.paneId) return null;
+    if (!validOwned(workers) || !validOwned(dag)) return null;
+    // Freeze the exact identity strings for the layout about to be settled. An
+    // in-place record mutation must not be able to change what we compare later.
+    const todoId = todo, workersId = workers.paneId, dagId = dag.paneId;
+    const binding = bindingRevision({ scope, todo: todoId, workers: workersId, dag: dagId });
+    const panes = await this.layoutPanes(tabId);
+    if (!panes.some(pane => pane?.pane_id === todoId)) return null;
+    const coordination = await this.scopedCoordinationRecord(tabId);
+    const collab = coordination && (!coordination.workers || coordination.workers === workersId) &&
+      (!coordination.dag || coordination.dag === dagId) ? coordination.paneId : null;
+    const lower = deriveLowerBand({ panes, todo: todoId, workers: workersId, dag: dagId, collab });
+    if (!lower) return null;
+    // The reads above can yield. Revalidate everything mutable immediately before
+    // settle, with no await between this check and publication. A reply that
+    // arrives after invalidation is abandoned, not resurrected as settled.
+    const finalRecord = await readJson(this.recordFile);
+    if (this.stopped || this.layoutActive || this.arrangement?.moving ||
+      this.lifetimeId !== lifetime || this.claim?.tabId !== tabId) return null;
+    if (!sameScope(scope, this.recoveryScope(tabId)) || !authorityCurrent()) return null;
+    // Current ownership is the map's current core records, not the pair snapshot
+    // captured before the awaits. A replaced Todo id, a new pane id, an unowned
+    // role, a removed pair entry, a pair/map mismatch or any new binding revision
+    // abandons the old layout entirely.
+    const currentTodo = this.ownedRoles.get('todo');
+    if (currentTodo) { if (currentTodo.paneId !== todoId) return null; }
+    else if (ownedTodo) return null;
+    const currentWorkers = this.ownedRoles.get('workers');
+    const currentDag = this.ownedRoles.get('dag');
+    if (!validOwned(currentWorkers) || !validOwned(currentDag)) return null;
+    if (currentWorkers.paneId !== workersId || currentDag.paneId !== dagId) return null;
+    if (!this.managed) {
+      if (nonManagedPair.workers && !pair?.workers) return null;
+      if (nonManagedPair.dag && !pair?.dag) return null;
+      if (pair?.workers && pair.workers.paneId !== currentWorkers.paneId) return null;
+      if (pair?.dag && pair.dag.paneId !== currentDag.paneId) return null;
+    }
+    if (bindingRevision({ scope: this.recoveryScope(tabId), todo: todoId,
+      workers: currentWorkers.paneId, dag: currentDag.paneId }) !== binding) return null;
+    if (!this.recordMatches(finalRecord) || finalRecord.manualClose === true || finalRecord.paneId !== todoId)
+      return null;
+    if (!panes.some(pane => pane?.pane_id === currentWorkers.paneId) ||
+      !panes.some(pane => pane?.pane_id === currentDag.paneId)) return null;
+    return this.recovery.settle(scope, { explicit, todo: todoId, workers: workersId, dag: dagId,
+      band: lower.band, cells: lower.cells }, { commandId });
+  }
+  async recoveryResult({ scope, commandId, layout }) {
+    const evidence = layout ? await this.completionEvidence({ scope, layout }) : null;
+    // Final gate after every awaited read: re-run the synchronous verdict over
+    // the live state. A core or pane transition during a read therefore yields a
+    // truthful waiting result, never a stale 4/4.
+    const finalEvidence = evidence?.recheck ? evidence.recheck() : evidence;
+    // The phase alone is not authority: re-read the live lease/custody at the
+    // same synchronous point as the pane verdict so a loss during any awaited
+    // read is reported instead of rounded up.
+    const coreFailure = finalEvidence ? finalEvidence.coreFailure ?? null : this.completionAuthority();
+    const coreReady = finalEvidence ? finalEvidence.coreReady === true :
+      (this.managed ? this.actor?.snapshot?.phase === 'READY' : false);
+    const collabCell = layout?.cells?.find(cell => cell.role === 'collab') ?? null;
+    const complete = Boolean(layout && coreReady && finalEvidence?.current === true);
+    const result = { v: 1, kind: 'result', scope, commandId,
+      status: layout ? 'settled' : 'waiting', fourPaneComplete: complete,
+      core: { ready: Boolean(coreReady), workers: layout?.workers ?? null, dag: layout?.dag ?? null },
+      collab: { current: finalEvidence?.panes.collab?.current === true, paneId: collabCell?.paneId ?? null } };
+    // A fully proven four-pane state keeps the exact settled shape. Anything
+    // less names the failing pane and condition instead of rounding up to 4/4.
+    if (layout && !complete) {
+      const waiting = [...(finalEvidence?.waiting ?? [])];
+      if (!coreReady) waiting.unshift({ role: 'core', paneId: null,
+        condition: coreFailure?.condition ?? 'core-not-ready',
+        detail: coreFailure?.detail ?? (this.managed ? 'the core phase is not READY' : 'the core is not managed') });
+      result.waiting = waiting;
+      result.reason = waiting.map(entry => `${entry.role}${entry.paneId ? ` ${entry.paneId}` : ''}: ` +
+        `${entry.detail ?? entry.condition}`).join('; ');
+    }
+    return result;
+  }
+  // A caller-supplied command id is an explicit intent. Re-delivery joins the
+  // existing waiter; the shared coordinator serializes passes and keeps at most
+  // one coalesced rerun queued for fresh ids.
+  requestRecovery({ commandId, explicit = true, forceRoles } = {}) {
+    const id = commandId ?? randomUUID(), scope = this.recoveryScope();
+    if (!validScope(scope)) return Promise.reject(protocolError('RECOVERY_SCOPE_INVALID',
+      'the current recovery scope is not settled yet'));
+    return this.recovery.request({ commandId: id, scope, reconcile: async ({ commandId: passCommandId }) => {
+      const before = this.recovery.inspect().passSeq;
+      const roles = forceRoles ?? (explicit ? [...CORE_ORDER] : []);
+      await this.schedule({ forceRoles: roles, commandId: passCommandId });
+      const after = this.recovery.inspect();
+      const layout = after.passSeq > before && after.last?.commandId === passCommandId
+        ? this.recovery.replay(this.recoveryScope()) : null;
+      const result = await this.recoveryResult({ scope: this.recoveryScope(), commandId: passCommandId, layout });
+      try { assertResult(result); this.pi?.events?.emit(RECOVERY_V1.result, result); }
+      catch (error) { this.warnOnce(error); }
+      return result;
+    } });
   }
   recordMatches(record) {
     return record?.schema === 'omo-herdr-dashboard/pane/1' && record.role === 'todo' &&
@@ -1947,7 +2335,16 @@ export class TodoPane {
       provider.setCoordinator(this.coordinator());
       void this.schedule().catch(() => {});
     };
-    this.unsubscribers.push(pi.events.on(dashboardChannels.provider, accept),
+    this.unsubscribers.push(pi.events.on(RECOVERY_V1.layoutQuery, event => {
+      if (this.stopped || queryIssues(event).length) return;
+      const scope = this.recoveryScope();
+      if (!sameScope(event.scope, scope)) return;
+      if (this.managed && (!this.actor?.leaseHeld || this.actor.blocked || this.actor.draining)) return;
+      const replay = this.recovery.replay(scope);
+      if (replay) pi.events.emit(RECOVERY_V1.layout, replay);
+      else pi.events.emit(RECOVERY_V1.result, { v: 1, kind: 'result', scope, commandId: event.commandId,
+        status: 'waiting', fourPaneComplete: false, core: { ready: false }, collab: { current: false } });
+    }), pi.events.on(dashboardChannels.provider, accept),
       pi.events.on(dashboardChannels.reply, accept),
       pi.events.on(dashboardChannels.query, event => {
         if (!this.stopped && event?.v === 1 && event.kind === 'todo-owner' && sameDashboardOwner(event, this.binding))
@@ -2288,7 +2685,7 @@ export class TodoPane {
     this.recoveryWatch.ready.catch(() => {});
     return this.recoveryWatch.ready;
   }
-  schedule({ forceRoles = [] } = {}) {
+  schedule({ forceRoles = [], commandId } = {}) {
     const closureVersions = new Map(this.closureVersions);
     const pass = async () => {
       if (this.restartReopening && !forceRoles.length) return;
@@ -2462,6 +2859,11 @@ export class TodoPane {
       }
       // Complete: the paints accepted while it ran decide READY now.
       if (arrangement.moving) await this.managedReady(actor => actor.snapshot.roles.todo?.ack?.sequence);
+      // One settled layout per pass. A protocol/read failure here must not turn
+      // a healthy recovery pass into a recovery block.
+      try {
+        await this.settleRecoveryLayout({ pair, tabId, explicit: forceRoles.length > 0, commandId });
+      } catch (error) { this.warnOnce(error); }
     };
     // Every mutation of this pass runs in its scope, so the gate knows whether it
     // is automatic. A gate refusal is a wait: zero mutations, one notice, no latch.
