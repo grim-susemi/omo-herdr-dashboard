@@ -136,6 +136,15 @@ export default function extension(pi, { createController = options => new Coordi
 
   pi.on('session_start', start);
   pi.on('session_tree', start);
+  // bindExtensions() awaits every session_start handler before the coordination
+  // mod publishes its broker, so the startup status write can only observe the
+  // pre-publish process. The first agent start runs after binding and after
+  // that publication; writeStatus() skips an identical snapshot so repeated
+  // turns do not rewrite the record.
+  pi.on('before_agent_start', async () => {
+    if (!controller) return;
+    try { await controller.writeStatus(); } catch { /* the viewer keeps the last state */ }
+  });
   pi.on('session_shutdown', async () => {
     await lifecycle;
     await stop({ observe: true });

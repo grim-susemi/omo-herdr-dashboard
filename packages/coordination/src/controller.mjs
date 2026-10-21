@@ -147,6 +147,11 @@ export class CoordinationPane {
       ownerKey, lifetimeId, generation, scopeEpoch, now, heartbeatMs });
     this.newLaunchToken = launchToken;
     this.advisorLast = null;
+    // The status record is refreshed on startup and on post-bind lifecycle
+    // events. Its timestamp is not semantic, so an unchanged snapshot is not
+    // rewritten; statusWrites counts real file replacements for tests.
+    this.lastStatus = null;
+    this.statusWrites = 0;
     this.statusFile = join(stateDir, `${safeKey(parentPane)}.status.json`);
     this.recordFile = join(stateDir, `${safeKey(parentPane)}.pane.json`);
     this.stopped = false;
@@ -166,8 +171,15 @@ export class CoordinationPane {
   }
   async writeStatus(override) {
     const status = override ?? await connectionStatus({ host: this.host, env: this.env, receiptPath: this.receiptPath });
-    await writeJson(this.statusFile, { v: 1, ...status, advisor: advisorSummary(this.host, this.advisorLast),
-      sessionId: this.sessionId, parentPaneId: this.parentPane, pid: process.pid, at: new Date().toISOString() });
+    const record = { v: 1, ...status, advisor: advisorSummary(this.host, this.advisorLast),
+      sessionId: this.sessionId, parentPaneId: this.parentPane, pid: process.pid, at: new Date().toISOString() };
+    // `at` only records when this snapshot was written, so two polls of the
+    // same carrier state are one write, not a stream of byte changes.
+    const comparable = JSON.stringify({ ...record, at: null });
+    if (comparable === this.lastStatus) return status;
+    await writeJson(this.statusFile, record);
+    this.lastStatus = comparable;
+    this.statusWrites += 1;
     return status;
   }
   // Advisor ledger events rewrite the status file (coalesced) so the pane follows this

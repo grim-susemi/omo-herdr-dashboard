@@ -1169,6 +1169,79 @@ test('the coordination extension subscribes before replay and observes before sh
   assert.deepEqual(actions, ['start', 'yield:yield-1', 'layout:1', 'observe', 'stop']);
 });
 
+test('11-o (a) a broker published after session_start flips the status on the post-bind event', async t => {
+  const dir = directory();
+  const socket = join(dir, 'herdr.sock'), bin = join(dir, 'herdr.exe');
+  writeFileSync(socket, ''); writeFileSync(bin, '');
+  const saved = Object.fromEntries(['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SOCKET_PATH', 'HERDR_BIN_PATH',
+    'OMO_HERDR_COORDINATION_STATE_DIR'].map(key => [key, process.env[key]]));
+  const savedBroker = globalThis[API_KEY], savedReady = globalThis[API_READY_KEY];
+  delete globalThis[API_KEY]; delete globalThis[API_READY_KEY];
+  Object.assign(process.env, { HERDR_ENV: '1', HERDR_PANE_ID: 'P11O', HERDR_SOCKET_PATH: socket,
+    HERDR_BIN_PATH: bin, OMO_HERDR_COORDINATION_STATE_DIR: join(dir, 'coordination') });
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    if (savedBroker === undefined) delete globalThis[API_KEY]; else globalThis[API_KEY] = savedBroker;
+    if (savedReady === undefined) delete globalThis[API_READY_KEY]; else globalThis[API_READY_KEY] = savedReady;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const bus = new EventEmitter(), handlers = new Map();
+  const pi = {
+    events: {
+      on(name, callback) { bus.on(name, callback); return () => bus.off(name, callback); },
+      emit(name, value) { bus.emit(name, value); },
+    },
+    on(type, callback) { handlers.set(type, callback); return () => {}; },
+    cwd: dir,
+  };
+  let controller;
+  extension(pi, { createController: options => (controller = new CoordinationPane(options)) });
+  const ctx = { hasUI: true, mode: 'tui', sessionManager: {
+    getSessionFile: () => join(dir, 'parent.jsonl'), getSessionId: () => 's1' } };
+  await handlers.get('session_start')({}, ctx);
+  const statusFile = join(dir, 'coordination', 'P11O.status.json');
+  const startup = JSON.parse(readFileSync(statusFile, 'utf8'));
+  assert.equal(startup.state, 'no-carrier', 'session_start runs before the mod publishes its broker');
+  // bindExtensions() has now returned; the mod installs its broker.
+  globalThis[API_KEY] = { version: 1, features: [], getClient() {} };
+  const refresh = handlers.get('before_agent_start');
+  assert.equal(typeof refresh, 'function', 'a post-bind lifecycle event refreshes the status');
+  await refresh({ type: 'before_agent_start' }, ctx);
+  const connected = JSON.parse(readFileSync(statusFile, 'utf8'));
+  assert.equal(connected.state, 'connected');
+  assert.equal(connected.protocol, 'api v1');
+  assert.equal(controller.statusWrites, 2);
+  // A duplicate event is not a second write: the record stays byte-identical.
+  const bytes = readFileSync(statusFile);
+  await refresh({ type: 'before_agent_start' }, ctx);
+  assert.deepEqual(readFileSync(statusFile), bytes);
+  assert.equal(controller.statusWrites, 2);
+  await handlers.get('session_shutdown')();
+});
+
+test('11-o (b) an identical post-bind refresh does not rewrite the status record', async () => {
+  const dir = directory();
+  try {
+    const host = { [API_KEY]: { version: 1, features: [], getClient() {} } };
+    const controller = new CoordinationPane({ stateDir: dir, parentPane: 'P11O-b', sessionId: 's1',
+      host, env: {}, herdr: async () => ({}) });
+    await controller.start();
+    const file = join(dir, 'P11O-b.status.json');
+    const bytes = readFileSync(file);
+    await controller.writeStatus();
+    await controller.writeStatus();
+    assert.deepEqual(readFileSync(file), bytes, 'an identical snapshot is not rewritten');
+    assert.equal(controller.statusWrites, 1);
+    // A changed carrier state is still written exactly once.
+    delete host[API_KEY];
+    await controller.writeStatus();
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).state, 'no-carrier');
+    assert.equal(controller.statusWrites, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('coordination placement no longer polls or scans role directories', () => {
   const source = readFileSync(new URL('../src/controller.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /readdir|dashboardIds|PLACE_ATTEMPTS|waiting-timeout/);
