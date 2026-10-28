@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readJson, writeJson } from '../../dag/src/storage.mjs';
 import { shellCommand } from '../../dag/src/herdr.mjs';
-import { VIEWER_HEARTBEAT_LIMIT_MS, inspectViewerProof, proofMismatch, readViewerProof } from './proof.mjs';
+import { VIEWER_HEARTBEAT_LIMIT_MS, inspectViewerProof, proofMismatch, readViewerProof, viewerProofPath } from './proof.mjs';
 import { layoutIssues, resultIssues, sameScope, scopeKey, validScope, yieldIssues } from './recovery.mjs';
 import { RECOVERY_V1 } from './recovery.mjs';
 import { legacyCollabCommand, observeLegacyCollab } from '../../dag/src/controller.mjs';
@@ -281,6 +281,7 @@ export class CoordinationPane {
   async consumeOwnerClose() {
     const record = await readJson(this.recordFile).catch(() => null);
     if (!record || record.v !== 2 || typeof record.launch?.token !== 'string') return null;
+    if (record.sessionId !== this.sessionId) return null;
     const proof = readViewerProof(this.recordFile);
     if (!ownerIntentMatches(record, proof)) return null;
     if (!(proof.viewer?.pid >= 1) || !Number.isFinite(Date.parse(proof.viewer?.startedAt ?? ''))) return null;
@@ -839,12 +840,24 @@ export class CoordinationPane {
   // close recorded after that command began.
   async overrideRecord(next, closedAt, requestedAt) {
     const current = await readJson(this.recordFile).catch(() => null);
+    if (!current || current.sessionId !== this.sessionId) return false;
     if (current?.manualClose === true) {
       const at = Date.parse(current.closure?.at ?? current.closedAt ?? closedAt ?? '');
       if (!Number.isFinite(at) || at > requestedAt) return false;
     }
     await writeJson(this.recordFile, next);
     return true;
+  }
+  // The record file is keyed by the parent pane, not the session. A record
+  // left by a previous session in this reused pane can never authorize this
+  // one: keep it as evidence and start a fresh placement.
+  async archiveForeignRecord(record) {
+    const target = this.recordFile + '.foreign-' + this.stamp().replace(/[:.]/g, '-') +
+      '-' + randomUUID().slice(0, 8) + '.json';
+    await writeJson(target, { v: 1, reason: 'foreign-session', archivedAt: this.stamp(),
+      record, viewerProof: readViewerProof(this.recordFile) ?? null });
+    try { unlinkSync(this.recordFile); } catch { /* already gone */ }
+    try { unlinkSync(viewerProofPath(this.recordFile)); } catch { /* already gone */ }
   }
   async ensure(message, { acceptedAt = this.now(), acceptedCloseAt = null } = {}) {
     if (this.stopped) return this.status();
@@ -855,8 +868,22 @@ export class CoordinationPane {
     this.cells = message.cells;
     this.geometryCurrent = false;
     const explicitAt = acceptedAt;
-    await this.consumeOwnerClose();
+    // A record is keyed by the parent pane, not the session. A previous
+    // session's record in this reused pane is never this session's custody:
+    // archive it once its pane is gone, or hold while it is still visible.
     let record = await readJson(this.recordFile).catch(() => null);
+    if (this.sessionId && record?.sessionId && record.sessionId !== this.sessionId) {
+      const layout = await this.observeLayout().catch(() => null);
+      if (!layout) { this.state = 'layout-unavailable'; return this.status(); }
+      if (layout.panes?.some(pane => pane?.pane_id === record.paneId)) {
+        this.state = 'foreign-pane-live';
+        return this.status();
+      }
+      await this.archiveForeignRecord(record);
+      record = null;
+    }
+    await this.consumeOwnerClose();
+    record = await readJson(this.recordFile).catch(() => null);
 
     // A recorded owner or unknown-absence close is a pane-level suppression:
     // a lifecycle/session change never clears it.
@@ -1362,6 +1389,7 @@ export class CoordinationPane {
     if (this.env?.OMO_HERDR_COORDINATION_PANE === '0') { this.state = 'disabled'; return null; }
     const record = await readJson(this.recordFile).catch(() => null);
     if (!record?.paneId || record.v !== 2) return null;
+    if (!this.sessionId || record.sessionId !== this.sessionId) return null;
     let layout;
     try { layout = (await this.herdr('layout', '--pane', this.parentPane))?.layout; }
     catch { return null; }

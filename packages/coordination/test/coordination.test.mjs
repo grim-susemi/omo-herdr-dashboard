@@ -906,6 +906,93 @@ test('foreign scopes and stale events never cause a native mutation', async () =
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a previous session's dead record is archived and replaced, not foreign-blocked", async () => {
+  const dir = directory();
+  try {
+    const fake = fakeHerdr(corePanes());
+    const controller = controllerFor(dir, fake);
+    mkdirSync(join(dir, 'state'), { recursive: true });
+    const foreign = v2Record({ sessionId: 's0', scope: protocolScope({ ownerKey: 'o0', sessionId: 's0' }),
+      paneId: 'C', launch: { token: 'OLD', at: LAUNCH_AT } });
+    writeRecord(controller.recordFile, foreign);
+    await controller.acceptLayout(settled({ panes: fake.panes }));
+    await controller.idle();
+    assert.equal(controller.state, 'running');
+    const record = JSON.parse(readFileSync(controller.recordFile, 'utf8'));
+    assert.equal(record.sessionId, 's1');
+    assert.equal(record.paneId, 'C');
+    const archives = fs.readdirSync(join(dir, 'state')).filter(name => name.startsWith('P.pane.json.foreign-'));
+    assert.equal(archives.length, 1);
+    const archived = JSON.parse(readFileSync(join(dir, 'state', archives[0]), 'utf8'));
+    assert.equal(archived.reason, 'foreign-session');
+    assert.equal(archived.record.sessionId, 's0');
+    assert.equal(fake.calls.filter(call => call.startsWith('close ')).length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a previous session's live collaboration pane is held without a mutation", async () => {
+  const dir = directory();
+  try {
+    const fake = fakeHerdr(placedPanes());
+    const controller = controllerFor(dir, fake);
+    mkdirSync(join(dir, 'state'), { recursive: true });
+    const foreign = v2Record({ sessionId: 's0', scope: protocolScope({ ownerKey: 'o0', sessionId: 's0' }), paneId: 'C' });
+    writeRecord(controller.recordFile, foreign);
+    const before = readFileSync(controller.recordFile, 'utf8');
+    await controller.acceptLayout(settled({ panes: fake.panes, collab: 'C' }));
+    assert.equal(controller.state, 'foreign-pane-live');
+    assert.equal(readFileSync(controller.recordFile, 'utf8'), before);
+    assert.equal(fake.calls.filter(call => /^(split|swap|resize|run|close) /.test(call)).length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("shutdown never marks a previous session's record as this session's absence", async () => {
+  const dir = directory();
+  try {
+    const fake = fakeHerdr(corePanes());
+    const controller = controllerFor(dir, fake);
+    mkdirSync(join(dir, 'state'), { recursive: true });
+    const foreign = v2Record({ sessionId: 's0', scope: protocolScope({ ownerKey: 'o0', sessionId: 's0' }), paneId: 'C' });
+    writeRecord(controller.recordFile, foreign);
+    const before = readFileSync(controller.recordFile, 'utf8');
+    assert.equal(await controller.shutdownObserve(), null);
+    assert.equal(readFileSync(controller.recordFile, 'utf8'), before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an owner-close proof is never consumed into a previous session's record", async () => {
+  const dir = directory();
+  try {
+    const fake = fakeHerdr(corePanes());
+    const controller = controllerFor(dir, fake);
+    mkdirSync(join(dir, 'state'), { recursive: true });
+    const foreign = v2Record({ sessionId: 's0', scope: protocolScope({ ownerKey: 'o0', sessionId: 's0' }), paneId: 'C' });
+    writeRecord(controller.recordFile, foreign);
+    writeMatchingProof(controller.recordFile, foreign, { ownerClose: { reason: 'owner-close',
+      at: '2026-10-20T11:59:59.900Z', launchToken: foreign.launch.token, pane: 'C',
+      sessionId: 's0', lifetimeId: foreign.scope.lifetimeId } });
+    const before = readFileSync(controller.recordFile, 'utf8');
+    assert.equal(await controller.consumeOwnerClose(), null);
+    assert.equal(readFileSync(controller.recordFile, 'utf8'), before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an explicit command never overrides another session's close record", async () => {
+  const dir = directory();
+  try {
+    const fake = fakeHerdr(corePanes());
+    const controller = controllerFor(dir, fake);
+    mkdirSync(join(dir, 'state'), { recursive: true });
+    const foreign = v2Record({ sessionId: 's0', scope: protocolScope({ ownerKey: 'o0', sessionId: 's0' }),
+      manualClose: true, phase: 'closed',
+      closure: { reason: 'absence', at: '2026-10-20T11:59:00.000Z', launchToken: 'L1', sessionId: 's0', lifetimeId: 'life1' } });
+    writeRecord(controller.recordFile, foreign);
+    const before = readFileSync(controller.recordFile, 'utf8');
+    assert.equal(await controller.overrideRecord({ ...foreign, manualClose: false }, null, NOW), false);
+    assert.equal(readFileSync(controller.recordFile, 'utf8'), before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('an already placed 86-column band with an unchanged payload is a no-op', async () => {
   const dir = directory();
   try {
