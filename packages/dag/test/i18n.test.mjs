@@ -7,9 +7,10 @@ import { payload, sessionId } from './fixtures.mjs';
 
 test('English is the default for active, empty, error, and disconnected screens', () => {
   const state = { runs: sessionRuns(payload(), sessionId), connected: true };
-  const frame = render(state, { color: false });
-  assert.match(frame, /Running · Done 1\/5/);
-  assert.match(frame, /Dependencies/);
+  const frame = render(state, { color: false, columns:120 });
+  assert.match(frame, /^ DAG \[1\/5\].*Running/m);
+  assert.deepEqual(frame.split('\n').filter(line=>/^─ Step /.test(line)).map(line=>line.match(/Step \d+ \d+\/\d+/)[0]),
+    ['Step 1 1/1','Step 2 0/2','Step 3 0/1','Step 4 0/1']);
   assert.match(frame, /LIVE/);
   assert.doesNotMatch(frame, /[가-힣]/);
   assert.doesNotMatch(frame, /[\u4e00-\u9fff]/);
@@ -23,15 +24,22 @@ test('English is the default for active, empty, error, and disconnected screens'
 
 test('Korean and Simplified Chinese remain available without translating user-defined workflow labels', () => {
   const state = { runs: sessionRuns(payload(), sessionId), connected: true, language: 'ko' };
-  const frame = render(state, { color: false });
-  assert.match(frame, /실행 중 · 완료 1\/5/);
-  assert.match(frame, /의존 관계/);
+  const frame = render(state, { color: false, columns:120 });
+  assert.match(frame, /^ DAG \[1\/5\].*Running/m);
+  assert.match(frame, /Step 2 0\/2/);
+  assert.doesNotMatch(frame, /[가-힣]/);
   assert.match(frame, /Analyze/);
   const chinese = { runs: sessionRuns(payload(), sessionId), connected: true, language: 'zh-cn' };
-  const chineseFrame = render(chinese, { color: false });
-  assert.match(chineseFrame, /运行中 · 已完成 1\/5/);
-  assert.match(chineseFrame, /依赖关系/);
+  const chineseFrame = render(chinese, { color: false, columns:120 });
+  assert.match(chineseFrame, /^ DAG \[1\/5\].*运行中/m);
+  assert.match(chineseFrame, /第 2 步 0\/2/);
   assert.match(chineseFrame, /Analyze/);
+  for(const language of ['en','ko','zh-cn']) {
+    const labelled=render({connected:true,language,runs:[{id:'labels',name:'사용자流程',status:'running',
+      nodes:[{id:'node',label:'원문标签',state:'running'}],edges:[]}]},{color:false,columns:80});
+    assert.match(labelled,/사용자流程/);
+    assert.match(labelled,/원문标签/);
+  }
   assert.equal(width('依赖关系'), 8);
   assert.equal(width('运行中 · 已完成 1/5'), 19);
   assert.equal(fit('依赖关系', 5), '依赖…');

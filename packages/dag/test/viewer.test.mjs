@@ -16,7 +16,7 @@ import { writeJson } from '../src/storage.mjs';
 import { TASK_SCOPE } from '../src/view-state.mjs';
 
 // Only the selected (or followed) title is bold: its SGR opens with 1; right before the status icon.
-const selectedTitle = (raw, title) => new RegExp(`\\x1b\\[1;[\\d;]*m${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(raw);
+const selectedTitle = (raw, title) => new RegExp(`\\x1b\\[1(?:;[\\d;]+)?m${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(raw);
 const includesRunning = (raw, suffix) => spinnerFrames.some(glyph => selectedTitle(raw, `${glyph} ${suffix}`));
 
 for (const view of ['dag', 'tasks']) test(`real ${view} PTY pauses on mouse and resumes on blur`, { timeout: 25000 }, async t => {
@@ -53,14 +53,14 @@ test('real standalone PTY respects saved folds, preserves task selection, switch
   const state = { sessionId: 'tasks-pty', language: 'ko', connected: true, runs: [], tasks: [
     { id: 'st_b', status: 'completed', description: 'SECOND_DESCRIPTION' },
     { id: 'st_a', status: 'running', description: 'FIRST_DESCRIPTION 한글🙂', category: 'REAL_CATEGORY', model: 'REAL_MODEL', progress: 'FIRST_PROGRESS' },
-    { id: 'st_child', parentTaskId: 'st_a', status: 'lost', description: 'EXPLICIT_CHILD' },
+    { id: 'st_child', parentTaskId: 'st_a', status: 'completed', description: 'EXPLICIT_CHILD' },
   ] };
   await writeJson(file, state);
   const preferences = { version: 1, sessionId: state.sessionId, expanded: { '[null,"st_a"]': false, '[null,"st_0"]': false } };
   await writeJson(`${file}.view.json`, preferences);
   let viewer = openViewer(file, t);
   const fresh = await viewer.frame((text, raw) => includesRunning(raw, '▸ FIRST_DESCRIPTION'));
-  assert.equal(fresh.split('\n').filter(line => line.startsWith('│')).length, 1);
+  assert.equal(fresh.split('\n').filter(line => line.includes('FIRST_DESCRIPTION')).length, 1);
   assert.doesNotMatch(fresh, /FIRST_PROGRESS|REAL_MODEL|EXPLICIT_CHILD/);
   const pausedPreferences = await preferenceWritten(file, value => value.navigation?.follow === false,
     () => viewer.frame(text => text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: 'd' })));
@@ -80,7 +80,7 @@ test('real standalone PTY respects saved folds, preserves task selection, switch
   await viewer.frame((text, raw) => includesRunning(raw, '▸ FIRST_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
   state.tasks.reverse();
   state.tasks.push({ id: 'st_0', status: 'running', description: 'NEW_DESCRIPTION 새 작업 한글🙂', progress: 'NEW_PROGRESS' });
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ FIRST_DESCRIPTION') && text.includes(`${messages.ko.tasks} (3)`), () => writeJson(file, state));
+  await viewer.frame((text, raw) => includesRunning(raw, '▸ FIRST_DESCRIPTION') && text.includes(`${messages.ko.tasks} [1/3]`), () => writeJson(file, state));
   await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ SECOND_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
   const arrival = await viewer.frame((text, raw) => includesRunning(raw, '▸ NEW_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
   assert.doesNotMatch(arrival, /NEW_PROGRESS/);
@@ -139,13 +139,14 @@ test('real PTY compact cards expose full selected progress with d without persis
   let viewer = openViewer(file, t);
   const initial = await viewer.frame((text, raw) => selectedTitle(raw, '✓ COMPACT_DESCRIPTION') && text.split('\n').length === 32,
     () => viewer.send({ resize: [32, 80] }));
-  assert.equal(initial.split('\n').filter(line => line.startsWith('╭')).length, 3);
-  const interiors = initial.split('\n').filter(line => line.startsWith('│'));
-  assert.equal(interiors.length, 5);
-  assert.match(interiors[1], /\[worker\/visual\] gpt-6-astra \(opencodex\)/);
-  assert.match(interiors[2], /9분 5초 · 20턴 · 도구 65회/);
-  assert.match(interiors[3], /× SECOND_COMPACT/);
-  assert.match(interiors[4], /\? -/);
+  assert.equal(initial.split('\n').filter(line => line.startsWith('╭')).length, 0);
+  const interiors = initial.split('\n').filter(line => line.startsWith('▌'));
+  assert.equal(interiors.length, 3);
+  assert.match(interiors[0], /✓ COMPACT_DESCRIPTION · ⧖ 9m 5s/);
+  assert.equal(interiors[1], '▌[worker/visual] gpt-6-astra (opencodex)');
+  assert.equal(interiors[2], '▌20 turns · 65 tools');
+  assert.match(initial, /^ × SECOND_COMPACT$/m);
+  assert.match(initial, /^ \? -$/m);
   assert.doesNotMatch(initial, /PROGRESS_HEAD|SECOND_PROGRESS/);
   assert.ok(interiors.every(line => line.replace(/[│ ]/g, '')));
   assert.doesNotMatch(initial, /a-full-id|b-full-id|c-full-id|PROGRESS_TAIL|2026-09-06|opencodex\//);
@@ -156,9 +157,9 @@ test('real PTY compact cards expose full selected progress with d without persis
   assert.doesNotMatch(full, /b-full-id|c-full-id/);
   await viewer.frame((text, raw) => !text.includes('PROGRESS_TAIL') && !text.includes('PROGRESS_HEAD') && selectedTitle(raw, '✓ COMPACT_DESCRIPTION'), () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => text.includes('PROGRESS_TAIL'), () => viewer.send({ keys: 'd' }));
-  const next = await viewer.frame((text, raw) => selectedTitle(raw, '× SECOND_COMPACT'), () => viewer.send({ keys: 'n' }));
+  const next = await viewer.frame((text, raw) => selectedTitle(raw, '× SECOND_COMPACT'), () => viewer.send({ keys: 'p' }));
   assert.doesNotMatch(next, /a-full-id|b-full-id|PROGRESS_TAIL/);
-  await viewer.frame((text, raw) => selectedTitle(raw, '✓ COMPACT_DESCRIPTION'), () => viewer.send({ keys: 'p' }));
+  await viewer.frame((text, raw) => selectedTitle(raw, '✓ COMPACT_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
   const folded = await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ COMPACT_DESCRIPTION'), () => viewer.send({ keys: ' ' }));
   assert.doesNotMatch(folded, /PROGRESS_HEAD|PROGRESS_TAIL/);
   await viewer.frame(text => text.includes('PROGRESS_TAIL'), () => viewer.send({ keys: 'd' }));
@@ -174,7 +175,7 @@ test('real PTY compact cards expose full selected progress with d without persis
   viewer = openViewer(file, t);
   const restarted = await viewer.frame((text, raw) => selectedTitle(raw, '✓ ▸ COMPACT_DESCRIPTION'));
   assert.doesNotMatch(restarted, /PROGRESS_HEAD|PROGRESS_TAIL|a-full-id/);
-  await viewer.frame(text => text.includes('9분 5초') && !text.includes('PROGRESS_HEAD') && !text.includes('▸ COMPACT_DESCRIPTION'), () => viewer.send({ keys: '\r' }));
+  await viewer.frame(text => text.includes('9m 5s') && !text.includes('PROGRESS_HEAD') && !text.includes('▸ COMPACT_DESCRIPTION'), () => viewer.send({ keys: '\r' }));
   await viewer.close();
   assert.deepEqual(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded, { ...expanded, '[null,"a-full-id"]': true });
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
@@ -204,7 +205,8 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   const dir = await mkdtemp(join(tmpdir(), 'auto-expand-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.json');
-  const task = { id: 'task', status: dag ? 'completed' : 'pending', description: 'AUTO_CARD', progress: 'AUTO_PROGRESS' };
+  const task = { id: 'task', status: dag ? 'completed' : 'pending', description: 'AUTO_CARD', progress: 'AUTO_PROGRESS',
+    agent:'AUTO_AGENT',model:'AUTO_MODEL',turns:2 };
   const node = { id: 'node', label: 'AUTO_NODE', state: 'pending', taskId: task.id };
   const state = { sessionId: 'auto', connected: true, tasks: [task], runs: dag ? [
     { id: 'run', name: 'AUTO_RUN', status: 'running', nodes: [node], edges: [] },
@@ -213,10 +215,11 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   await writeJson(file, state);
   let viewer = openViewer(file, t);
   const matches = (expanded, verbose = false, includeGraph = true) => text => text.includes('AUTO_CARD') &&
-    text.includes('AUTO_PROGRESS') === (dag ? expanded || verbose : verbose) &&
+    text.includes('AUTO_PROGRESS') === verbose &&
     text.includes(`Task: ${task.id}`) === verbose &&
-    (verbose || text.includes('▸ AUTO_CARD') === !expanded) &&
-    (!dag || !includeGraph || text.includes(`[${expanded ? '-' : '+'}] AUTO_NODE`));
+    (verbose || text.includes('AUTO_MODEL') === expanded) &&
+    (dag || verbose || text.includes('▸ AUTO_CARD') === !expanded) &&
+    (!dag || !includeGraph || new RegExp(`└${expanded ? '▌' : ' '}[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏○✓] AUTO_NODE`).test(text));
   const verifiedFrame = async (expanded, verbose, action, current = () => true) => {
     const detail = await viewer.frame(text => matches(expanded, verbose, false)(text) && current(text), action);
     // Recorded metric details increased the verbose card height. Observe the
@@ -230,8 +233,10 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   };
   const check = async (expanded, action, verbose = false) => {
     const text = await verifiedFrame(expanded, verbose, action);
-    if (!verbose) assert.equal(text.split('\n').filter(line => line.startsWith('│')).length,
-      expanded ? (dag ? 2 : 1) : !dag && task.status === 'completed' ? 0 : 1);
+    if (!verbose) {
+      assert.equal(text.split('\n').filter(line => line.includes('[AUTO_AGENT] AUTO_MODEL')).length, expanded ? 1 : 0);
+      assert.equal(text.includes('2 turns'),expanded);
+    }
     return text;
   };
   const transition = async (status, expanded, verbose = false) => {
@@ -239,10 +244,13 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
     else task.status = status;
     task.progress = `AUTO_PROGRESS_${status}`;
     await verifiedFrame(expanded, verbose, () => writeJson(file, state),
-      text => verbose || (dag && expanded) ? text.includes(task.progress) :
-        (dag || !text.includes(task.progress)) && (expanded || text.includes(dag ? 'Completed' : '✓')));
+      text => verbose ? text.includes(task.progress) :
+        (status === 'completed' ? text.includes('✓') : status === 'pending' ? text.includes('○') :
+          spinnerFrames.some(glyph=>text.includes(glyph))) &&
+        !text.includes(task.progress));
   };
   await check(false);
+  if(dag) await viewer.frame(text=>text.includes(messages.en.followOff),()=>viewer.send({keys:'c'}));
   await transition('running', true);
   await viewer.frame(text => text.split('\n').length === 40 && matches(true)(text), () => viewer.send({ resize: [40, 80] }));
   await transition('completed', false);
@@ -258,6 +266,10 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   assert.deepEqual(manualOnly.expanded, {});
   assert.equal(manualOnly.navigation.follow, false);
   viewer = openViewer(file, t);
+  if(dag) {
+    await viewer.frame(text=>text.includes(messages.en.followOn));
+    await viewer.frame(text=>text.includes(messages.en.followOff),()=>viewer.send({keys:'c'}));
+  }
   await check(true);
   await check(false, () => viewer.send({ keys: ' ' }));
   await transition('completed', false);
@@ -269,6 +281,10 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   const savedFalse = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
   assert.deepEqual(savedFalse.expanded, { [preferenceKey]: false });
   viewer = openViewer(file, t);
+  if(dag) {
+    await viewer.frame(text=>text.includes(messages.en.followOn));
+    await viewer.frame(text=>text.includes(messages.en.followOff),()=>viewer.send({keys:'c'}));
+  }
   await check(false);
   await transition('completed', false);
   await check(true, () => viewer.send({ keys: '\r' }));
@@ -278,8 +294,12 @@ for (const dag of [false, true]) test(`real ${dag ? 'DAG' : 'standalone'} PTY au
   const savedTrue = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
   assert.deepEqual(savedTrue.expanded, { [preferenceKey]: true });
   viewer = openViewer(file, t);
-  await check(true);
-  await viewer.frame(text => text.split('\n').length === 40 && matches(true)(text), () => viewer.send({ resize: [40, 80] }));
+  if(dag) {
+    await viewer.frame(text=>text.includes(messages.en.followOn));
+    await viewer.frame(text=>text.includes(messages.en.followOff),()=>viewer.send({keys:'c'}));
+  }
+  const restored=await check(true,()=>viewer.send({resize:[40,80]}));
+  assert.equal(restored.split('\n').length,40);
   await check(true, () => viewer.send({ keys: 'd' }), true);
   await check(true, () => viewer.send({ keys: 'd' }));
   await viewer.close();
@@ -388,7 +408,11 @@ function openViewer(file, t, options = []) {
   const send = value => child.stdin.write(`${JSON.stringify(value)}\n`);
   function frame(predicate, action = () => {}, { raw: keepRaw = false } = {}) {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => finish(new Error(`PTY frame timeout\n${lastFrame}\n${stderr}`)), 5000);
+      const timeoutError = new Error('PTY frame timeout');
+      const timer = setTimeout(() => {
+        timeoutError.message += `\n${lastFrame}\n${stderr}`;
+        finish(timeoutError);
+      }, 5000);
       const onFrame = (text, raw) => { if (predicate(text, raw)) finish(null, keepRaw ? { text, raw } : text); };
       const onExit = code => finish(new Error(`Viewer exited ${code}: ${stderr}\n${lastFrame}`));
       function finish(error, text) {
@@ -414,13 +438,14 @@ test('real viewer PTY selects, toggles, refreshes, switches runs and persists ac
     { id: 'r1', name: 'FIRST_RUN', status: 'running', nodes: [
       { id: 'a', label: 'ALPHA', state: 'running', taskId: 'ta' },
       { id: 'b', label: 'BETA', state: 'pending', taskId: 'tb' },
+      ...Array.from({length:35},(_,index)=>({id:`tail-${index}`,label:`TAIL_NODE_${index}`,state:'pending'})),
     ], edges: [{ from: 'a', to: 'b' }] },
     { id: 'r2', name: 'SECOND_RUN', status: 'running', nodes: [
       { id: 'a', label: 'OTHER_ALPHA', state: 'running', taskId: 'other' },
     ], edges: [] },
   ], tasks: [
-    { id: 'ta', description: 'ALPHA_DESCRIPTION', progress: 'ALPHA_PROGRESS' },
-    { id: 'tb', description: 'BETA_DESCRIPTION', progress: 'BETA_PROGRESS' },
+    { id: 'ta', description: 'ALPHA_DESCRIPTION', progress: 'ALPHA_PROGRESS',model:'ALPHA_MODEL' },
+    { id: 'tb', description: 'BETA_DESCRIPTION', progress: 'BETA_PROGRESS',model:'BETA_MODEL' },
     { id: 'other', description: 'OTHER_DESCRIPTION' },
   ] };
   await writeJson(file, state);
@@ -428,56 +453,60 @@ test('real viewer PTY selects, toggles, refreshes, switches runs and persists ac
     expanded: { '["r1","a"]': false, '["r1","c"]': false, '["r2","a"]': false } });
   let viewer = openViewer(file, t);
   const fresh = await viewer.frame(text => text.includes('FIRST_RUN'), undefined, { raw: true });
-  assert.match(fresh.raw, /\x1b\[1;[\d;]*m\[[-+]\] ALPHA/);
-  assert.ok(fresh.text.includes('▸ BETA'));
+  assert.ok(includesRunning(fresh.raw,'ALPHA'));
+  assert.ok(!selectedTitle(fresh.raw,'○ BETA'));
+  assert.doesNotMatch(fresh.text,/ALPHA_MODEL|ALPHA_PROGRESS/);
   await viewer.frame(text => text.split('\n').length === 60, () => viewer.send({ resize: [60, 80] }));
-  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA_DESCRIPTION') && text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: ' ' }));
-  await viewer.frame((text, raw) => selectedTitle(raw, '○ ▸ BETA_DESCRIPTION'), () => viewer.send({ keys: '\t' }));
-  await viewer.frame((text, raw) => selectedTitle(raw, '○ BETA_DESCRIPTION') && text.includes('BETA_PROGRESS'), () => viewer.send({ keys: '\r' }));
-  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA_DESCRIPTION'), () => viewer.send({ keys: '\x1b[Z' }));
-  const selected = await viewer.frame((text, raw) => selectedTitle(raw, '○ BETA_DESCRIPTION'), () => viewer.send({ keys: '\t' }));
-  assert.ok(selected.includes('BETA_PROGRESS'));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA') && text.includes('ALPHA_MODEL') && !text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: ' ' }));
+  await viewer.frame((text, raw) => selectedTitle(raw, '○ BETA') && !text.includes('BETA_MODEL'), () => viewer.send({ keys: '\t' }));
+  await viewer.frame((text, raw) => selectedTitle(raw, '○ BETA') && text.includes('BETA_MODEL') && !text.includes('BETA_PROGRESS'), () => viewer.send({ keys: '\r' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA'), () => viewer.send({ keys: '\x1b[Z' }));
+  const selected = await viewer.frame((text, raw) => selectedTitle(raw, '○ BETA'), () => viewer.send({ keys: '\t' }));
+  assert.ok(selected.includes('BETA_MODEL'));
+  assert.doesNotMatch(selected,/BETA_PROGRESS/);
   await viewer.frame(text => text.includes(`${messages.en.task}: tb`) && text.includes('BETA_PROGRESS'), () => viewer.send({ keys: 'd' }));
-  await viewer.frame(text => text.includes('BETA_PROGRESS') && !text.includes(`${messages.en.task}: tb`), () => viewer.send({ keys: 'd' }));
-  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA_DESCRIPTION'), () => viewer.send({ keys: '\x1b[Z' }));
-  const collapsed = await viewer.frame((text, raw) => includesRunning(raw, '▸ ALPHA_DESCRIPTION'), () => viewer.send({ keys: ' ' }));
-  assert.ok(!collapsed.includes('ALPHA_PROGRESS'));
+  await viewer.frame(text => text.includes('BETA_MODEL') && !text.includes('BETA_PROGRESS') && !text.includes(`${messages.en.task}: tb`), () => viewer.send({ keys: 'd' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA'), () => viewer.send({ keys: '\x1b[Z' }));
+  const collapsed = await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA') && !text.includes('ALPHA_MODEL'), () => viewer.send({ keys: ' ' }));
+  assert.doesNotMatch(collapsed,/ALPHA_PROGRESS|ALPHA_MODEL/);
   await viewer.frame(text => text.includes(`${messages.en.task}: ta`) && text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: 'd' }));
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ ALPHA_DESCRIPTION') && !text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: 'd' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA') && !text.includes('ALPHA_PROGRESS') && !text.includes('ALPHA_MODEL'), () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => text.split('\n').length === 35, () => viewer.send({ resize: [35, 80] }));
   state.runs[0].nodes.reverse();
   state.runs[0].nodes.find(node => node.id === 'a').taskId = 'retry';
   state.runs[0].nodes.push({ id: 'c', label: 'NEW_NODE', state: 'running', taskId: 'tc' });
-  state.tasks.push({ id: 'retry', description: 'RETRY_DESCRIPTION' }, { id: 'tc', description: 'NEW_DESCRIPTION' });
+  state.tasks.push({ id: 'retry', description: 'RETRY_DESCRIPTION',model:'RETRY_MODEL' },
+    { id: 'tc', description: 'NEW_DESCRIPTION',model:'NEW_MODEL' });
   state.runs[0].name = 'UPDATED_RUN';
-  await viewer.frame((text, raw) => text.includes('UPDATED_RUN') && includesRunning(raw, '▸ RETRY_DESCRIPTION'), () => writeJson(file, state));
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ NEW_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ RETRY_DESCRIPTION'), () => viewer.send({ keys: 'p' }));
-  await viewer.frame((text, raw) => text.includes('SECOND_RUN') && selectedTitle(raw, '▸ OTHER_ALPHA'), () => viewer.send({ keys: '\x1b[C' }));
-  await viewer.frame((text, raw) => text.includes('UPDATED_RUN') && selectedTitle(raw, '▸ ALPHA'), () => viewer.send({ keys: '\x1b[D' }));
-  const top = await viewer.frame((text, raw) => selectedTitle(raw, '▸ ALPHA') && /1–/.test(text), () => viewer.send({ keys: '\x1b[5~' }));
+  await viewer.frame((text, raw) => text.includes('UPDATED_RUN') && includesRunning(raw, 'ALPHA') && text.includes('RETRY_DESCRIPTION'), () => writeJson(file, state));
+  await viewer.frame((text, raw) => includesRunning(raw, 'NEW_NODE'), () => viewer.send({ keys: 'n' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA'), () => viewer.send({ keys: 'p' }));
+  await viewer.frame((text, raw) => text.includes('SECOND_RUN') && includesRunning(raw, 'OTHER_ALPHA'), () => viewer.send({ keys: '\x1b[C' }));
+  await viewer.frame(text => text.includes('UPDATED_RUN') && text.includes('Follow OFF'), () => viewer.send({ keys: '\x1b[D' }));
+  const top = await viewer.frame(text => /1–/.test(text), () => viewer.send({ keys: '\x1b[5~' }));
   const down = await viewer.frame(text => /2–/.test(text), () => viewer.send({ keys: 'j' }));
   assert.notEqual(down, top);
   await viewer.frame(text => /1–/.test(text), () => viewer.send({ keys: 'k' }));
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ NEW_DESCRIPTION'), () => viewer.send({ keys: 'n' }));
-  const resized = await viewer.frame((text, raw) => text.split('\n').length === 18 && includesRunning(raw, '▸ NEW_DESCRIPTION'), () => viewer.send({ resize: [18, 54] }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'NEW_NODE'), () => viewer.send({ keys: 'n' }));
+  const resized = await viewer.frame((text, raw) => text.split('\n').length === 18 && includesRunning(raw, 'NEW_NODE'), () => viewer.send({ resize: [18, 54] }));
   assert.ok(resized.split('\n').every(line => width(line) < 54));
   await viewer.close();
   const saved = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
   assert.equal(saved.expanded['["r1","a"]'], false);
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
   viewer = openViewer(file, t);
-  await viewer.frame((text, raw) => selectedTitle(raw, '▸ NEW_NODE') && text.includes(messages.en.followOn));
-  await viewer.frame((text, raw) => includesRunning(raw, '▸ RETRY_DESCRIPTION'), () => viewer.send({ keys: 'p' }));
-  await viewer.frame((text, raw) => includesRunning(raw, 'RETRY_DESCRIPTION'), () => viewer.send({ keys: '\r' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'NEW_NODE') && text.includes(messages.en.followOn));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA'), () => viewer.send({ keys: 'p' }));
+  await viewer.frame((text, raw) => includesRunning(raw, 'ALPHA') && text.includes('RETRY_MODEL'), () => viewer.send({ keys: '\r' }));
   await viewer.close();
   assert.equal(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded['["r1","a"]'], true);
   viewer = openViewer(file, t);
   await viewer.frame(text => text.includes('UPDATED_RUN') && text.includes(messages.en.followOn));
-  const restored = await viewer.frame(text => text.includes('UPDATED_RUN') && text.includes('[-] ALPHA'),
-    () => viewer.send({ keys: '\x1b[5~'.repeat(8) }));
-  assert.ok(restored.includes('[-] BETA'));
-  assert.ok(restored.includes('▸ NEW_NODE'));
+  const restored = await viewer.frame(text => text.includes('UPDATED_RUN') && text.includes('RETRY_MODEL') &&
+    text.includes('BETA_MODEL') && text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
+  assert.equal(JSON.parse(await readFile(`${file}.view.json`, 'utf8')).expanded['["r1","b"]'],true);
+  assert.ok(restored.includes('NEW_NODE'));
+  assert.doesNotMatch(restored,/NEW_MODEL/);
   await viewer.close();
   console.log('PTY evidence: saved false folded, saved true restored, Tab/Shift-Tab/n/p, Space/Enter, run switches, atomic refresh/reorder/retry/new node, quit/restart persistence passed.');
 });
@@ -531,23 +560,23 @@ test('real PTY follow reveals graph work, retains parallel targets, hands off an
   const narrow = await viewer.frame(text => text.split('\n').length === 18 && text.includes('RUN_TARGET_') &&
     text.split('\n').every(line => width(line) < 35), () => viewer.send({ resize: [18, 35] }), { raw: true });
   assert.ok(narrow.text.split('\n').every(line => width(line) < 35), narrow.text);
-  assert.doesNotMatch(narrow.text, /DETAIL_n6/);
-  assert.ok(!selectedTitle(narrow.raw, '[-] RUN_TARGET'), narrow.text);
+  assert.doesNotMatch(narrow.text, /INSPECT_PROGRESS|Task:|Metrics source:|Started:/);
+  assert.ok(!includesRunning(narrow.raw, 'RUN_TARGET_'), narrow.text);
   nodes[7].state = 'running';
   state.tasks[7].status = 'running';
   run.name = 'PARALLEL_UPDATE';
   const stable = await viewer.frame(text => text.includes('PARALLEL_UPDATE') && text.includes('RUN_TARGET_'), () => writeJson(file, state));
-  assert.doesNotMatch(stable, /DETAIL_n6|DETAIL_n7/);
+  assert.doesNotMatch(stable, /INSPECT_PROGRESS|Task:|Metrics source:|Started:/);
   state.tasks[6].progress = 'STREAM_UPDATE';
   run.name = 'TOKEN_UPDATE';
   const token = await viewer.frame(text => text.includes('TOKEN_UPDATE') && text.includes('RUN_TARGET_'), () => writeJson(file, state));
   assert.equal(token.split('\n').at(-1), stable.split('\n').at(-1));
-  const beforeHandoff = await viewer.frame(text => text.split('\n').length === 12 &&
-    text.includes('RUN_TARGET_'), () => viewer.send({ resize: [12, 35] }));
+  const beforeHandoff = await viewer.frame(text => text.split('\n').length === 6 &&
+    text.includes('RUN_TARGET_'), () => viewer.send({ resize: [6, 35] }));
   assert.doesNotMatch(beforeHandoff, /NEXT_TARGET_/);
   nodes[6].state = 'completed'; state.tasks[6].status = 'completed'; run.name = 'COMPLETION_UPDATE';
   const handoff = await viewer.frame(text => text.includes('COMPLETION_UPDATE') && text.includes('NEXT_TARGET_'), () => writeJson(file, state));
-  assert.doesNotMatch(handoff, /RUN_TARGET_|DETAIL_n7/);
+  assert.doesNotMatch(handoff, /RUN_TARGET_|INSPECT_PROGRESS|Task:|Metrics source:|Started:/);
   await viewer.frame(text => text.split('\n').length === 26, () => viewer.send({ resize: [26, 80] }));
   const controls = ['j', 'k', '\x1b[6~', '\x1b[5~', 'n', 'p', '\t', '\x1b[Z', ' ', '\r', 'd', '\x1b[C', '\x1b[D', 'c', 't'];
   for (const [index, keys] of controls.entries()) {
@@ -556,12 +585,13 @@ test('real PTY follow reveals graph work, retains parallel targets, hands off an
     state.runs[1].name = `OTHER_INSPECTION_${index}`;
     state.tasks.find(task => task.id === 'root').description = `ROOT_UPDATE_${index}`;
     const inspected = await viewer.frame(text => text.includes(messages.en.followOff) &&
-      (text.includes(`Selected run: ${run.name}`) || text.includes(`Selected run: ${state.runs[1].name}`) ||
+      (text.includes(run.name) || text.includes(state.runs[1].name) ||
         text.includes(`ROOT_UPDATE_${index}`)), () => writeJson(file, state));
     assert.ok(inspected.includes(messages.en.followOff));
     const resumed = await viewer.frame(text => text.includes(messages.en.followOn) && text.includes('NEXT_TARGET_') &&
-      !text.includes('DETAIL_n7'), () => viewer.send({ keys: 'f' }), { raw: true });
-    assert.ok(!selectedTitle(resumed.raw, '[-] NEXT_TARGET'), resumed.text);
+      !text.includes('Task:'), () => viewer.send({ keys: 'f' }), { raw: true });
+    assert.doesNotMatch(resumed.text,/INSPECT_PROGRESS|STREAM_UPDATE|Metrics source:|Started:/);
+    assert.ok(!includesRunning(resumed.raw, 'NEXT_TARGET_'), resumed.text);
   }
   await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   await viewer.frame(text => text.includes(messages.en.followOn) && text.includes('NEXT_TARGET_'), () => viewer.send({ keys: 'f' }));
@@ -709,8 +739,8 @@ for (const view of ['dag', 'tasks']) test(`fixed ${view} follow keeps auto revea
   const dir = await mkdtemp(join(tmpdir(), `task8-${view}-`));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'role.json');
-  const nodes = Array.from({ length: 9 }, (_, index) => ({ id: `n${index}`, label: `GRAPH_${index}`,
-    state: index === 8 ? 'running' : 'completed', taskId: `linked-${index}` }));
+  const nodes = Array.from({ length: 40 }, (_, index) => ({ id: `n${index}`, label: `GRAPH_${index}`,
+    state: index === 39 ? 'running' : index < 8 ? 'completed' : 'pending', taskId: `linked-${index}` }));
   const state = { schema: 'omo-herdr-dashboard/role/1', sessionId: 'task8-scope', socketPath: 'fixture',
     parentPaneId: 'fixture-parent', tabId: 'fixture-tab', paneId: 'fixture-owned', scopeEpoch: 1,
     role: view === 'dag' ? 'dag' : 'workers', launchToken: 'task8-test', connected: true, language: 'en',
@@ -718,21 +748,44 @@ for (const view of ['dag', 'tasks']) test(`fixed ${view} follow keeps auto revea
     runs: [{ id: 'run', name: 'TASK8_RUN', status: 'running', nodes,
       edges: nodes.slice(1).map((node, index) => ({ from: nodes[index].id, to: node.id })) }],
     tasks: [...nodes.map(node => ({ id: node.taskId, status: node.state, description: `LINKED_${node.id}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ id: `a${index}`, status: 'completed', description: `ORDINARY_${index}` })),
+      ...Array.from({ length: 40 }, (_, index) => ({ id: `a${index}`, status: 'completed', description: `ORDINARY_${index}` })),
       { id: 'z', status: 'running', description: 'RETAINED_WORKER' }] };
   state.ownerKey = createHash('sha256').update(JSON.stringify([state.socketPath, state.parentPaneId, state.sessionId]))
     .digest('hex').slice(0, 24);
+  const sockets=new Set();
+  const presencePath=`\\\\.\\pipe\\task8-presence-${randomUUID()}`;
+  state.presenceOffer={v:1,token:randomUUID(),ownerKey:state.ownerKey,sessionId:state.sessionId,
+    scopeEpoch:state.scopeEpoch,role:state.role,pipePath:presencePath,sequence:0};
+  const presence=net.createServer(socket=>{
+    sockets.add(socket);socket.on('error',()=>{});socket.once('close',()=>sockets.delete(socket));
+    socket.setEncoding('utf8');
+    let buffer='';
+    socket.on('data',chunk=>{
+      buffer+=chunk;
+      for(let cut=buffer.indexOf('\n');cut>=0;cut=buffer.indexOf('\n')){
+        const message=JSON.parse(buffer.slice(0,cut));buffer=buffer.slice(cut+1);
+        if(message.type!=='hello') continue;
+        const {pipePath,sequence,...binding}=state.presenceOffer;
+        socket.write(`${JSON.stringify({...binding,type:'snapshot',sequence:1,snapshot:{
+          ownerKey:state.ownerKey,sessionId:state.sessionId,scopeEpoch:state.scopeEpoch,
+          sequence:1,availability:'current',phases:[]}})}\n`);
+      }
+    });
+  });
+  const listening=once(presence,'listening');
+  presence.listen(presencePath);await listening;
+  t.after(async()=>{for(const socket of sockets)socket.destroy();await new Promise(resolve=>presence.close(resolve));});
   const options = ['--view', view, '--close-pane', state.paneId, '--launch-token', state.launchToken];
   await writeJson(file, state);
   let viewer = openViewer(file, t, options);
-  const marker = view === 'dag' ? 'GRAPH_8' : 'RETAINED_WORKER';
+  const marker = view === 'dag' ? 'GRAPH_39' : 'RETAINED_WORKER';
   await viewer.frame(text => text.includes(marker) && text.includes(messages.en.followOn));
   state.tasks.filter(task => task.id.startsWith('a')).forEach(task => { task.status = 'running'; });
   state.tasks.find(task => task.id === 'z').description = 'RETAINED_WORKER_UPDATE';
   state.runs[0].name = 'PARALLEL_ARRIVAL';
   const automatic = await viewer.frame(text => text.includes(marker) && text.includes(messages.en.followOn) &&
     (view === 'dag' ? text.includes('PARALLEL_ARRIVAL') : text.includes('RETAINED_WORKER_UPDATE')), () => writeJson(file, state));
-  assert.doesNotMatch(automatic, /LINKED_n8/);
+  assert.doesNotMatch(automatic, /Task:|Progress:|Metrics source:|Started:/);
   await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   await viewer.close();
   const justPaused = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
@@ -740,23 +793,26 @@ for (const view of ['dag', 'tasks']) test(`fixed ${view} follow keeps auto revea
   viewer = openViewer(file, t, options);
   await viewer.frame(text => text.includes(view === 'dag' ? marker : 'ORDINARY_0') &&
     text.includes(messages.en.followOn));
-  const selection = view === 'dag' ? 'LINKED_n8' : 'RETAINED_WORKER_UPDATE';
+  const selection = view === 'dag' ? 'LINKED_n39' : 'RETAINED_WORKER_UPDATE';
   await viewer.frame(text => text.includes(selection) && text.includes(messages.en.followOff), () => viewer.send({ keys: 'p' }));
-  await viewer.frame(text => text.includes(`▸ ${selection}`), () => viewer.send({ keys: ' ' }));
-  await viewer.frame(text => text.includes(selection) && text.includes(messages.en.followOff), () => viewer.send({ keys: 'k' }));
+  await viewer.frame(text => text.includes(selection) && (view === 'dag' ?
+    /└ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] GRAPH_39/.test(text) : text.includes(`▸ ${selection}`)), () => viewer.send({ keys: ' ' }));
+  await viewer.frame(text => text.includes(messages.en.followOff) &&
+    (view==='dag' ? text.includes(selection) : text.includes('59–80/81')), () => viewer.send({ keys: 'k' }));
   await viewer.close();
   const saved = JSON.parse(await readFile(`${file}.view.json`, 'utf8'));
   assert.equal(saved.navigation.follow, false);
   assert.ok(saved.navigation.scroll > 0);
   assert.equal(saved.scopeEpoch, 1);
-  if (view === 'dag') assert.equal(new Map(saved.navigation.selectedNodes).get('run'), 'n8');
+  if (view === 'dag') assert.equal(new Map(saved.navigation.selectedNodes).get('run'), 'n39');
   else assert.equal(saved.navigation.selectedTaskId, 'z');
   const source = await readFile(file, 'utf8');
   viewer = openViewer(file, t, options);
   await viewer.frame(text => text.includes(messages.en.followOn));
   await viewer.frame(text => text.includes(selection) && text.includes(messages.en.followOff),
     () => viewer.send({ keys: 'd' }));
-  await viewer.frame(text => text.includes(`▸ ${selection}`) && text.includes(messages.en.followOff),
+  await viewer.frame(text => text.includes(selection) && text.includes(messages.en.followOff) &&
+    (view === 'dag' ? /└ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] GRAPH_39/.test(text) : text.includes(`▸ ${selection}`)),
     () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => text.includes(selection) && text.includes(messages.en.followOff), () => writeJson(file, state));
   const narrow = await viewer.frame(text => text.split('\n').length === 18 && text.includes(messages.en.followOff) &&
@@ -766,13 +822,14 @@ for (const view of ['dag', 'tasks']) test(`fixed ${view} follow keeps auto revea
   assert.deepEqual(JSON.parse(await readFile(`${file}.view.json`, 'utf8')), saved);
   assert.equal(await readFile(file, 'utf8'), source);
   state.scopeEpoch = 2;
+  state.presenceOffer.scopeEpoch=2;
   state.runs = [];
   state.tasks = [{ id: 'new', status: 'running', description: 'NEW_SCOPE_WORKER' }];
   await writeJson(file, state);
   viewer = openViewer(file, t, options);
   const rebased = await viewer.frame(text => text.includes(messages.en.followOn) &&
-    text.includes(view === 'dag' ? 'DAG (0)' : 'NEW_SCOPE_WORKER'));
-  assert.doesNotMatch(rebased, /GRAPH_8|RETAINED_WORKER|LINKED_n8|ORDINARY_9/);
+    text.includes(view === 'dag' ? 'DAG [0/0]' : 'NEW_SCOPE_WORKER'));
+  assert.doesNotMatch(rebased, /GRAPH_39|RETAINED_WORKER|LINKED_n39|ORDINARY_9/);
   await viewer.close();
 });
 

@@ -6,7 +6,7 @@ import { messages } from '../src/i18n.mjs';
 import { renderFrame, runningTarget, width } from '../src/render.mjs';
 import { isExpanded, setExpanded } from '../src/view-state.mjs';
 
-test('execution colors emphasize unselected graph and task titles, borders and status independently of selection', () => {
+test('execution colors emphasize unselected graph and task titles and bars independently of selection', () => {
   const colors = { running: '36', completed: '32', failed: '31', error: '31', paused: '33', blocked: '33' };
   const nodes = [...Object.keys(colors), 'pending'].map(state => ({ id: state, label: `N_${state}`, state, taskId: state }));
   const state = { connected: true, runs: [{ id: 'r', name: 'Run', status: 'running', nodes, edges: [] }],
@@ -16,15 +16,13 @@ test('execution colors emphasize unselected graph and task titles, borders and s
   for (const [id, color] of Object.entries(colors)) {
     const graph = lines.slice(frame.bodyStart + frame.graphRanges[id].start, frame.bodyStart + frame.graphRanges[id].end);
     const card = lines.slice(frame.bodyStart + frame.nodeRanges[id].start, frame.bodyStart + frame.nodeRanges[id].end);
-    assert.ok(graph[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(id === 'completed' ? graph[1].includes(`\x1b[1;${color}m`) : graph[1].includes(`\x1b[${color}m`) && !graph[1].includes('\x1b[1;'), id);
-    assert.ok(graph[2].includes(`\x1b[${color}m`), id);
-    assert.ok(graph[3].startsWith(`\x1b[${color}m╰`), id);
-    assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-    assert.ok(id === 'completed' ? card[1].includes(`\x1b[1;${color}m`) : card[1].includes(`\x1b[${color}m`) && !card[1].includes('\x1b[1;'), id);
-    assert.ok(card.at(-1).startsWith(`\x1b[${color}m╰`), id);
+    assert.match(stripVTControlCharacters(graph[0]), new RegExp(`N_${id}`));
+    assert.ok(id === 'completed' ? graph[0].includes(`\x1b[1;${color}m`) :
+      graph[0].includes(`\x1b[${color}m`) && !graph[0].includes('\x1b[1;'), id);
+    if (id === 'running') assert.ok(graph[0].includes(`\x1b[${color}m▌`), id);
+    assert.deepEqual(card, graph, 'the stage node owns its compact card');
   }
-  const pending = lines.slice(3 + frame.graphRanges.pending.start, 3 + frame.graphRanges.pending.end).join('\n');
+  const pending = lines.slice(frame.bodyStart + frame.graphRanges.pending.start, frame.bodyStart + frame.graphRanges.pending.end).join('\n');
   assert.ok(!pending.includes('\x1b[36m'));
   state.runs = [];
   state.tasks = nodes.map(node => ({ id: node.id, status: node.state, description: `T_${node.id}` }));
@@ -34,10 +32,10 @@ test('execution colors emphasize unselected graph and task titles, borders and s
     const card = standalone.text.split('\n').slice(standalone.bodyStart + range.start, standalone.bodyStart + range.end);
     if (id === 'completed') {
       assert.equal(range.end-range.start,1);
-      assert.ok(card[0].includes(`\x1b[1;${color}m✓ [+] T_completed`),id);
+      assert.ok(card[0].includes(`\x1b[1;${color}m✓ ▸ T_completed`),id);
     } else {
-      assert.ok(card[0].startsWith(`\x1b[${color}m╭`), id);
-      assert.ok(card[1].includes(`\x1b[${color}m`) && !card[1].includes('\x1b[1;'), id);
+      assert.ok(card[0].includes(`\x1b[${color}m`) && !card[0].includes('\x1b[1;'), id);
+      assert.match(stripVTControlCharacters(card[0]), new RegExp(`T_${id}`));
     }
     if (id === 'completed') assert.ok(!card.join('\n').includes('\x1b[36m'));
   }
@@ -124,7 +122,7 @@ test('follow reveals the running card, leaves visible targets still and preserve
 });
 
 test('standalone follow reveals the running card without changing selection; disconnected frames have no live activity', () => {
-  const tasks = ['a', 'b', 'c', 'z'].map(id => ({ id, status: 'running', description: `TASK_${id}_한글中文`,
+  const tasks = [...'abcdefghijklmnopqrstuvw', 'z'].map(id => ({ id, status: 'running', description: `TASK_${id}_한글中文`,
     activity: { phase: 'text', since: 1000, lastAt: 1000, text: 'LIVE_TOKEN' } }));
   const state = { connected: true, runs: [], tasks, updatedAt: new Date(1000).toISOString() };
   for (const language of ['en', 'ko', 'zh-cn']) {

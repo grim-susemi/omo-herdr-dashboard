@@ -31,14 +31,14 @@ test('running cards show model liveness: phase, time since the last token, stall
   assert.match(detailOf({ ...live, activity: activity('tool', { tool: 'bash' }, 65000) }), /▶ bash running 1m 5s/);
   assert.equal(card({ ...live, activity: activity('tool', { tool: 'bash' }, 65000) }).length, 1);
   // A retry keeps the card's message row.
-  assert.match(card({ ...live, activity: activity('retry', { attempt: 2, maxAttempts: 3 }, 4000) })[2], /↻ retry 2\/3 · 4s/);
+  assert.match(card({ ...live, activity: activity('retry', { attempt: 2, maxAttempts: 3 }, 4000) })[1], /↻ retry 2\/3 · 4s/);
   // A silent token phase or a long first-token wait is flagged; a long tool is not.
-  assert.match(card({ ...live, activity: activity('text', { text: 'LAST' }, 45000) })[2], /⚠ possibly stalled · 45s ago · LAST/);
-  assert.match(card({ ...live, activity: activity('waiting', {}, 95000) })[2], /⚠ possibly stalled · waiting for model 1m 35s/);
+  assert.match(card({ ...live, activity: activity('text', { text: 'LAST' }, 45000) })[1], /⚠ possibly stalled · 45s ago · LAST/);
+  assert.match(card({ ...live, activity: activity('waiting', {}, 95000) })[1], /⚠ possibly stalled · waiting for model 1m 35s/);
   assert.doesNotMatch(card({ ...live, activity: activity('tool', { tool: 'bash' }, 600000) }).join('\n'), /⚠|PROGRESS_LINE/);
   // Korean labels; terminal tasks, malformed activity and missing activity drop the message row.
-  assert.match(detailOf({ ...live, activity: activity('text', { text: 'x' }, 7000) }, { language: 'ko' }), /✎ 7초 전 · x/);
-  assert.match(card({ ...live, activity: activity('waiting', {}, 95000) }, { language: 'ko' })[2], /⚠ 멈춤 의심 · 응답 대기 1분 35초/);
+  assert.match(detailOf({ ...live, activity: activity('text', { text: 'x' }, 7000) }, { language: 'ko' }), /✎ 7s ago · x/);
+  assert.match(card({ ...live, activity: activity('waiting', {}, 95000) }, { language: 'ko' })[1], /⚠ possibly stalled · waiting for model 1m 35s/);
   const viewState = emptyViewState('session');
   setExpanded(viewState, TASK_SCOPE, 'st_done', true);
   const finished = card(done, { viewState }).join('\n');
@@ -46,17 +46,19 @@ test('running cards show model liveness: phase, time since the last token, stall
   assert.doesNotMatch(card({ ...live, activity: { phase: 'text' } }).join('\n'), /PROGRESS_LINE/);
   assert.doesNotMatch(card({ ...live, activity: undefined }).join('\n'), /PROGRESS_LINE/);
   assert.match(detailOf({ ...live, activity: undefined }), /PROGRESS_LINE/);
-  // Detail view labels the activity; the DAG box appends it to the running state and turns yellow when stalled.
+  // Detail labels all activity; compact DAG cards retain only alerts.
   const detail = render({ connected: true, runs: [], tasks: [live] }, { rows: 80, columns: 54, color: false, now, selectedTaskId: 'st_live', verbose: true });
   assert.ok(detail.includes(`${messages.en.activity}: ✎ now · OLD_HEAD`) && detail.includes('PROGRESS_LINE'));
   const run = normalizeRun({ run_id: 'dag', status: 'running', nodes: [
     { id: 'live', state: 'running', task_id: 'st_live' }, { id: 'done', state: 'completed', task_id: 'st_done' }], edges: [] });
   const dag = render({ connected: true, runs: [run], tasks: [live, done] }, { rows: 120, columns: 80, color: false, now });
-  assert.match(dag, /⠋ Running ✎ now …\S*/);
+  assert.match(dag, /⠋ live/);
+  assert.doesNotMatch(dag, /✎|NEWEST_TAIL|OLD_HEAD/);
   assert.doesNotMatch(dag, /DONE_TAIL/);
   const stalled = { ...live, activity: activity('text', { text: 'LAST' }, 45000) };
   const colored = render({ connected: true, runs: [run], tasks: [stalled, done] }, { rows: 120, columns: 80, color: true, now });
-  assert.ok(colored.includes('\x1b[33m⠋ Running ⚠ possibly stalled'));
+  assert.ok(colored.includes('⚠ possibly stalled · 45s ago · LAST'));
+  assert.ok(colored.includes('\x1b[36m▌'), 'the running bar keeps its execution color');
   for (const columns of [12, 20, 35, 54, 120]) for (const line of render({ connected: true, runs: [run], tasks: [live, done] },
     { columns, rows: 48, color: true, now, selectedNodeId: 'live' }).split('\n')) assert.ok(width(line) < columns, `${columns}: ${line}`);
   assert.equal(fitTail('abcdef', 4), '…def');
@@ -78,8 +80,10 @@ test('standalone tasks are separate from every DAG, respect explicit folds, and 
   setExpanded(viewState, TASK_SCOPE, 'a', false);
   const options = { rows: 200, columns: 54, color: false, viewState, selectedTaskId: 'a', now: Date.parse('2026-09-06T00:01:02Z') };
   const fresh = renderFrame(state, options);
-  for (const range of Object.values(fresh.taskRanges)) assert.equal(range.end - range.start, 3);
-  assert.doesNotMatch(fresh.text, /LATEST_PROGRESS|CHILD_SENTINEL|REAL_MODEL/);
+  assert.equal(fresh.taskRanges.a.end - fresh.taskRanges.a.start, 3, 'lost descendant remains actionable');
+  for (const id of ['b','c']) assert.equal(fresh.taskRanges[id].end - fresh.taskRanges[id].start, 1);
+  assert.doesNotMatch(fresh.text, /LATEST_PROGRESS|− CHILD_SENTINEL|REAL_MODEL/);
+  assert.match(fresh.text, /\? GRANDCHILD_SENTINEL/);
   setExpanded(viewState, TASK_SCOPE, 'c', true);
   const frame = renderFrame(state, { ...options, verbose: true });
   for (const value of ['ROOT_SENTINEL', 'visual-engineering', 'REAL_MODEL', 'LATEST_PROGRESS', '00:01:02',
@@ -94,7 +98,8 @@ test('standalone tasks are separate from every DAG, respect explicit folds, and 
   const collapsed = render(state, { ...options, viewState });
   assert.ok(collapsed.includes('ROOT_SENTINEL'));
   assert.ok(!collapsed.includes('LATEST_PROGRESS'));
-  assert.ok(!collapsed.includes('CHILD_SENTINEL'));
+  assert.ok(!collapsed.includes('− CHILD_SENTINEL'));
+  assert.match(collapsed, /\? GRANDCHILD_SENTINEL/);
   state.runs = [{ id: 'r1', name: 'ONE', status: 'running', nodes: [{ id: 'n', state: 'running', label: 'NODE', taskId: 'b' }], edges: [] },
     { id: 'r2', name: 'TWO', status: 'running', nodes: [{ id: 'n', state: 'running', label: 'NODE', taskId: 'c' }], edges: [] }];
   assert.deepEqual(standaloneTasks(state).map(task => task.id), ['a']);
@@ -147,33 +152,34 @@ test('compact cards share content-height safe lines, localized counts, selected-
   for (const id of ['root-id', 'other-id']) setExpanded(expanded, TASK_SCOPE, id, true);
   for (const id of ['node', 'missing']) setExpanded(expanded, 'run', id, true);
   const options = { columns: 80, rows: 200, color: false, viewState: expanded, selectedTaskId: 'root-id', now: Date.parse('2026-09-06T00:09:05Z') };
-  const card = (frame, id, kind = 'taskRanges') => frame.text.split('\n').slice((kind === 'taskRanges' ? 2 : 3) + frame[kind][id].start, (kind === 'taskRanges' ? 2 : 3) + frame[kind][id].end);
+  const card = (frame, id, kind = 'taskRanges') => frame.text.split('\n').slice(frame.bodyStart + frame[kind][id].start - frame.scroll, frame.bodyStart + frame[kind][id].end - frame.scroll);
   const compact = renderFrame(state, options);
   const lines = card(compact, 'root-id');
-  assert.equal(lines.length, 7, 'three root rows, subtask divider, one child row and borders');
-  assert.match(lines[1], /(^|[│▌ ])⠋ ROOT_DESCRIPTION/);
-  assert.doesNotMatch(lines[1], />/);
-  assert.match(lines[2], /\[worker\/visual\] gpt-5.4 \(high\)/);
+  assert.equal(lines.length, 5, 'three root rows, subtask divider and one child row');
+  assert.equal(lines[0], '▌⠋ ROOT_DESCRIPTION · ⧖ 9m 5s');
+  assert.doesNotMatch(lines[0], />/);
+  assert.match(lines[1], /\[worker\/visual\] gpt-5.4 \(high\)/);
   assert.doesNotMatch(lines.join('\n'), /PROGRESS_HEAD/);
-  assert.match(lines[3], /9m 5s · 20 turns · 65 tools/);
-  assert.match(lines[5], /↳ sub ✓ CHILD_DESCRIPTION/);
-  assert.match(card(compact, 'other-id')[1], /× OTHER_DESCRIPTION/);
+  assert.equal(lines[2], '▌20 turns · 65 tools');
+  assert.match(lines[4], /↳ ✓ CHILD_DESCRIPTION/);
+  assert.match(card(compact, 'other-id')[0], /× OTHER_DESCRIPTION/);
   assert.doesNotMatch(lines.join('\n'), /root-id|child-id|opencodex\/|PROGRESS_TAIL|2026-09-06/);
   assert.ok(!lines.join('\n').includes('\x1b'));
   const korean = renderFrame(state, { ...options, language: 'ko' });
-  assert.match(card(korean, 'root-id')[3], /9분 5초 · 20턴 · 도구 65회/);
+  assert.match(card(korean, 'root-id')[0], /9m 5s/);
+  assert.match(card(korean, 'root-id')[2], /20 turns · 65 tools/);
   const full = renderFrame(state, { ...options, verbose: true });
   const fullRoot = card(full, 'root-id').join('\n');
   for (const token of ['root-id', 'PROGRESS_HEAD', 'PROGRESS_TAIL', '2026-09-06T00:00:00Z', 'gpt-5.4']) assert.ok(fullRoot.includes(token), token);
   assert.doesNotMatch(fullRoot, /opencodex\//);
-  assert.equal(card(full, 'other-id').length, 3);
+  assert.equal(card(full, 'other-id').length, 1);
   assert.doesNotMatch(card(full, 'other-id').join('\n'), /OTHER_PROGRESS/);
-  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 7);
+  assert.equal(card(renderFrame(state, { ...options, selectedTaskId: undefined, verbose: true }), 'root-id').length, 5);
   const viewState = emptyViewState('session');
   setExpanded(viewState, TASK_SCOPE, 'root-id', false);
   const saved = structuredClone(viewState);
   const collapsed = renderFrame(state, { ...options, viewState });
-  assert.equal(card(collapsed, 'root-id').length, 3);
+  assert.equal(card(collapsed, 'root-id').length, 1);
   assert.doesNotMatch(card(collapsed, 'root-id').join('\n'), /PROGRESS_HEAD|CHILD_DESCRIPTION/);
   assert.ok(card(renderFrame(state, { ...options, viewState, verbose: true }), 'root-id').join('\n').includes('PROGRESS_TAIL'));
   assert.deepEqual(viewState, saved);
@@ -183,30 +189,27 @@ test('compact cards share content-height safe lines, localized counts, selected-
     { id: 'missing', label: 'MISSING_LABEL', state: 'pending' },
   ], edges: [{ from: 'node', to: 'missing' }] }];
   const freshDag = renderFrame(state, { ...options, viewState: { expanded: { '["run","node"]': false } } });
-  for (const range of Object.values(freshDag.nodeRanges)) assert.equal(range.end - range.start, 3);
+  for (const range of Object.values(freshDag.nodeRanges)) assert.equal(range.end - range.start, 1);
   assert.doesNotMatch(freshDag.text, /PROGRESS_HEAD|CHILD_DESCRIPTION/);
   const dag = renderFrame(state, { ...options, selectedNodeId: 'node' });
   const dagCard = card(dag, 'node', 'nodeRanges');
-  assert.ok(dagCard[0].startsWith('╭─ GRAPH_LABEL '));
-  // The worker card lost its message row; the DAG node card keeps it. Compare the detail rows both
-  // cards share (view chrome such as lane/bar prefixes and dividers differs by design).
-  const dagRows = dagCard.filter(row => !row.includes('PROGRESS_HEAD'));
-  assert.equal(dagRows.length, dagCard.length - 1, 'the DAG node card keeps the message row');
-  assert.doesNotMatch(lines.join('\n'), /PROGRESS_HEAD/, 'the worker card is the DAG card without that row');
+  assert.match(dagCard[0], /^└▌⠋ GRAPH_LABEL/);
+  assert.doesNotMatch(dagCard.join('\n'), /PROGRESS_HEAD/);
+  const dagRows = dagCard;
   const detailRows = rows => rows.map(row => row.replace(/^[│ ]*▌\s*/, '')).filter(row => /^\[|^↳/.test(row));
   assert.deepEqual(detailRows(lines), detailRows(dagRows));
-  assert.match(dag.text, /node → missing/);
+  assert.ok(dag.stageRanges[0].nodeIds.includes('node') && dag.stageRanges[1].nodeIds.includes('missing'));
   const missing = card(dag, 'missing', 'nodeRanges');
-  assert.equal(missing.length, 3);
-  assert.match(missing[1], /○ MISSING_LABEL/);
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /○ MISSING_LABEL/);
   assert.doesNotMatch(missing.join('\n'), /undefined|null|NaN|0 turns/);
   for (const columns of [8, 20, 35, 54, 80]) for (const color of [false, true]) {
     const narrow = renderFrame(state, { ...options, columns, color, selectedNodeId: 'node' });
     assert.ok(narrow.text.split('\n').every(line => width(line) < columns));
     // Where the badge and the model cannot share a row, the badge keeps its own row and the model follows it.
     const narrowCard = card(narrow, 'node', 'nodeRanges');
-    assert.equal(narrowCard.length, columns < 35 ? 9 : 8, `${columns}`);
-    if (!color) assert.match(narrowCard[2], /^│ \[[^\]]+\]/u, `${columns}`);
+    assert.equal(narrowCard.length, columns < 35 ? 6 : 5, `${columns}`);
+    if (!color && columns >=20) assert.match(narrowCard[1], /^ ▌\[[^\]]+\]/u, `${columns}`);
   }
 });
 
@@ -221,12 +224,14 @@ test('DAG detail borders identify their node without changing card height or sta
     const options = { columns, rows: 100, color: false, viewState, selectedNodeId: node.id };
     const frame = renderFrame(state, options);
     const range = frame.nodeRanges[node.id];
-    const card = frame.text.split('\n').slice(3 + range.start, 3 + range.end);
-    assert.equal(card.length, 3);
-    if (columns >= 20) assert.equal(card[1].includes('[+] Work'), !expanded);
-    assert.ok(card[0].startsWith(`╭─ ${fit(label, columns - 7)} `));
-    assert.equal(width(card[0]), columns - 1);
-    assert.ok(card[0].endsWith('─╮'));
+    const card = frame.text.split('\n').slice(frame.bodyStart + range.start, frame.bodyStart + range.end);
+    assert.equal(card.length, 1);
+    assert.match(card[0], expanded ? /^└▌⠋/ : /^└ ⠋/);
+    const detail=renderFrame(state,{...options,verbose:true});
+    const border=detail.text.split('\n')[detail.bodyStart+detail.nodeRanges[node.id].start-detail.scroll];
+    assert.ok(border.startsWith(`╭─ ${fit(label, columns - 7)} `));
+    assert.equal(width(border), columns - 1);
+    assert.ok(border.endsWith('─╮'));
     assert.ok(frame.text.split('\n').every(line => width(line) < columns));
     const colored = render(state, { ...options, color: true });
     assert.ok(colored.split('\n').every(line => width(line) < columns));
@@ -234,16 +239,19 @@ test('DAG detail borders identify their node without changing card height or sta
   const full = render(state, { columns: 200, rows: 100, color: false, selectedNodeId: node.id, verbose: true });
   assert.ok(full.includes(`${label} (${node.id})`));
   node.label = '\x1b]52;c;YQ==\x07safe\x1b[2J\nnode';
-  const cleanFrame = renderFrame(state, { columns: 54, rows: 100, color: false });
-  assert.ok(cleanFrame.text.split('\n')[3 + cleanFrame.nodeRanges[node.id].start].startsWith('╭─ safe node '));
+  const cleanFrame = renderFrame(state, { columns: 54, rows: 100, color: false,selectedNodeId:node.id,verbose:true });
+  assert.ok(cleanFrame.text.split('\n')[cleanFrame.bodyStart + cleanFrame.nodeRanges[node.id].start-cleanFrame.scroll].startsWith('╭─ safe node '));
   assert.ok(!cleanFrame.text.includes('\x1b'));
   const standalone = renderFrame(state, { columns: 54, rows: 100, color: false, view: 'tasks' });
-  assert.equal(standalone.text.split('\n')[2 + standalone.taskRanges.standalone.start], `╭${'─'.repeat(51)}╮`);
+  assert.equal(standalone.text.split('\n')[standalone.bodyStart + standalone.taskRanges.standalone.start], ' ? ▸ Other work');
+  const standaloneDetail=renderFrame(state,{columns:54,rows:100,color:false,view:'tasks',selectedTaskId:'standalone',verbose:true});
+  assert.equal(standaloneDetail.text.split('\n')[standaloneDetail.bodyStart+standaloneDetail.taskRanges.standalone.start-standaloneDetail.scroll],`╭${'─'.repeat(51)}╮`);
 });
 
 test('automatic card ranges and DAG markers use authoritative status, while booleans and detail remain independent', () => {
   for (const dag of [false, true]) for (const status of ['running', 'pending', 'blocked', 'scheduled', 'paused', 'completed', 'failed', 'cancelled', 'skipped', 'error', 'interrupted', 'lost', 'unknown', undefined]) {
-    const task = { id: 'task', status: dag ? (status === 'running' ? 'completed' : 'running') : status, description: 'CARD_SENTINEL', progress: 'PROGRESS_SENTINEL' };
+    const task = { id: 'task', status: dag ? (status === 'running' ? 'completed' : 'running') : status, description: 'CARD_SENTINEL', progress: 'PROGRESS_SENTINEL',
+      agent:'worker',model:'MODEL',turns:2 };
     const state = { connected: true, tasks: [task], runs: dag ? [{ id: 'run', name: 'Run', status: 'running',
       nodes: [{ id: 'node', label: 'NODE_SENTINEL', state: status, taskId: task.id }], edges: [] }] : [] };
     for (const preference of [undefined, false, true]) {
@@ -254,15 +262,14 @@ test('automatic card ranges and DAG markers use authoritative status, while bool
       const expanded = preference ?? status === 'running';
       const frame = renderFrame(state, options);
       const range = dag ? frame.nodeRanges.node : frame.taskRanges.task;
-      // Only a paused worker card keeps its progress sentence; DAG node cards are unchanged.
-      assert.equal(range.end - range.start, expanded ? (dag || status === 'paused' ? 4 : 3) : !dag && status === 'completed' ? 1 : 3);
-      assert.equal(frame.text.includes('PROGRESS_SENTINEL'), expanded && (dag || status === 'paused'));
-      assert.equal(frame.text.includes('[+] CARD_SENTINEL'), !expanded);
+      assert.equal(range.end - range.start, expanded ? (status === 'paused' ? 4 : 3) : 1);
+      assert.equal(frame.text.includes('PROGRESS_SENTINEL'), expanded && status === 'paused');
+      if(!dag) assert.equal(frame.text.includes('▸ CARD_SENTINEL'), !expanded);
       if (dag && (status === 'unknown' || status === undefined)) {
-        assert.match(frame.text, /Graph error: Unknown translation key/);
+        assert.match(frame.text, /\? NODE_SENTINEL/);
         assert.throws(() => renderFrame(state, { ...options, verbose: true }), /Unknown translation key/);
       } else {
-        if (dag) assert.ok(frame.text.includes(`[${expanded ? '-' : '+'}] NODE_SENTINEL`));
+        if (dag) assert.match(frame.text, expanded ? /└▌.*NODE_SENTINEL/ : /└ .*NODE_SENTINEL/);
         assert.ok(renderFrame(state, { ...options, verbose: true }).text.includes('PROGRESS_SENTINEL'));
       }
       assert.deepEqual(renderFrame(state, options), frame);
@@ -304,7 +311,7 @@ test('narrow, normal, and wide terminals preserve row and display width limits',
   assert.equal(width('한글🙂e\u0301'), 7);
   assert.equal(width(fit('한글🙂abcdef', 8, true)), 8);
 });
-test('scrolling reveals exact edge list and failure diagnostics', () => {
+test('scrolling reveals every dependency stage and failure diagnostics', () => {
   const raw = payload(); raw.runs[0].nodes[4].last_error = { message: '검증 실패: timeout' };
   const state = { runs: sessionRuns(raw, sessionId), connected: false };
   const options = { columns: 54, rows: 14, color: false };
@@ -312,7 +319,9 @@ test('scrolling reveals exact edge list and failure diagnostics', () => {
   const frame = end.text;
   const pages = [];
   for (let scroll = 0; scroll <= end.scroll; scroll++) pages.push(render(state, { ...options, scroll }));
-  assert.match(pages.join('\n'), /integrate → verify/);
+  const traversed=pages.join('\n');
+  for(const label of ['Analyze','Server','UI','Integrate','Verify']) assert.ok(traversed.includes(label),label);
+  for(const stage of ['Step 1 1/1','Step 2 0/2','Step 3 0/1','Step 4 0/1']) assert.ok(traversed.includes(stage),stage);
   assert.match(frame, /검증 실패: timeout/);
   assert.match(frame, /Disconnected/);
 });
@@ -338,7 +347,7 @@ test('expanded details wrap full task data and traverse only explicit descendant
   assert.doesNotMatch(frame, /UNRELATED_TASK/);
   assert.ok(frame.split('\n').every(line => width(line) < 54));
   const a = renderFrame(state, { columns: 54, rows: 200, color: false, selectedNodeId: 'a', verbose: true }).nodeRanges.a;
-  const aLines = frame.split('\n').slice(3 + a.start, 3 + a.end).join('\n');
+  const aLines = frame.split('\n').slice(2 + a.start, 2 + a.end).join('\n');
   assert.doesNotMatch(aLines, /DEPENDENCY_NOT_CHILD/);
   assert.ok(aLines.includes(`${messages.en.turns}: 0`));
   assert.ok(aLines.includes(`${messages.en.toolCalls}: 7`));
@@ -346,7 +355,8 @@ test('expanded details wrap full task data and traverse only explicit descendant
     viewState: { expanded: { '["run","a"]': false } } });
   assert.doesNotMatch(collapsed, /PROGRESS_START|EXPLICIT_CHILD|EXPLICIT_GRANDCHILD/);
   assert.match(collapsed, /DEPENDENCY_NOT_CHILD/);
-  assert.match(collapsed, /a → b/);
+  assert.ok(collapsed.indexOf('Analyze')<collapsed.indexOf('Step 2') &&
+    collapsed.indexOf('Step 2')<collapsed.indexOf('Build'));
 });
 
 test('navigation keeps a selected detail header visible and scrolling remains bounded', () => {
@@ -436,13 +446,17 @@ test('elapsed duration follows explicit descendants without borrowing the parent
     { id: 'child', parentTaskId: 'parent', status: 'running', startedAt: '2026-09-06T00:01:00Z' },
     { id: 'unknown', parentTaskId: 'parent', startedAt: '2026-09-06T00:01:00Z' },
   ] };
-  const frame = render(state, { now: Date.parse('2026-09-06T00:02:03Z'), color: false, rows: 100, viewState: { expanded: { '["r","a"]': true } } });
-  const interior = frame.split('\n').filter(line => line.startsWith('│'));
-  assert.equal(interior.length, 6, 'parent, divider and two children without blank rows');
-  assert.match(interior[1], /⧖ 2m 3s/);
-  assert.match(interior[4], /⧖ 1m 3s/);
-  assert.match(interior[5], /↳ sub \? -/);
-  assert.doesNotMatch(interior[5], /1m 3s|2m 3s/);
+  const rendered=renderFrame(state,{now:Date.parse('2026-09-06T00:02:03Z'),color:false,rows:100,
+    viewState:{expanded:{'["r","a"]':true}}});
+  const frame=rendered.text;
+  const range=rendered.nodeRanges.a;
+  const interior=frame.split('\n').slice(rendered.bodyStart+range.start,rendered.bodyStart+range.end);
+  assert.equal(interior.length, 4, 'parent, divider and two children without blank rows');
+  assert.match(interior[0], /⧖ 2m 3s/);
+  assert.match(interior[2], /⧖ 1m 3s/);
+  assert.match(interior[3], /↳ \? -/);
+  assert.doesNotMatch(interior[3],/⧖/);
+  assert.doesNotMatch(interior[3], /1m 3s|2m 3s/);
 });
 
 test('DAG colors use theme ANSI and not fixed light-gray indexes', () => {

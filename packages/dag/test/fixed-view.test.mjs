@@ -26,33 +26,41 @@ for (const view of ['dag', 'tasks']) for (const columns of [80, 29, 24])
 test('initial 60x12 worker viewport shows the whole active card and concise follow state', () => {
   const frame = renderFixedFrame(state, { columns:60, rows:12, color:false, selectedTaskId:'st_ordinary' }, 'tasks');
   const lines = frame.text.split('\n');
-  assert.ok(lines.some(line => /^╰─+╯$/.test(line)), 'Active card bottom is clipped');
+  const range = frame.taskRanges.st_ordinary;
+  assert.ok(range.start >= frame.scroll && range.end <= frame.scroll + frame.bodyRows, 'whole active card is visible');
   assert.ok(frame.text.includes('ORDINARY_ROOT'));
-  assert.match(frame.text, /\$0\.4493.*21 tok\/s/);
+  assert.match(frame.text, /21 tok\/s/);
+  assert.doesNotMatch(frame.text, /\$0\.4493/);
+  assert.match(renderFixedFrame(state, { columns:60, rows:60, color:false,
+    selectedTaskId:'st_ordinary', verbose:true }, 'tasks').text, /\$0\.4493.*21 tok\/s/);
   assert.ok(lines.slice(-3).some(line => line.includes('Follow ON')));
   assert.doesNotMatch(lines.at(-1), /j\/k|Space\/Enter|^f /);
 });
 test('workers viewport suppresses a border-only card edge without changing task ranges', () => {
   const source = {...state, runs:[], tasks:[
     {id:'active',status:'running',description:'ACTIVE',progress:'PROGRESS',turns:2},
-    {id:'next',status:'pending',description:'NEXT'}]};
+    {id:'next',status:'pending',description:'NEXT'},
+    ...Array.from({length:5},(_,index)=>({id:`tail${index}`,status:'pending',description:`TAIL_${index}`}))]};
   const frame = renderFixedFrame(source,{columns:80,rows:8,color:false,
     selectedTaskId:'active'},'tasks');
-  assert.deepEqual(frame.taskRanges.active,{start:0,end:4});
-  assert.deepEqual(frame.taskRanges.next,{start:4,end:7});
+  assert.deepEqual(frame.taskRanges.active,{start:0,end:2});
+  assert.deepEqual(frame.taskRanges.next,{start:3,end:4});
   assert.equal(frame.bodyStart, 2);
   const body=frame.text.split('\n').slice(frame.bodyStart, frame.bodyStart + frame.bodyRows);
-  assert.equal(body.length, 5);
+  assert.equal(body.length, 4);
   assert.doesNotMatch(body.join('\n'), /PROGRESS/);
-  assert.match(body[2], /2 turns/);
-  assert.match(body[3], /^╰/);
-  assert.equal(body[4], '');
+  assert.equal(body[1], '▌2 turns');
+  assert.match(body[2], /^─+$/);
+  assert.equal(body[3], ' ○ ▸ NEXT');
   const colored = renderFixedFrame(source,{columns:80,rows:8,color:true,
     selectedTaskId:'active'},'tasks');
-  assert.equal(colored.text.split('\n')[6], '');
-  const bottomOnly=renderFixedFrame(source,{columns:80,rows:7,color:false,scroll:6},'tasks');
+  assert.deepEqual(colored.taskRanges,frame.taskRanges);
+  const detailed=renderFixedFrame(source,{columns:80,rows:8,color:false,follow:false,
+    selectedTaskId:'active',verbose:true},'tasks');
+  const bottomOnly=renderFixedFrame(source,{columns:80,rows:8,color:false,follow:false,
+    selectedTaskId:'active',verbose:true,scroll:detailed.taskRanges.active.end-1},'tasks');
   assert.equal(bottomOnly.text.split('\n')[2],'');
-  assert.deepEqual(bottomOnly.taskRanges,frame.taskRanges);
+  assert.deepEqual(bottomOnly.taskRanges,detailed.taskRanges);
 });
 
 import { test } from 'node:test';
@@ -81,8 +89,10 @@ for (const view of ['dag', 'tasks']) test(`managed ${view} has a fixed header, a
     viewState: { expanded: { '[null,"st_ordinary"]': true } } }, view).text;
   assert.doesNotMatch(frame, /t DAG|t Tasks/);
   if (view === 'dag') {
-    for (const marker of ['ACTUAL_DAG', 'ACTUAL_FIRST_NODE', 'ACTUAL_SECOND_NODE', 'first → second', 'DAG_LINKED_DETAIL'])
+    for (const marker of ['ACTUAL_DAG', 'ACTUAL_FIRST_NODE', 'ACTUAL_SECOND_NODE', 'Step 1', 'Step 2', 'DAG_LINKED_DETAIL'])
       assert.ok(frame.includes(marker), marker);
+    assert.ok(frame.indexOf('ACTUAL_FIRST_NODE') < frame.indexOf('Step 2') &&
+      frame.indexOf('Step 2') < frame.indexOf('ACTUAL_SECOND_NODE'));
     assert.doesNotMatch(frame, /ORDINARY_ROOT/);
   } else {
     assert.match(frame, /ORDINARY_ROOT/);
@@ -99,7 +109,10 @@ for (const [columns, rows] of [[80, 24], [40, 16], [24, 8], [12, 4], [1, 1]])
     assert.ok(frame.split('\n').length <= rows);
     assert.ok(frame.split('\n').every(line => width(line) < columns || columns === 1 && width(line) <= 1));
     assert.doesNotMatch(frame, /ORDINARY_ROOT|Tasks|t DAG/);
-    if (columns >= 24 && rows >= 8) assert.match(frame, /DAG \(0\)/);
+    if (columns >= 24 && rows >= 8) {
+      assert.match(frame, /DAG \[0\/0\]/);
+      assert.match(frame, /Waiting for a DAG/);
+    }
     assert.deepEqual(empty.runs, []);
   });
 
@@ -139,7 +152,8 @@ test('empty worker and DAG panes name their own role and share the coloured head
 
 
 test('completed ordinary roots shrink to unboxed summaries while manual expansion remains visible', () => {
-  const finished = { id: 'done', status: 'completed', description: 'COMPACT_DONE', progress: 'DETAIL_PROGRESS' };
+  const finished = { id: 'done', status: 'completed', description: 'COMPACT_DONE', progress: 'DETAIL_PROGRESS',
+    model:'FINISHED_MODEL',turns:2 };
   const sample = { connected: true, runs: [], tasks: [finished, { id: 'live', status: 'running', description: 'LIVE_ROOT' }] };
   const folded = renderFixedFrame(sample, { columns: 80, rows: 60, color: false, selectedTaskId: 'done' }, 'tasks');
   assert.equal(folded.taskRanges.done.end - folded.taskRanges.done.start, 1);
@@ -149,6 +163,9 @@ test('completed ordinary roots shrink to unboxed summaries while manual expansio
   assert.doesNotMatch(expanded.text, /DETAIL_PROGRESS|\[\+\] COMPACT_DONE/);
   assert.match(expanded.text, /COMPACT_DONE/);
   assert.equal(expanded.taskRanges.done.end - expanded.taskRanges.done.start, 3);
+  const card=expanded.text.split('\n').slice(expanded.bodyStart+expanded.taskRanges.done.start,
+    expanded.bodyStart+expanded.taskRanges.done.end);
+  assert.deepEqual(card,['▌✓ COMPACT_DONE','▌FINISHED_MODEL','▌2 turns']);
 });
 
 test('completed history keeps canonical counts and every root reachable', () => {
@@ -178,11 +195,14 @@ for (const status of ['running','pending','blocked','paused','error','lost']) te
   assert.ok(frame.taskRanges.parent.end-frame.taskRanges.parent.start>1);
 });
 
-test('14-row workers fit the entire selected running card including metrics and bottom border', () => {
+test('14-row workers fit the entire selected running card including metrics', () => {
   const frame = renderFixedFrame(state,{columns:80,rows:14,color:false,selectedTaskId:'st_ordinary'},'tasks');
-  assert.match(frame.text,/\$0\.4493.*21 tok\/s/);
+  assert.match(frame.text,/21 tok\/s/);
+  assert.doesNotMatch(frame.text,/\$0\.4493/);
   const lines=frame.text.split('\n');
-  assert.ok(lines.findIndex(line=>line.startsWith('╰'))>lines.findIndex(line=>line.includes('21 tok/s')));
+  const range=frame.taskRanges.st_ordinary;
+  assert.ok(range.end<=frame.scroll+frame.bodyRows);
+  assert.equal(lines[frame.bodyStart+range.end-frame.scroll-1],'▌21 tok/s');
 });
 
 for (const view of ['dag', 'tasks']) for (const [columns, rows] of [[52, 23], [34, 18], [51, 46]])
@@ -191,7 +211,7 @@ for (const view of ['dag', 'tasks']) for (const [columns, rows] of [[52, 23], [3
       runningNodeId: 'first', runningTaskId: 'st_ordinary', follow: true }, view);
     const lines = frame.text.split('\n');
     assert.equal(lines.length, rows);
-    assert.equal(frame.bodyStart, view === 'dag' ? 3 : 2);
+    assert.equal(frame.bodyStart, 2);
     assert.ok(frame.bodyRows > 0);
     const range = view === 'dag' ? frame.graphRanges.first : frame.taskRanges.st_ordinary;
     const visible = lines.slice(frame.bodyStart + Math.max(0, range.start - frame.scroll),
@@ -318,7 +338,7 @@ for (const view of ['dag', 'tasks']) test(`real fixed ${view} PTY ignores t and 
     events.on('frame', onFrame); child.once('exit', onExit);
     Promise.resolve().then(action).catch(error => finish(error));
   });
-  const title = view === 'dag' ? 'OMO  /  DAG' : 'OMO  /  Tasks';
+  const title = view === 'dag' ? 'DAG [0/2]' : 'Tasks [0/1]';
   await frame(text => text.includes(title) && text.includes('Follow ON'));
   // f gives this otherwise-no-op t action an exact observable completion;
   // a clock repaint cannot satisfy Follow OFF before the key sequence.
@@ -327,13 +347,13 @@ for (const view of ['dag', 'tasks']) test(`real fixed ${view} PTY ignores t and 
   await frame(text => text.includes(title) && text.includes('Follow ON'), () => send('f'));
   if (view === 'dag') {
     managed.runs = [];
-    const empty = await frame(text => text.includes('DAG (0)'), () => writeJson(file, managed));
+    const empty = await frame(text => text.includes('DAG [0/0]') && text.includes('Waiting for a DAG'), () => writeJson(file, managed));
     assert.doesNotMatch(empty, /ORDINARY_ROOT|Tasks/);
   } else {
     managed.tasks.find(task => task.id === 'st_ordinary').description = 'UPDATED_ORDINARY';
     managed.runs[0].name = 'OTHER_ROLE_ACTIVE';
     const updated = await frame(text => text.includes('UPDATED_ORDINARY'), () => writeJson(file, managed));
-    assert.match(updated, /OMO  \/  Tasks/);
+    assert.match(updated, /^ Tasks \[0\/1\]/);
     assert.doesNotMatch(updated, /OTHER_ROLE_ACTIVE|ACTUAL_FIRST_NODE/);
   }
   const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });

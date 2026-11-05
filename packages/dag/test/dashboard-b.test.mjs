@@ -177,7 +177,8 @@ test('labelled worker details wrap with a stable hanging indent while compact ca
   const options = { columns: 30, rows: 100, color: false, selectedTaskId: 'root', frame: 0, now: 0 };
   const frame = renderFrame(state, options), range = frame.taskRanges.root;
   const lines = frame.text.split('\n').slice(frame.bodyStart + range.start, frame.bodyStart + range.end);
-  assert.equal(lines.length, 3);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^ ⠋ HEAD .*…$/);
   assert.doesNotMatch(lines.join('\n'), /PROGRESS/);
   const detail = renderFrame(state, { ...options, verbose: true }).text.split('\n');
   const label = `${messages.en.description}: `;
@@ -257,23 +258,21 @@ test('worker and DAG cards follow their content with role badges, a time mark an
       selectedTaskId: 'root', selectedNodeId: 'node' };
     const frame = renderFrame(state, options);
     const card = cardLines(frame, view === 'dag' ? frame.nodeRanges.node : frame.taskRanges.root);
-    const sub = messages[language].subtask;
-    const rows = card.slice(1, -1).map(line => line.slice(2, -2).trimEnd());
-    // Worker cards drop a healthy task's message row; DAG node cards still show it.
-    const divider = view === 'dag' ? 4 : 3;
-    assert.deepEqual([...rows.slice(0, divider), ...rows.slice(divider + 1)], ['⠋ ROOT_TITLE', '[deep-high] gpt-6.1-sol:xhigh',
-      ...(view === 'dag' ? ['ROOT_PROGRESS'] : []), `⧖ ${language === 'en' ? '1m 0s' : '1분 0초'}`, `  ↳ ${sub} ⠋ CHILD_TITLE`,
-      '  [deep-low] gpt-6.1-sol:medium', `    ↳ ${sub} ○ GRAND_TITLE`, '    [quick] gpt-6.1-sol:low'], `${view} ${columns}`);
-    if (view !== 'dag') assert.doesNotMatch(card.join('\n'), /ROOT_PROGRESS/);
+    const rows = card.map(line => line.slice(view === 'dag' ? 2 : 1));
+    const divider = 2;
+    assert.deepEqual([...rows.slice(0, divider), ...rows.slice(divider + 1)], [
+      `${view === 'dag' ? '⠋ NODE  ROOT_TITLE' : '⠋ ROOT_TITLE'} · ⧖ 1m 0s`,
+      '[deep-high] gpt-6.1-sol:xhigh', '↳ ⠋ CHILD_TITLE',
+      '[deep-low] gpt-6.1-sol:medium', '↳ ○ GRAND_TITLE', '[quick] gpt-6.1-sol:low'], `${view} ${columns}`);
+    assert.doesNotMatch(card.join('\n'), /ROOT_PROGRESS/);
     assert.ok(rows[divider].startsWith(`─ ${t(language, 'subtasksCount', { count: 2 })} ─`), rows[divider]);
     assert.ok(rows.every(row => row.trim()), 'no blank row inside the card');
     assert.equal(card.join('\n').split('⧖').length - 1, 1);
-    assert.ok(card.every(line => width(line) === columns - 1 && line.endsWith('│') || /^[╭╰]/.test(line) &&
-      width(line) === columns - 1), 'card borders align');
+    assert.ok(card.every(line => width(line) < columns && line.includes('▌')), 'content stays inside its bar card');
     assert.ok(frame.text.split('\n').every(line => width(line) < columns));
     const colored = renderFrame(state, { ...options, color: true });
     assert.equal(stripVTControlCharacters(colored.text), frame.text);
-    for (const badge of ['[deep-high]', '[deep-low]', '[quick]']) assert.ok(colored.text.includes(`\x1b[36m${badge}\x1b[0m`), badge);
+    for (const badge of ['[deep-high]', '[deep-low]', '[quick]']) assert.ok(colored.text.includes(`\x1b[35m${badge}\x1b[0m`), badge);
   }
 });
 
@@ -304,8 +303,8 @@ test('card marks measure one cell, mark only elapsed time and leave the schedule
   const tasks = [{ id: 'later', status: 'scheduled', description: 'LATER' },
     { id: 'turns', status: 'running', description: 'TURNS_ONLY', turns: 3 }];
   const text = renderFrame({ connected: true, runs: [], tasks }, { columns: 40, rows: 30, color: false, frame: 0, now: cardNow }).text;
-  assert.match(text, /◷ \[\+\] LATER/);
-  assert.match(text, /^│ 3 turns +│$/m);
+  assert.match(text, /◷ ▸ LATER/);
+  assert.match(text, /^▌3 turns$/m);
   assert.doesNotMatch(text, /⧖/);
 });
 
@@ -324,23 +323,22 @@ test('long CJK titles, long models and roles, and empty roles stay inside the ca
     assert.ok(plain.every(line => width(line) < columns), `${columns}`);
     const card = id => plain.slice(frame.bodyStart + frame.taskRanges[id].start, frame.bodyStart + frame.taskRanges[id].end);
     for (const id of ['a-cjk', 'b-empty', 'c-control', 'd-role']) {
-      assert.ok(card(id).every(line => width(line) === columns - 1), `${id} ${columns}`);
-      assert.ok(card(id).slice(1, -1).every(line => line.replace(/[│\s]/gu, '')), `${id} ${columns}`);
+      assert.ok(card(id).every(line => width(line) < columns), `${id} ${columns}`);
+      assert.ok(card(id).every(line => line.slice(1).trim()), `${id} ${columns}`);
     }
     const cjk = card('a-cjk');
-    assert.match(cjk[1], /…\s*│$/);
+    assert.match(cjk[0], /… · ⧖ 1m 0s$/);
     // The truncated role badge always survives; the model shares its row when it fits and follows it otherwise.
-    assert.match(cjk[2], /^│ \[r+…?\]/);
-    const modelAt = /:xhigh\s*│$/.test(cjk[2]) ? 2 : 3;
-    assert.match(cjk[modelAt], /:xhigh\s*│$/);
-    assert.match(cjk[modelAt + 1], /^│ ⧖ 1m 0s\s+│$/);
+    assert.match(cjk[1], /^▌\[r+…?\]$/);
+    assert.match(cjk[2], /:xhigh$/);
+    assert.equal(cjk.length, 3);
     assert.doesNotMatch(cjk.join('\n'), /進捗/);
     assert.doesNotMatch(cjk.join('\n'), /provider\//);
     for (const id of ['b-empty', 'c-control']) {
-      assert.equal(card(id).length, 4, id);
-      assert.match(card(id)[2], /^│ gpt-6\.1-sol\s+│$/);
+      assert.equal(card(id).length, 2, id);
+      assert.equal(card(id)[1], '▌gpt-6.1-sol');
     }
-    assert.match(card('d-role')[2], /^│ \[c+…\]\s*│$/);
+    assert.match(card('d-role')[1], /^▌\[c+…\]$/);
   }
 });
 
@@ -354,23 +352,23 @@ test('a populated role or category keeps its coloured badge before the model at 
     assert.equal(stripVTControlCharacters(colored.text), frame.text);
     for (const task of tasks) {
       const card = cardLines(frame, frame.taskRanges[task.id]);
-      assert.ok(card.every(line => width(line) === columns - 1), `${task.id} ${columns}`);
-      const badgeAt = card.findIndex(line => /^│ \[.+\]\s*(?:\S.*)?│$/u.test(line));
+      assert.ok(card.every(line => width(line) < columns), `${task.id} ${columns}`);
+      const badgeAt = card.findIndex(line => /^▌\[.+\](?: \S.*)?$/u.test(line));
       assert.ok(badgeAt > 0, `badge missing ${task.id} ${columns}`);
       const modelAt = card.findIndex(line => /:xhigh/.test(line));
       assert.ok(modelAt >= badgeAt, `model before badge ${task.id} ${columns}`);
       const raw = colored.text.split('\n').slice(colored.bodyStart + colored.taskRanges[task.id].start,
         colored.bodyStart + colored.taskRanges[task.id].end)[badgeAt];
-      assert.match(raw, /\x1b\[36m\[[^\x1b]*\]\x1b\[0m/u, `badge colour ${task.id} ${columns}`);
+      assert.match(raw, /\x1b\[35m\[[^\x1b]*\]\x1b\[0m/u, `badge colour ${task.id} ${columns}`);
     }
   }
   const narrow = renderFrame({ connected: true, runs: [], tasks }, { columns: 40, rows: 200, color: false, frame: 0, now: cardNow });
   const both = cardLines(narrow, narrow.taskRanges['p-both']);
-  assert.match(both[2], /^│ \[deep-high\/visual-engineering\] +│$/);
-  assert.match(both[3], /^│ gpt-6\.1-sol:xhigh +│$/);
+  assert.equal(both[1], '▌[deep-high/visual-engineering]');
+  assert.equal(both[2], '▌gpt-6.1-sol:xhigh');
   const long = cardLines(narrow, narrow.taskRanges['p-long']);
-  assert.match(long[2], /^│ \[r+…\] +│$/);
-  assert.match(long[3], /^│ gpt-6\.1-sol:xhigh +│$/);
+  assert.match(long[1], /^▌\[r+…\]$/);
+  assert.equal(long[2], '▌gpt-6.1-sol:xhigh');
 });
 
 test('DAG runs draw no boxes: a lane graph with stage headers and a barred card per open node', () => {
@@ -477,33 +475,36 @@ test('worker and DAG cards share three rows, and role and model split onto two w
 
 test('a card one column narrower than its longest line truncates with an ellipsis instead of overflowing', () => {
   const task = { id: 'wide', status: 'running', description: 'D'.repeat(32), agent: 'deep-high', model: 'gpt-6.1-sol',
-    reasoningEffort: 'xhigh', startedAt: '2026-10-14T00:00:00.000Z', progress: 'PROGRESS' };
+    reasoningEffort: 'xhigh', progress: 'PROGRESS' };
   const draw = columns => {
     const frame = renderFrame({ connected: true, runs: [], tasks: [task] },
       { columns, rows: 50, color: false, frame: 0, now: cardNow, selectedTaskId: 'wide' });
     return { frame, card: cardLines(frame, frame.taskRanges.wide) };
   };
-  // The title row, '⠋ ' plus 32 cells, is the widest; 39 columns leave exactly 34 interior cells.
-  const exact = draw(39);
-  assert.ok(exact.card[1].endsWith(`⠋ ${'D'.repeat(32)} │`));
+  // One terminal margin and one bar leave 34 content cells at 36 columns.
+  const exact = draw(36);
+  assert.equal(exact.card[0], `▌⠋ ${'D'.repeat(32)}`);
   assert.doesNotMatch(exact.frame.text, /…/);
-  const narrow = draw(38);
-  assert.ok(narrow.card[1].endsWith(`⠋ ${'D'.repeat(30)}… │`));
-  assert.ok(narrow.card.every(line => width(line) === 37));
-  assert.ok(narrow.frame.text.split('\n').every(line => width(line) < 38));
+  const narrow = draw(35);
+  assert.equal(narrow.card[0], `▌⠋ ${'D'.repeat(30)}…`);
+  assert.ok(narrow.frame.text.split('\n').every(line => width(line) < 35));
 });
 
 test('consecutive worker cards and DAG detail cards are not separated by blank rows', () => {
   const tasks = [{ id: 'a', status: 'running', description: 'FIRST', progress: 'FIRST_PROGRESS' },
     { id: 'b', status: 'pending', description: 'SECOND' }, { id: 'c', status: 'failed', description: 'THIRD' }];
   const workers = renderFrame({ connected: true, runs: [], tasks }, { columns: 40, rows: 60, color: false, frame: 0, now: 0 });
-  assert.equal(workers.taskRanges.b.start, workers.taskRanges.a.end);
-  assert.equal(workers.taskRanges.c.start, workers.taskRanges.b.end);
+  const workerRows = workers.text.split('\n');
+  assert.match(workerRows[workers.bodyStart + workers.taskRanges.a.end], /^─+$/);
+  assert.equal(workers.taskRanges.b.start, workers.taskRanges.a.end + 1);
+  assert.equal(workers.taskRanges.c.start, workers.taskRanges.b.end + 1);
+  assert.match(workerRows[workers.bodyStart + workers.taskRanges.c.start - 1], /^─ History \(1\) ─/);
   const run = { id: 'run', name: 'RUN', status: 'running', edges: [{ from: 'one', to: 'two' }], nodes: [
     { id: 'one', label: 'ONE', state: 'running', taskId: 'a' }, { id: 'two', label: 'TWO', state: 'pending', taskId: 'b' }] };
   const dag = renderFrame({ connected: true, runs: [run], tasks }, { columns: 40, rows: 80, color: false, frame: 0, now: 0 });
-  assert.equal(dag.nodeRanges.two.start, dag.nodeRanges.one.end);
-  assert.equal(dag.text.split('\n')[dag.bodyStart + dag.nodeRanges.one.start - 1], messages.en.details);
+  assert.equal(dag.nodeRanges.two.start, dag.nodeRanges.one.end + 1);
+  assert.match(dag.text.split('\n')[dag.bodyStart + dag.nodeRanges.one.start - 1], /^─ Step 1 /);
+  assert.match(dag.text.split('\n')[dag.bodyStart + dag.nodeRanges.two.start - 1], /^─ Step 2 /);
 });
 
 test('every row of a bar card starts right after the bar at every depth', () => {
