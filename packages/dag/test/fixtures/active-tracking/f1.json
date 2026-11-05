@@ -1,0 +1,5 @@
+{"sessionId":"synthetic-f1","connected":true,"runs":[{"id":"run","name":"F1","status":"running","nodes":[
+{"id":"c0","label":"DONE_0","state":"completed"},{"id":"c1","label":"DONE_1","state":"completed"},{"id":"c2","label":"DONE_2","state":"completed"},{"id":"c3","label":"DONE_3","state":"completed"},{"id":"c4","label":"DONE_4","state":"completed"},
+{"id":"r0","label":"RUNNING_PRIMARY","state":"running"},{"id":"r1","label":"RUNNING_SECONDARY","state":"running"},
+{"id":"p","label":"PENDING_NODE","state":"pending"},
+{"id":"s","label":"SCHEDULED_NODE","state":"scheduled"},{"id":"b","label":"BLOCKED_NODE","state":"blocked"}],"edges":[]}],"tasks":[]}

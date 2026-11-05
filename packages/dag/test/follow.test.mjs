@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { stripVTControlCharacters } from 'node:util';
 import { messages } from '../src/i18n.mjs';
 import { renderFrame, runningTarget, width } from '../src/render.mjs';
+import { isExpanded, setExpanded } from '../src/view-state.mjs';
 
 test('execution colors emphasize unselected graph and task titles, borders and status independently of selection', () => {
   const colors = { running: '36', completed: '32', failed: '31', error: '31', paused: '33', blocked: '33' };
@@ -101,15 +103,16 @@ test('follow reveals the running card, leaves visible targets still and preserve
   const state = { connected: true, runs: [{ id: 'r', name: 'Run', status: 'running', nodes,
     edges: nodes.slice(1).map((node, i) => ({ from: nodes[i].id, to: node.id })) }],
   tasks: nodes.map(node => ({ id: node.taskId, status: node.state, description: `DETAIL_${node.id}`, progress: 'TOKEN_HEAD' })) };
-  const shown = (frame, range) => range.start >= frame.scroll && range.end <= frame.scroll + frame.bodyRows;
   for (const language of ['en', 'ko', 'zh-cn']) for (const columns of [12, 20, 35, 54, 81]) {
     const options = { columns, rows: 18, color: true, language, selectedNodeId: 'n0', runningNodeId: 'n8' };
     const frame = renderFrame(state, options);
-    assert.ok(shown(frame, frame.graphRanges.n8), `${language} ${columns} running card on screen`);
+    assert.equal(frame.scroll, frame.stageRanges.find(stage => stage.nodeIds.includes('n8')).start,
+      `${language} ${columns} stage header at viewport top`);
+    assert.equal(frame.graphRanges.n8.start - frame.scroll, 1, 'running title immediately follows its stage header');
+    assert.ok(frame.bodyStart + frame.graphRanges.n8.start - frame.scroll + 1 <= 8, 'title within physical top eight');
     assert.ok(frame.text.split('\n').every(line => width(line) < columns));
-    if (frame.scroll > 0 && shown({ ...frame, scroll: frame.scroll - 1 }, frame.graphRanges.n8)) {
-      assert.equal(renderFrame(state, { ...options, scroll: frame.scroll - 1 }).scroll, frame.scroll - 1);
-    }
+    assert.equal(renderFrame(state, { ...options, scroll: Math.max(0, frame.scroll - 1) }).scroll, frame.scroll,
+      'follow re-pins a target that was already visible');
     state.tasks[8].progress = 'TOKEN_TAIL';
     assert.equal(renderFrame(state, { ...options, scroll: frame.scroll }).scroll, frame.scroll);
     const manual = renderFrame(state, { ...options, follow: false, scroll: 0 });
@@ -168,4 +171,55 @@ test('titles start without a marker column and only the selected title is bold',
     assert.ok(workerRow('ta').includes('\x1b[31m× ▸ T_A') && !workerRow('ta').includes('\x1b[1;'), workerRow('ta'));
     assert.ok(workerRow('tc').includes('\x1b[36m⠋ T_C') && !workerRow('tc').includes('\x1b[1;'), workerRow('tc'));
   }
+});
+
+function pointerViewer() {
+  const state = JSON.parse(readFileSync(new URL('./fixtures/active-tracking/f1.json', import.meta.url), 'utf8'));
+  let closing = false, view = 'dag', follow = true, revealSelection = false, scrollAnchor, dragY, headerDrag = false, scroll = 0, lastFrame;
+  const selectedNodes = new Map(), selectedId = state.runs[0].id, viewState = { expanded: {} };
+  const captureScrollAnchor = () => undefined;
+  function draw() {
+    lastFrame = renderFrame(state, { view, fixed: true, columns: 54, rows: 8, color: false, follow, scroll,
+      viewState, runningNodeId: follow ? 'r0' : undefined });
+    scroll = lastFrame.scroll;
+  }
+  draw();
+  // Execute the actual input owner without a test-only export from the viewer.
+  const source = readFileSync(new URL('../src/viewer.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('pointer: mouse => {') + 9;
+  const end = source.indexOf('} });\ndisposeFocus', start) + 1;
+  const pointer = eval(`(${source.slice(start, end)})`);
+  return { pointer, snapshot: () => ({ scroll, dragY, headerDrag, frame: lastFrame }) };
+}
+
+for (const [name, release] of [['SGR', { button: 0, release: true }], ['button', { button: 3 }]]) {
+  test(`pinned header drag stays still until ${name} release`, () => {
+    const viewer = pointerViewer(), y = viewer.snapshot().frame.pinnedHeader.row + 1;
+    const positions = [viewer.snapshot().scroll], offsets = [viewer.snapshot().dragY];
+    for (const [button, row] of [[0, y], [32, y + 1], [32, y + 2], [32, y + 3]]) {
+      viewer.pointer({ button, y: row, x: 5 });
+      positions.push(viewer.snapshot().scroll); offsets.push(viewer.snapshot().dragY);
+    }
+    assert.deepEqual(positions, [6, 6, 6, 6, 6]);
+    assert.deepEqual(offsets, Array(5).fill(undefined), 'header movement never arms a body drag');
+    viewer.pointer({ ...release, y: y + 3, x: 5 });
+    assert.equal(viewer.snapshot().headerDrag, false, 'release ends header suppression');
+  });
+}
+
+test('body drag keeps its existing row deltas below the pinned header', () => {
+  const viewer = pointerViewer(), y = viewer.snapshot().frame.bodyStart + 1;
+  const positions = [viewer.snapshot().scroll];
+  for (const [button, row] of [[0, y], [32, y + 1], [32, y + 2], [32, y + 3]]) {
+    viewer.pointer({ button, y: row, x: 5 }); positions.push(viewer.snapshot().scroll);
+  }
+  assert.deepEqual(positions, [6, 6, 5, 4, 3]);
+  assert.equal(viewer.snapshot().dragY, y + 3);
+});
+
+test('wheel reports are not mistaken for button release', () => {
+  const viewer = pointerViewer();
+  viewer.pointer({ button: 67, y: 3, x: 5 });
+  assert.equal(viewer.snapshot().scroll, 9);
+  assert.match(viewer.snapshot().frame.text, /Follow OFF/);
 });

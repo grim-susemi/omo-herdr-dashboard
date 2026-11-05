@@ -1,0 +1,1 @@
+{"sessionId":"synthetic-f4","connected":true,"runs":[{"id":"done","name":"DONE_RUN","status":"completed","nodes":[{"id":"a","label":"DONE_A","state":"completed"},{"id":"b","label":"DONE_B","state":"completed"},{"id":"c","label":"DONE_C","state":"completed"}],"edges":[{"from":"a","to":"b"},{"from":"b","to":"c"}]}],"tasks":[]}

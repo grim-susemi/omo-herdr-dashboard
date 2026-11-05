@@ -1,0 +1,1 @@
+{"sessionId":"synthetic-f3-scheduled","connected":true,"runs":[{"id":"scheduled","name":"SCHEDULED_RUN","status":"running","nodes":[{"id":"pending","label":"PENDING_FIRST","state":"pending"},{"id":"scheduled","label":"SCHEDULED_TARGET","state":"scheduled"}],"edges":[]}],"tasks":[]}

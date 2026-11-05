@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
-import { completedTasks, defaultTaskId, renderFrame, runningTarget, workersSections } from './render.mjs';
+import { completedTasks, dagInspectionRun, defaultTaskId, renderFrame, runningTarget, workersSections } from './render.mjs';
 import { readJson } from './storage.mjs';
 import { TASK_SCOPE, emptyViewState, isExpanded, loadViewState, saveViewState, setExpanded } from './view-state.mjs';
 
@@ -102,13 +102,15 @@ function validManaged(next) {
       .digest('hex').slice(0, 24);
 }
 if (fixedView && launchToken && !validManaged(state)) throw new Error('Managed viewer launch identity mismatch');
-let selectedId = state?.runs?.[0]?.id;
+let selectedId = (fixedView !== 'tasks' ? dagInspectionRun(state)?.id : undefined) ?? state?.runs?.[0]?.id;
 let view = fixedView ?? (state?.runs?.length ? 'dag' : 'tasks'), selectedTaskId;
 let scroll = 0, error = '', timer, drawing = false, again = false;
 let viewState = emptyViewState(state?.sessionId), viewError = '', saving = Promise.resolve(), closing = false;
 const selectedNodes = new Map();
 let revealSelection = false, verbose = false, detailSelection, completedExpanded = false;
+let dagCompletedExpanded = false;
 let follow = true, target, lastFrame, dragY, disposeFocus, scrollAnchor;
+let headerDrag = false;
 let presenceClient, presenceMessage, presenceKey, controlKey, presenceNotice = '';
 let retirementServer;
 const retirementSockets = new Set();
@@ -185,24 +187,41 @@ function draw() {
   if (closing) return;
   const sections = workersSections(state);
   if (interactive) animation.update(state);
-  if (!error) target = runningTarget(!fixedView ? state : fixedView === 'dag' ?
+  if (!error && (view !== 'dag' || state?.connected)) target = runningTarget(!fixedView ? state : fixedView === 'dag' ?
     { ...state, tasks: [] } : { ...state, runs: [], tasks: sections.roots }, target);
-  const running = !error && follow && state?.connected ? target : undefined;
+  const running = !error && follow && state?.connected && (view !== 'dag' || !presenceKey || presenceMessage) ? target : undefined;
   if (running) {
     if (view !== running.view || running.view === 'dag' && selectedId !== running.runId) scroll = 0;
     view = fixedView ?? running.view;
     if (view === 'dag') selectedId = running.runId;
   }
+  if (view === 'dag' && !running && !target && follow && state?.connected && !error &&
+      (!presenceKey || presenceMessage)) selectedId = dagInspectionRun(state, selectedId)?.id ?? selectedId;
   let runIndex = state?.runs?.findIndex(run => run.id === selectedId) ?? 0;
-  if (runIndex < 0) { runIndex = 0; selectedId = state?.runs?.[0]?.id; }
+  if (runIndex < 0) {
+    selectedId = dagInspectionRun(state)?.id ?? state?.runs?.[0]?.id;
+    runIndex = Math.max(0, state?.runs?.findIndex(run => run.id === selectedId) ?? 0);
+  }
   const run = state?.runs?.[runIndex];
   if (!fixedView && !state?.runs?.length) view = 'tasks';
   const roots = sections.roots;
   if (!roots.some(task => task.id === selectedTaskId)) selectedTaskId = defaultTaskId(state, roots);
-  if (scrollAnchor &&
+  if (view === 'tasks' && scrollAnchor &&
     ![scrollAnchor.id, ...(scrollAnchor.candidates ?? [])].some(id => roots.some(task => task.id === id)))
     scrollAnchor = undefined;
-  if (!run?.nodes.some(node => node.id === selectedNodes.get(selectedId))) selectedNodes.set(selectedId, run?.nodes[0]?.id);
+  if (view === 'dag' && scrollAnchor && scrollAnchor.runId !== selectedId) {
+    scrollAnchor = undefined; scroll = 0;
+  }
+  const selectedNodeId = selectedNodes.get(selectedId);
+  if (!run?.nodes.some(node => node.id === selectedNodeId)) {
+    const stage = lastFrame?.runId === selectedId && lastFrame?.stageRanges?.find(item => item.nodeIds.includes(selectedNodeId));
+    const ids = stage?.nodeStages?.find(nodes => nodes.includes(selectedNodeId)) ?? stage?.nodeIds ?? [];
+    const at = ids.indexOf(selectedNodeId);
+    const candidates = at < 0 ? [] : [...ids.slice(at + 1), ...ids.slice(0, at).reverse()];
+    const fallback = candidates.find(id => run?.nodes.some(node => node.id === id)) ?? run?.nodes[0]?.id;
+    selectedNodes.set(selectedId, fallback);
+    if (stage && fallback) revealSelection = true;
+  }
   const selection = JSON.stringify([state?.sessionId, view, view === 'tasks' ? null : selectedId,
     view === 'tasks' ? selectedTaskId : selectedNodes.get(selectedId)]);
   if (selection !== detailSelection) { verbose = false; detailSelection = selection; }
@@ -215,6 +234,8 @@ function draw() {
     offline: Boolean(presenceKey && !presenceMessage),
     error, notice: viewError ? t(state?.language, 'viewError', { error: viewError }) : presenceNotice, completedExpanded,
     selectedNodeId: selectedNodes.get(selectedId), selectedTaskId, view, viewState, verbose, revealSelection, follow,
+    dagCompletedExpanded,
+    inspectUnfinished: view === 'dag',
     runningNodeId: running?.nodeId, runningTaskId: running?.taskId ?? followHistoryId, frame: animation.frame, now: clock.now() };
   const render = () => fixedView ? renderFixedFrame(state, options, fixedView) : renderFrame(state, options);
   let result = render();
@@ -222,10 +243,16 @@ function draw() {
   // anchor to its task start plus the within-card offset; relayout only when
   // that row moved (arrivals/removals above it). A metrics-only update resolves
   // to the exact same row and keeps the visible window unchanged.
-  if (!follow && !revealSelection && view === 'tasks' && scrollAnchor) {
-    const anchored = scrollForAnchor(scrollAnchor, result.taskRanges);
+  if (!follow && !revealSelection && scrollAnchor) {
+    const folded = view === 'dag' && result.stageRanges.find(stage => stage.folded &&
+      [scrollAnchor.id, ...(scrollAnchor.candidates ?? [])].some(id => stage.nodeIds.includes(id)));
+    const anchored = scrollForAnchor(scrollAnchor, view === 'tasks' ? result.taskRanges : result.graphRanges) ?? folded?.start;
     if (anchored !== undefined && result.scroll !== anchored) {
       options.scroll = anchored;
+      result = render();
+    } else if (view === 'dag' && anchored === undefined) {
+      scrollAnchor = undefined;
+      options.scroll = 0;
       result = render();
     }
   }
@@ -259,14 +286,26 @@ function scrollForAnchor(anchor, ranges) {
   return undefined;
 }
 function captureScrollAnchor() {
-  const ranges = view === 'tasks' ? lastFrame?.taskRanges : undefined;
+  const ranges = view === 'tasks' ? lastFrame?.taskRanges : lastFrame?.graphRanges;
   if (!ranges) return undefined;
+  const folded = view === 'dag' && lastFrame?.stageRanges.find(stage =>
+    stage.folded && scroll >= stage.start && scroll < stage.end);
+  if (folded) {
+    const ids = folded.nodeStages[0];
+    return { runId: selectedId, id: ids[0], offset: 0, candidates: ids.slice(1) };
+  }
   const entries = Object.entries(ranges);
   if (!entries.length) return undefined;
   const within = entries.findIndex(([, range]) => scroll >= range.start && scroll < range.end);
   const index = within >= 0 ? within : entries.findIndex(([, range]) => range.end > scroll);
   if (index < 0) return undefined;
   const [id, range] = entries[index];
+  if (view === 'dag') {
+    const ids = lastFrame.stageRanges.find(stage => stage.nodeIds.includes(id))?.nodeIds ?? [];
+    const at = ids.indexOf(id);
+    return { runId: selectedId, id, offset: scroll - range.start,
+      candidates: [...ids.slice(at + 1), ...ids.slice(0, at).reverse()] };
+  }
   const ids = entries.map(([taskId]) => taskId);
   const candidates = [...new Set([...ids.slice(index, index + 4),
     ...ids.slice(Math.max(0, index - 2), index).reverse()])];
@@ -284,8 +323,9 @@ async function refresh() {
       const sessionChanged = next.sessionId !== state?.sessionId || fixedView && !sameScope(next, state);
       readGrace.clear(); state = next; error = '';
       if (sessionChanged) {
-        await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0;
-        selectedId = state?.runs?.[0]?.id; completedExpanded = false; scrollAnchor = undefined;
+        await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0; lastFrame = undefined;
+        selectedId = (fixedView !== 'tasks' ? dagInspectionRun(state)?.id : undefined) ?? state?.runs?.[0]?.id;
+        completedExpanded = false; dagCompletedExpanded = false; scrollAnchor = undefined;
         follow = true; target = undefined; revealSelection = false;
         view = fixedView ?? (state?.runs?.length ? 'dag' : 'tasks');
         await restorePreferences();
@@ -350,6 +390,7 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   if (key === 'f') {
     follow = !follow;
     revealSelection = false;
+    if (follow && view === 'dag') { verbose = false; detailSelection = undefined; }
     scrollAnchor = follow ? undefined : captureScrollAnchor();
   }
   if (['\x1b[B', 'j', '\x1b[A', 'k', '\x1b[6~', '\x1b[5~'].includes(key)) {
@@ -368,11 +409,17 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     scroll = 0; revealSelection = true; scrollAnchor = undefined;
   }
   if ((key === 'c' || pressed.name === 'c') && (view === 'tasks' ? completedTasks(state).length :
-      (state?.runs?.length ?? 0) > 1)) {
+      (state?.runs?.length ?? 0) > 0)) {
     follow = false;
     manual = movedSelection = true;
-    completedExpanded = !completedExpanded;
-    scroll = 0; revealSelection = true; scrollAnchor = undefined;
+    if (view === 'tasks') {
+      completedExpanded = !completedExpanded;
+      scroll = 0; revealSelection = true; scrollAnchor = undefined;
+    } else {
+      scrollAnchor = captureScrollAnchor();
+      dagCompletedExpanded = !dagCompletedExpanded;
+      revealSelection = false;
+    }
   }
   if ((!fixedView || view === 'dag') && (key === '\x1b[C' || key === '\x1b[D')) {
     follow = false;
@@ -413,12 +460,13 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     verbose = false;
     const item = items.find(item => item.id === itemId);
     const status = view === 'tasks' ? item.status : item.state;
-    setExpanded(viewState, scope, itemId, !isExpanded(viewState, scope, itemId, status));
+    const hidden = view === 'dag' && lastFrame?.stageRanges.some(stage => stage.folded && stage.nodeIds.includes(itemId));
+    if (!hidden) setExpanded(viewState, scope, itemId, !isExpanded(viewState, scope, itemId, status));
     revealSelection = true;
   }
   draw();
   if (follow) scrollAnchor = undefined;
-  else if (view === 'tasks') scrollAnchor = captureScrollAnchor();
+  else scrollAnchor = captureScrollAnchor();
   if (manual || key === 'f') {
     viewState.navigation ??= { follow };
     viewState.navigation.follow = follow;
@@ -449,11 +497,14 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
   }
 }, focus: focused => {
   if (focused || closing) return;
-  dragY = undefined; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined;
+  dragY = undefined; headerDrag = false; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined;
   draw();
 }, pointer: mouse => {
   if (closing) return;
-  if (mouse.release) { dragY = undefined; return; }
+  // Mask the wheel bit (64) too, so wheel reports cannot become releases.
+  if (mouse.release || (mouse.button & 67) === 3) { dragY = undefined; headerDrag = false; return; }
+  // The press redraw removes the pin; its gesture origin survives until release.
+  if (headerDrag && (mouse.button & 32)) return;
   if (mouse.button & 64) {
     follow = false; revealSelection = false; scrollAnchor = undefined;
     scroll = Math.max(0, scroll + (mouse.button & 1 ? 3 : -3));
@@ -462,11 +513,18 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
     if (mouse.button & 32) {
       if (dragY !== undefined) scroll = Math.max(0, scroll + dragY - mouse.y);
     } else {
+      headerDrag = mouse.y - 1 === lastFrame?.pinnedHeader?.row;
       const ranges = view === 'tasks' ? lastFrame?.taskRanges : lastFrame?.nodeRanges;
       const row = mouse.y - 1 - (lastFrame?.bodyStart ?? 0) + scroll;
       const inBody = mouse.y - 1 >= lastFrame?.bodyStart &&
         mouse.y - 1 < lastFrame.bodyStart + lastFrame.bodyRows;
-      const hit = inBody ? Object.entries(ranges ?? {}).find(([, range]) => row >= range.start && row < range.end) ??
+      const folded = view === 'dag' && inBody ? lastFrame?.stageRanges.find(stage =>
+        stage.folded && row >= stage.start && row < stage.end) : undefined;
+      if (folded) {
+        selectedNodes.set(selectedId, folded.nodeIds[0]);
+        revealSelection = true;
+      }
+      const hit = inBody && !folded ? Object.entries(ranges ?? {}).find(([, range]) => row >= range.start && row < range.end) ??
         (view === 'dag' ? Object.entries(lastFrame?.graphRanges ?? {}).find(([, range]) =>
           row >= range.start && row < range.end) : undefined) : undefined;
       if (hit) {
@@ -479,14 +537,15 @@ const disposeInput = terminalInput(process.stdin, { key: (text, pressed) => {
           !isExpanded(viewState, view === 'tasks' ? TASK_SCOPE : selectedId, id, item.status ?? item.state));
       }
     }
-    dragY = mouse.y;
+    // A pinned stage header is chrome, not the body row now underneath it.
+    dragY = headerDrag ? undefined : mouse.y;
   } else return;
   draw();
-  if (!follow && view === 'tasks') scrollAnchor = captureScrollAnchor();
+  if (!follow) scrollAnchor = captureScrollAnchor();
 } });
 disposeFocus = await watchHerdrFocus(paneId ?? process.env.HERDR_PANE_ID, () => {
   if (closing) return;
-  dragY = undefined; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined; draw();
+  dragY = undefined; headerDrag = false; follow = true; revealSelection = false; verbose = false; scrollAnchor = undefined; draw();
 }, cause => { presenceNotice = `Focus: ${cause.message}`; draw(); })
   .catch(cause => { presenceNotice = `Focus: ${cause.message}`; return () => {}; });
 process.on('SIGTERM', () => { void close(); }); process.on('SIGINT', () => { void close(); }); process.on('SIGHUP', () => { void close(); });

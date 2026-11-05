@@ -317,6 +317,15 @@ export function runningTarget(state, previous) {
     (previous?.taskId ? targets.find(target => target.taskId === previous.taskId) : undefined) ?? targets[0];
 }
 
+const inspectionStatuses = ['running', 'scheduled', 'blocked', 'paused', 'pending'];
+// Run fallback belongs to the DAG viewport, never to execution identity or store ordering.
+export function dagInspectionRun(state, currentId) {
+  const runs = state?.runs ?? [];
+  const unfinished = run => run.nodes.some(node => inspectionStatuses.includes(node.state));
+  return runs.find(run => run.id === currentId && unfinished(run)) ??
+    [...runs].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '')).find(unfinished);
+}
+
 // A run is drawn as a lane graph (as git log --graph): one vertical lane per open branch, a status-coloured
 // dot where a node sits on its lane, and a stage header row ("Step 2 0/2 ───") before each dependency stage,
 // joined onto the fork or merge row when there is one. Open (running or manually expanded) nodes keep a
@@ -442,12 +451,32 @@ export function laneLines(run, columns, color = true, language = 'en', { selecte
 // nodes listed one per row behind a single tree mark (├, └ for the last), so the left margin stays one cell
 // however many nodes run in parallel (23 parallel nodes took 45 cells of lanes). A node fed by only part of
 // the previous stage names its first parent (← a +2). Open nodes keep the bar card and dotted parting row.
-export function stageLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 }, view = taskView(tasks) } = {}) {
-  const out = [], ranges = Object.create(null);
+export function stageLines(run, columns, color = true, language = 'en', { selectedNodeId, viewState, tasks = [], timing = { now: Date.now(), connected: true, frame: 0 }, view = taskView(tasks), dagCompletedExpanded = true, revealSelection = false } = {}) {
+  const out = [], ranges = Object.create(null), stageRanges = [];
   const steps = layers(run, language);
   const line = text => paint(text, dim, color);
   const labels = new Map(run.nodes.map(node => [node.id, node.label ?? node.id]));
-  steps.forEach((step, index) => {
+  let revealedUntil = 0;
+  for (let index = 0; index < steps.length; index++) {
+    const step = steps[index];
+    if (!dagCompletedExpanded && index >= revealedUntil && step.every(node => node.state === 'completed')) {
+      let end = index + 1;
+      while (end < steps.length && steps[end].every(node => node.state === 'completed')) end++;
+      const span = steps.slice(index, end);
+      if (!revealSelection || !span.some(stage => stage.some(node => node.id === selectedNodeId))) {
+        const nodeIds = span.flat().map(node => node.id), start = out.length;
+        const label = language === 'ko' ? `완료 ${nodeIds.length}개 · 단계 ${index + 1}–${end}` :
+          language === 'zh-cn' ? `已完成 ${nodeIds.length} · 阶段 ${index + 1}–${end}` :
+            `Completed ${nodeIds.length} · Step ${index + 1}–${end}`;
+        out.push(line(fit(`▸ ${label}`, columns)));
+        stageRanges.push({ index, start, end: start + 1, nodeIds, folded: true,
+          nodeStages: span.map(stage => stage.map(node => node.id)) });
+        index = end - 1;
+        continue;
+      }
+      revealedUntil = end;
+    }
+    const headerStart = out.length;
     const active = step.some(node => node.state === 'running');
     const label = t(language, 'stage', { index: index + 1 }) + ` ${step.filter(node => node.state === 'completed').length}/${step.length}`;
     out.push(`${line('─ ')}${paint(label, active ? roleColors.time : dim, color, active)}${line(` ${'─'.repeat(Math.max(0, columns - width(label) - 3))}`)}`);
@@ -469,8 +498,9 @@ export function stageLines(run, columns, color = true, language = 'en', { select
       for (const row of detail) out.push(`${line(last ? ' ' : '│')}${bar}${row}`);
       ranges[node.id] = { start, end: out.length };
     });
-  });
-  return { rows: out, ranges };
+    stageRanges.push({ index, start: headerStart, end: headerStart + 1, nodeIds: step.map(node => node.id) });
+  }
+  return { rows: out, ranges, stageRanges };
 }
 
 // Continuation rows keep the hanging indent; the wrap mark sits inside it when it fits.
@@ -777,17 +807,23 @@ function historyCardLines(task, tasks, context, draw) {
 
 export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scroll = 0, color = true, error = '', language = state?.language ?? 'en',
   selectedNodeId, selectedTaskId, view, viewState, verbose = false, revealSelection = false, notice = '', now = Date.now(), completedExpanded = false,
-  follow = true, runningNodeId, runningTaskId, offline = false, frame = 0, fixed = false } = {}) {
+  follow = true, runningNodeId, runningTaskId, offline = false, frame = 0, fixed = false, inspectUnfinished = false, dagCompletedExpanded = true } = {}) {
   columns = Math.max(1, columns - 1);
   rows = Math.max(1, rows);
   const all = state?.runs ?? [];
-  const run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
+  let run = all[Math.min(Math.max(0, runIndex), Math.max(0, all.length - 1))];
   const sections = workersSections(state);
   const roots = sections.roots;
   const rootsDone = roots.filter(task => task.status === 'completed').length;
   // The fixed DAG role stays a DAG pane with no run yet; only the standalone viewer falls back to tasks.
   const dagRole = fixed && view === 'dag';
   const tasksView = view === 'tasks' || !all.length && !dagRole;
+  const dagFollow = !tasksView && follow && state?.connected && !error && !offline && !revealSelection;
+  // Running targets are supplied by the viewer's stable identity tracker. With
+  // no execution anywhere, inspect unfinished work without calling it running.
+  const inspection = dagFollow && (dagRole || inspectUnfinished) && !runningNodeId &&
+    !runningTarget(dagRole ? { ...state, tasks: [] } : state);
+  if (inspection) run = dagInspectionRun(state, run?.id) ?? run;
   // One header row "name [done/total]  summary" under which a divider runs, the same shape as the Todo pane.
   // The header and footer rows sit one column in from the pane edge, as in every pane.
   const inset = columns > 1 ? ' ' : '', room = columns - inset.length;
@@ -801,7 +837,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const head = [headLine(t(language, 'tasks'), rootsDone, roots.length,
     `${t(language, 'runningCount', { count: roots.filter(task => task.status === 'running').length })}${switchHint}`), separator(columns, color)];
   if (dagRole && !run) head[0] = headLine('DAG', 0, 0, t(language, 'none'));
-  const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
+  const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null), stageRanges = [];
+  let inspectionNodeId;
   if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'),
     ...(state?.connected ? [] : [t(language, 'disconnected')]), '');
   if (tasksView && (roots.length || all.length)) {
@@ -861,7 +898,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     // Run name, status and progress share one row; the graph and its ← labels carry the dependencies.
     // With several runs the row keeps naming the selected one; the selector below lists the active count.
     // A narrow pane drops the 'Selected run:' prefix before it would cut the run name itself.
-    const runTail = ` · ${t(language, run.status)}${failed ? ` · ${t(language, 'failedCount', { count: failed })}` : ''}${switchHint}`;
+    const runningCount = all.reduce((count, item) => count + item.nodes.filter(node => node.state === 'running').length, 0);
+    const runTail = ` · ${t(language, run.status)} · running ${runningCount}${failed ? ` · ${t(language, 'failedCount', { count: failed })}` : ''}${switchHint}`;
     const prefixed = `${t(language, 'selectedRun', { name: run.name })}${runTail}`;
     const runRoom = columns - width(`DAG [${done}/${run.nodes.length}]`) - 2;
     head[0] = headLine('DAG', done, run.nodes.length,
@@ -869,10 +907,15 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     const timing = { now, connected: state?.connected, updatedAt: state?.updatedAt, frame };
     const tasks = state?.tasks ?? noTasks, view = taskView(tasks);
     try {
-      const { rows: flow, ranges } = stageLines(run, columns, color, language, { selectedNodeId, viewState, tasks, timing, view });
+      const { rows: flow, ranges, stageRanges: stages } = stageLines(run, columns, color, language, { selectedNodeId, viewState, tasks, timing, view, dagCompletedExpanded, revealSelection });
       const start = body.length;
       body.push(...flow);
       for (const [id, range] of Object.entries(ranges)) graphRanges[id] = nodeRanges[id] = { start: start + range.start, end: start + range.end };
+      for (const stage of stages) stageRanges.push({ ...stage, start: start + stage.start, end: start + stage.end });
+      if (inspection) for (const status of inspectionStatuses) {
+        inspectionNodeId = stages.flatMap(stage => stage.nodeIds).find(id => run.nodes.find(node => node.id === id).state === status);
+        if (inspectionNodeId) break;
+      }
     }
     catch (error) { body.push(t(language, 'graphError', { error: clean(error.message) })); }
     // d still opens the full detail of the selected node, under the cards.
@@ -891,16 +934,35 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     body.push('', `  ○  ${t(language, first)}`, '', paint(`  ${t(language, line1)}`, dim, color), paint(`  ${t(language, line2)}`, dim, color));
   }
   const narrow = columns < 40;
-  const available = Math.max(0, rows - head.length - 2 - Number(Boolean(error)) - Number(Boolean(notice)));
+  let available = Math.max(0, rows - head.length - 2 - Number(Boolean(error)) - Number(Boolean(notice)));
+  if (!tasksView && run && available === 0) {
+    // At extreme heights the title owns the last row before normal chrome.
+    head.length = Math.min(head.length, Math.max(0, rows - 1));
+    available = 1;
+  }
   const selected = tasksView ? taskRanges[selectedTaskId] : nodeRanges[selectedNodeId];
   if (revealSelection && selected && available > 0) {
     if (verbose || selected.start < scroll || selected.start + Math.min(3, available) > scroll + available) scroll = selected.start;
   }
-  const running = tasksView ? taskRanges[runningTaskId] : graphRanges[runningNodeId];
-  if (follow && state?.connected && !revealSelection && running && available > 0 &&
+  const targetNodeId = runningNodeId ?? inspectionNodeId;
+  const running = tasksView ? taskRanges[runningTaskId] : graphRanges[targetNodeId];
+  let pinnedHeader;
+  if (dagFollow && running && available === 1) scroll = running.start;
+  if (dagFollow && running && available > 1) {
+    const stage = stageRanges.find(stage => stage.nodeIds.includes(targetNodeId));
+    if (stage) {
+      scroll = stage.start;
+      if (running.start - stage.end > 1 || running.start - stage.start >= available) {
+        scroll = running.start;
+        pinnedHeader = { ...stage, row: head.length };
+      }
+    }
+  }
+  if (tasksView && follow && state?.connected && !revealSelection && running && available > 0 &&
       (running.start < scroll || running.end > scroll + available)) scroll = running.start;
-  const start = Math.min(Math.max(0, scroll), Math.max(0, body.length - available));
-  const visible = body.slice(start, start + available).map(line => {
+  const bodyRows = available - Number(Boolean(pinnedHeader));
+  const start = Math.min(Math.max(0, scroll), Math.max(0, body.length - (dagFollow && running ? 1 : available)));
+  const visible = body.slice(start, start + bodyRows).map(line => {
     // Preserve ANSI colors when the already sized graph fits.
     return width(line) <= columns ? line : fit(line, columns);
   });
@@ -909,20 +971,24 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     if (to - from === 1 && (from === range.start || from === range.end - 1) &&
         /^[╭╰]─+[╮╯]$/.test(clean(body[from]))) visible[from - start] = '';
   }
-  while (visible.length < available) visible.push('');
-  if (!tasksView && run && narrow && available === 1) {
-    const node = run.nodes.find(node => node.id === runningNodeId) ??
+  while (visible.length < bodyRows) visible.push('');
+  if (pinnedHeader) visible.unshift(width(body[pinnedHeader.start]) <= columns ? body[pinnedHeader.start] : fit(body[pinnedHeader.start], columns));
+  if (!tasksView && run && available === 1) {
+    const node = run.nodes.find(node => node.id === targetNodeId) ??
       run.nodes.find(node => graphRanges[node.id]?.start <= start && graphRanges[node.id]?.end > start) ??
       run.nodes.find(node => node.id === selectedNodeId) ?? run.nodes[0];
     if (node) visible[0] = fit(`${statusIcon(node.state, frame)} ${clean(node.label ?? node.id)}`, columns);
   }
   const runPosition = !tasksView && run && all.length > 1 ? ` · ${t(language, 'runPosition', { index: all.indexOf(run) + 1, total: all.length })}` : '';
-  const range = `${runPosition}${body.length > available ? ` · ${start + 1}–${Math.min(start + available, body.length)}/${body.length}` : ''}`;
+  const showRange = tasksView ? body.length > available : start > 0 || body.length > bodyRows;
+  const range = `${runPosition}${showRange ? ` · ${start + 1}–${Math.min(start + bodyRows, body.length)}/${body.length}` : ''}`;
   const live = state?.connected && !error;
   const source = offline || !state?.connected ? t(language, !state?.connected && !narrow ? 'disconnected' : 'offlineShort') :
     t(language, error ? 'error' : 'liveShort');
+  const targetNode = !tasksView && run?.nodes.find(node => node.id === targetNodeId);
+  const targetLabel = targetNode ? ` · ${t(language, targetNode.state)}: ${clean(targetNode.label ?? targetNode.id)}` : '';
   const status = `${t(language, narrow ? follow && live ? 'followShortOn' : 'followShortOff' :
-    follow && live ? 'followOn' : 'followOff')} · ${source}${range}`;
+    follow && live ? 'followOn' : 'followOff')} · ${source}${range}${targetLabel}`;
   const foot = [
     ...(error ? [paint(fit(t(language, offline || !state?.connected ? 'readErrorOffline' : 'readError', { error: clean(error) }), columns), colors.error, color)] : []),
     ...(notice ? [paint(fit(notice, columns), colors.paused, color)] : []),
@@ -930,7 +996,8 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
     inset + paint(fit(status, room), live ? accent : colors.paused, color),
   ];
   return { text: [...head, ...visible, ...foot].slice(0, rows).join('\n'), scroll: start,
-    bodyStart: head.length, bodyRows: available, nodeRanges, taskRanges, graphRanges };
+    bodyStart: head.length + Number(Boolean(pinnedHeader)), bodyRows, nodeRanges, taskRanges, graphRanges,
+    ...(!tasksView ? { stageRanges, pinnedHeader, runId: run?.id, targetNodeId } : {}) };
 }
 
 export const render = (state, options) => renderFrame(state, options).text;
